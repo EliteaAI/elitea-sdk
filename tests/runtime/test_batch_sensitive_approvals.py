@@ -14,6 +14,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from elitea_sdk.runtime.clients.client import EliteAClient
 from elitea_sdk.runtime.langchain.assistant import Assistant
 from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+from elitea_sdk.runtime.middleware.strategies import LoggingStrategy
+from elitea_sdk.runtime.middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
 from elitea_sdk.runtime.toolkits.security import configure_sensitive_tools, reset_sensitive_tools
 
 PENDING_KEYS = {'interrupt_id', 'tool_call_id', 'toolkit_name', 'tool_name'}
@@ -74,13 +76,18 @@ class _BatchLLM:
         )
 
 
-def _make_tools(recorder: _Recorder):
+def _make_tools(recorder: _Recorder, async_unsupported: bool = False):
     def _tool(name):
         def _run(path=''):
             recorder.executed.append(name)
             return f'ran:{name}'
+
+        async def _arun(path=''):
+            raise NotImplementedError('no async path')
+
         return StructuredTool.from_function(
             func=_run,
+            coroutine=_arun if async_unsupported else None,
             name=name,
             description=f'{name} tool',
             metadata={'toolkit_type': 'art', 'toolkit_name': 'Artifact', 'tool_name': name},
@@ -88,36 +95,46 @@ def _make_tools(recorder: _Recorder):
     return [_tool(n) for n in ('create_file', 'delete_file', 'update_file', 'read_file')]
 
 
-def _runnable(memory, llm, recorder, batch: bool = True):
+def _runnable(memory, llm, recorder, batch: bool = True, async_unsupported: bool = False):
+    # Production order: the exception handler first, the sensitive guard last.
+    middleware = [SensitiveToolGuardMiddleware(batch_approvals=batch)]
+    if async_unsupported:
+        middleware.insert(0, ToolExceptionHandlerMiddleware(
+            strategies=[LoggingStrategy()], conversation_id='conv',
+        ))
     assistant = Assistant(
         elitea=_DummyRuntime(),
         data={'instructions': 'Use tools.', 'tools': [], 'meta': {}},
         client=llm,
-        tools=_make_tools(recorder),
+        tools=_make_tools(recorder, async_unsupported),
         memory=memory,
         app_type='predict',
-        middleware=[SensitiveToolGuardMiddleware(batch_approvals=batch)],
+        middleware=middleware,
     )
     return assistant.runnable()
 
 
 def _start(calls, batch=True, sensitive=('create_file', 'delete_file', 'update_file'), thread='t',
-           later_calls=None):
+           later_calls=None, async_unsupported=False):
     configure_sensitive_tools({'art': list(sensitive)})
     memory = MemorySaver()
     recorder = _Recorder()
     cfg = {'configurable': {'thread_id': thread}}
     llm = _BatchLLM(calls, later_calls)
-    first = _runnable(memory, llm, recorder, batch).invoke(
+    first = _runnable(memory, llm, recorder, batch, async_unsupported).invoke(
         {'messages': [HumanMessage(content='go')]}, config=dict(cfg),
     )
     return memory, recorder, cfg, first
 
 
-def _resume(memory, recorder, cfg, calls, decisions, batch=True, later_calls=None):
+def _resume(memory, recorder, cfg, calls, decisions, batch=True, later_calls=None,
+            async_unsupported=False):
     llm = _BatchLLM(calls, later_calls)
-    result = _runnable(memory, llm, recorder, batch).invoke(
-        {'hitl_resume': True, 'hitl_decisions': decisions}, config=dict(cfg),
+    payload = {'hitl_resume': True, 'hitl_decisions': decisions}
+    if not batch:
+        payload = {'hitl_resume': True, 'hitl_action': decisions, 'hitl_value': ''}
+    result = _runnable(memory, llm, recorder, batch, async_unsupported).invoke(
+        payload, config=dict(cfg),
     )
     return result, llm
 
@@ -408,6 +425,77 @@ class TestNoStaleDecision:
             assert first == {'action': 'approve', 'value': ''}
         finally:
             _RESUMED_SENSITIVE_DECISION.reset(token)
+
+
+class TestSyncFallbackKeepsApproval:
+    """A tool without an async path runs through the sync fallback of the agent loop.
+
+    The approval given for the call covers the fallback: one review, no second pause.
+    """
+
+    @pytest.fixture
+    def reviews(self, monkeypatch):
+        seen: list[str] = []
+        original = SensitiveToolGuardMiddleware._review_sensitive_tool_call
+
+        def counted(self, ctx):
+            seen.append(ctx['tool_name'])
+            return original(self, ctx)
+
+        monkeypatch.setattr(SensitiveToolGuardMiddleware, '_review_sensitive_tool_call', counted)
+        return seen
+
+    @pytest.mark.parametrize('batch', [False, True], ids=['single', 'batch'])
+    def test_approved_call_is_reviewed_once_and_runs_once(self, batch, reviews):
+        memory, recorder, cfg, first = _start(
+            [('create_file', 'c1')], batch=batch, async_unsupported=True,
+        )
+        assert first['execution_finished'] is False
+        reviews.clear()
+
+        decisions = _decide(first['hitl_interrupts']) if batch else 'approve'
+        final, _ = _resume(
+            memory, recorder, cfg, [('create_file', 'c1')], decisions, batch=batch,
+            async_unsupported=True,
+        )
+
+        assert final['execution_finished'] is True, final.get('hitl_interrupt')
+        assert not final.get('hitl_interrupt')
+        assert recorder.executed == ['create_file']
+        assert reviews == ['create_file']
+
+    @pytest.mark.parametrize('batch', [False, True], ids=['single', 'batch'])
+    def test_second_distinct_call_still_pauses(self, batch, reviews):
+        calls = [('create_file', 'c1')]
+        later = [('delete_file', 'c2')]
+        memory, recorder, cfg, first = _start(
+            calls, batch=batch, later_calls=later, async_unsupported=True,
+        )
+        decisions = _decide(first['hitl_interrupts']) if batch else 'approve'
+
+        second, _ = _resume(
+            memory, recorder, cfg, calls, decisions, batch=batch, later_calls=later,
+            async_unsupported=True,
+        )
+
+        assert second['execution_finished'] is False
+        assert second['hitl_interrupt']['tool_name'] == 'delete_file'
+        assert recorder.executed == ['create_file']
+
+    @pytest.mark.parametrize('batch', [False, True], ids=['single', 'batch'])
+    def test_rejected_call_never_runs(self, batch, reviews):
+        memory, recorder, cfg, first = _start(
+            [('create_file', 'c1')], batch=batch, async_unsupported=True,
+        )
+        decisions = _decide(first['hitl_interrupts'], action='reject') if batch else 'reject'
+
+        final, _ = _resume(
+            memory, recorder, cfg, [('create_file', 'c1')], decisions, batch=batch,
+            async_unsupported=True,
+        )
+
+        assert final['execution_finished'] is True
+        assert recorder.executed == []
 
 
 class TestGuardReview:

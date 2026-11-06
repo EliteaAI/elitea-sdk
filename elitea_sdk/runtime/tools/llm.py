@@ -4617,7 +4617,9 @@ class LLMNode(BaseTool):
                             None if is_application
                             else decisions_by_call_id.get(tool_call_id)
                         )
-                        with outcome_sink() as recorded, _resumed_decision_scope(call_decision):
+                        # Local: the middleware package imports this module.
+                        from ..middleware.sensitive_tool_guard import SYNC_FALLBACK_ERRORS, tool_call_review_scope
+                        with outcome_sink() as recorded, _resumed_decision_scope(call_decision), tool_call_review_scope():
                             tool_result = None
                             if is_application:
                                 # Application overrides invoke() (not ainvoke) to read tool_call_id
@@ -4652,8 +4654,11 @@ class LLMNode(BaseTool):
                             elif hasattr(tool_to_execute, 'ainvoke'):
                                 try:
                                     tool_result = await tool_to_execute.ainvoke(tool_args, config=config)
-                                except (NotImplementedError, AttributeError):
-                                    logger.debug(f"Tool '{tool_name}' ainvoke failed, falling back to sync invoke")
+                                except SYNC_FALLBACK_ERRORS as fallback_error:
+                                    logger.info(
+                                        "Tool '%s' ainvoke raised %s, falling back to sync invoke",
+                                        tool_name, type(fallback_error).__name__,
+                                    )
                                     tool_result = tool_to_execute.invoke(tool_args, config=config)
                             else:
                                 # Sync-only tool

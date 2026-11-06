@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import types
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 from uuid import uuid4
@@ -20,6 +21,28 @@ logger = logging.getLogger(__name__)
 # Tools whose call is already reviewed and running. Keyed by tool, so a nested call of the same tool is
 # not reviewed twice while a different sensitive tool called inside it (a sub-agent) is still reviewed.
 _REVIEWED: ContextVar[frozenset] = ContextVar('sensitive_tool_reviewed', default=frozenset())
+
+# The agent loop retries a tool on its sync path when the async path says "not supported". The mark
+# above is gone by then, so a reviewed call would ask the user a second time. While a tool call runs
+# inside `tool_call_review_scope`, the guard records a reviewed call whose async path raised one of
+# these errors, as (tool id, input object), and the sync retry of the same call skips its review.
+SYNC_FALLBACK_ERRORS = (NotImplementedError, AttributeError)
+_FALLBACK_REVIEWED: ContextVar[Optional[list]] = ContextVar('sensitive_tool_fallback_reviewed', default=None)
+
+
+@contextmanager
+def tool_call_review_scope():
+    """Hold the reviews of one tool call until the call ends, retries on the sync path included."""
+    token = _FALLBACK_REVIEWED.set([])
+    try:
+        yield
+    finally:
+        _FALLBACK_REVIEWED.reset(token)
+
+
+def _reviewed_for_sync_retry(tool_id: int, tool_input: Any) -> bool:
+    # Identity of the input, not equality: a new call with equal arguments is a new call.
+    return any(t == tool_id and i is tool_input for t, i in _FALLBACK_REVIEWED.get() or ())
 
 from ..toolkits.security import (
     find_sensitive_tool_match,
@@ -420,7 +443,10 @@ class SensitiveToolGuardMiddleware(Middleware):
         # A tool without a native coroutine runs its sync invoke from ainvoke; the flag keeps
         # that inner call from asking the user a second time. Executors copy the context.
         def guarded_invoke(tool_self: BaseTool, input: Any, config: Any = None, **kwargs: Any) -> Any:
-            if id(original_tool) not in _REVIEWED.get():
+            if (
+                    id(original_tool) not in _REVIEWED.get()
+                    and not _reviewed_for_sync_retry(id(original_tool), input)
+            ):
                 blocked = guard._blocked_result_if_rejected(original_tool, input)
                 if blocked is not None:
                     return blocked
@@ -438,6 +464,12 @@ class SensitiveToolGuardMiddleware(Middleware):
             token = _REVIEWED.set(_REVIEWED.get() | {id(original_tool)})
             try:
                 return await type(tool_self).ainvoke(tool_self, input, config, **kwargs)
+            except SYNC_FALLBACK_ERRORS:
+                # Review passed and the user approved: the sync retry of this call needs no second review.
+                reviewed = _FALLBACK_REVIEWED.get()
+                if reviewed is not None:
+                    reviewed.append((id(original_tool), input))
+                raise
             finally:
                 _REVIEWED.reset(token)
 
