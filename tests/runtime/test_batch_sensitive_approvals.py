@@ -39,10 +39,14 @@ class _Recorder:
 
 
 class _BatchLLM:
-    """Emits one AI message with all given calls, then a final answer."""
+    """Emits one AI message with all given calls, then a final answer.
 
-    def __init__(self, calls: list[tuple[str, str]]):
+    With ``later_calls`` it emits a second AI message after the first round ran.
+    """
+
+    def __init__(self, calls: list[tuple[str, str]], later_calls: list[tuple[str, str]] | None = None):
         self.calls = calls
+        self.later_calls = later_calls or []
         self.invocations: list[list] = []
         self.temperature = 0
         self.max_tokens = 1000
@@ -57,13 +61,14 @@ class _BatchLLM:
     def invoke(self, messages, config=None):
         self.invocations.append(list(messages))
         results = [m for m in messages if isinstance(m, ToolMessage)]
-        if len(results) >= len(self.calls):
+        if len(results) >= len(self.calls) + len(self.later_calls):
             return AIMessage(content='done: ' + '|'.join(str(m.content) for m in results))
+        wanted = self.calls if len(results) < len(self.calls) else self.later_calls
         return AIMessage(
             content='',
             tool_calls=[
                 {'name': name, 'args': {'path': f'/{name}'}, 'id': call_id}
-                for name, call_id in self.calls
+                for name, call_id in wanted
             ],
         )
 
@@ -95,20 +100,21 @@ def _runnable(memory, llm, recorder, batch: bool = True):
     return assistant.runnable()
 
 
-def _start(calls, batch=True, sensitive=('create_file', 'delete_file', 'update_file'), thread='t'):
+def _start(calls, batch=True, sensitive=('create_file', 'delete_file', 'update_file'), thread='t',
+           later_calls=None):
     configure_sensitive_tools({'art': list(sensitive)})
     memory = MemorySaver()
     recorder = _Recorder()
     cfg = {'configurable': {'thread_id': thread}}
-    llm = _BatchLLM(calls)
+    llm = _BatchLLM(calls, later_calls)
     first = _runnable(memory, llm, recorder, batch).invoke(
         {'messages': [HumanMessage(content='go')]}, config=dict(cfg),
     )
     return memory, recorder, cfg, first
 
 
-def _resume(memory, recorder, cfg, calls, decisions, batch=True):
-    llm = _BatchLLM(calls)
+def _resume(memory, recorder, cfg, calls, decisions, batch=True, later_calls=None):
+    llm = _BatchLLM(calls, later_calls)
     result = _runnable(memory, llm, recorder, batch).invoke(
         {'hitl_resume': True, 'hitl_decisions': decisions}, config=dict(cfg),
     )
@@ -168,7 +174,7 @@ class TestBatchPause:
         aggregate = raw[0]
         assert aggregate['type'] == 'hitl'
         assert aggregate['guardrail_type'] == 'parallel_sensitive_tools'
-        assert aggregate['batch'] == 'sequential'
+        assert 'batch' not in aggregate
         assert isinstance(aggregate['pending'], list) and len(aggregate['pending']) == 2
         for entry in aggregate['pending']:
             assert PENDING_KEYS <= set(entry)
@@ -257,6 +263,28 @@ class TestBatchPause:
         assert final['execution_finished'] is True
         assert recorder.executed == ['delete_file']
 
+    def test_partial_resume_hides_batch_state_from_ui_payload(self):
+        memory, recorder, cfg, first = _start(CALLS3)
+
+        second, _ = _resume(
+            memory, recorder, cfg, CALLS3, _decide(first['hitl_interrupts'], only={'create_file'}),
+        )
+
+        hidden = {'_batch_decided', '_pending_messages'}
+        assert second['execution_finished'] is False
+        assert not hidden & set(second['hitl_interrupt'])
+        for entry in second['hitl_interrupts']:
+            assert not hidden & set(entry)
+
+    def test_repeated_call_id_keeps_the_per_call_pause(self):
+        calls = [('create_file', 'dup'), ('delete_file', 'dup')]
+        _, recorder, _, first = _start(calls)
+
+        assert first['execution_finished'] is False
+        assert first['hitl_interrupt']['guardrail_type'] == 'sensitive_tool'
+        assert len(first.get('hitl_interrupts') or []) <= 1
+        assert recorder.executed == []
+
     def test_single_sensitive_call_keeps_single_pause(self):
         calls = [('read_file', 'c0'), ('create_file', 'c1')]
         _, _, _, first = _start(calls)
@@ -290,15 +318,54 @@ class TestFlagOff:
         assert SensitiveToolGuardMiddleware(batch_approvals=True).batch_approvals is True
 
 
+LATER2 = [('create_file', 'c3'), ('delete_file', 'c4')]
+
+
 class TestNoStaleDecision:
-    def test_approved_decision_does_not_leak_to_later_interrupt(self):
-        from elitea_sdk.runtime.tools.llm import _RESUMED_SENSITIVE_DECISION
+    def test_approved_decision_does_not_answer_a_later_model_turn(self):
+        memory, recorder, cfg, first = _start(CALLS2, later_calls=LATER2)
+        assert recorder.executed == []
 
-        memory, recorder, cfg, first = _start(CALLS2)
-        result, _ = _resume(memory, recorder, cfg, CALLS2, _decide(first['hitl_interrupts']))
+        second, _ = _resume(
+            memory, recorder, cfg, CALLS2, _decide(first['hitl_interrupts']), later_calls=LATER2,
+        )
 
-        assert result['execution_finished'] is True
-        assert _RESUMED_SENSITIVE_DECISION.get(None) is None
+        assert second['execution_finished'] is False
+        assert [p['tool_call_id'] for p in second['hitl_interrupts']] == ['c3', 'c4']
+        assert recorder.executed == ['create_file', 'delete_file']
+
+        final, _ = _resume(
+            memory, recorder, cfg, CALLS2, _decide(second['hitl_interrupts']), later_calls=LATER2,
+        )
+
+        assert final['execution_finished'] is True
+        assert recorder.executed == ['create_file', 'delete_file', 'create_file', 'delete_file']
+
+    def test_block_with_comment_keeps_note_in_blocked_result(self):
+        memory, recorder, cfg, first = _start(CALLS2, later_calls=LATER2)
+        pending = first['hitl_interrupts']
+        decisions = (
+            _decide(pending, action='block_with_comment', only={'create_file'}, value='use a copy')
+            + _decide(pending, only={'delete_file'})
+        )
+
+        second, llm = _resume(memory, recorder, cfg, CALLS2, decisions, later_calls=LATER2)
+
+        assert recorder.executed == ['delete_file']
+        assert second['execution_finished'] is False
+        assert [p['tool_call_id'] for p in second['hitl_interrupts']] == ['c3', 'c4']
+
+        final, llm = _resume(
+            memory, recorder, cfg, CALLS2, _decide(second['hitl_interrupts'], action='reject'),
+            later_calls=LATER2,
+        )
+
+        assert final['execution_finished'] is True
+        blocked = [m for m in llm.invocations[-1] if isinstance(m, ToolMessage)]
+        assert blocked[0].tool_call_id == 'c1'
+        assert SensitiveToolGuardMiddleware.BLOCKED_TOOL_RESULT_TYPE in str(blocked[0].content)
+        assert 'use a copy' in str(blocked[0].content)
+        assert 'use a copy' not in str(blocked[2].content)
 
     def test_guard_reads_decision_once(self):
         from elitea_sdk.runtime.tools.llm import _RESUMED_SENSITIVE_DECISION

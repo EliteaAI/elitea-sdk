@@ -4326,6 +4326,15 @@ class LLMNode(BaseTool):
 
         message_ids = set()
         open_calls = []
+        # A repeated call id would share one decision between two calls, so the
+        # message keeps the per-call guard, which answers each call on its own.
+        call_ids = [
+            (tc.get('id', '') if isinstance(tc, dict) else getattr(tc, 'id', ''))
+            for tc in tool_calls
+        ]
+        call_ids = [call_id for call_id in call_ids if call_id]
+        if len(call_ids) != len(set(call_ids)):
+            return
         for tool_call in tool_calls:
             is_dict = isinstance(tool_call, dict)
             tool_name = tool_call.get('name', '') if is_dict else getattr(tool_call, 'name', '')
@@ -4370,11 +4379,12 @@ class LLMNode(BaseTool):
             try:
                 pending_serialized.append(message_to_dict(message))
             except Exception:  # pragma: no cover - defensive
-                pass
+                logger.warning(
+                    '[HITL] Cannot serialize a pending message of type %s', type(message).__name__,
+                )
         aggregate = {
             'type': 'hitl',
             'guardrail_type': 'parallel_sensitive_tools',
-            'batch': 'sequential',
             'message': pending[0]['message'],
             'pending': pending,
             '_pending_messages': pending_serialized,
@@ -4453,12 +4463,16 @@ class LLMNode(BaseTool):
         effective_limit = self.steps_limit
         _injection_budget_max = self.steps_limit * 2
 
-        decisions_by_call_id = {
-            d[HITL_TOOL_CALL_ID_KEY]: d
-            for d in (batch_decisions or [])
-            if isinstance(d, dict) and d.get(HITL_TOOL_CALL_ID_KEY)
-            and not d.get(HITL_VIA_CALL_ID_KEY)
-        }
+        decisions_by_call_id: dict = {}
+        for d in (batch_decisions or []):
+            if not isinstance(d, dict) or d.get(HITL_VIA_CALL_ID_KEY):
+                continue
+            call_id = d.get(HITL_TOOL_CALL_ID_KEY)
+            if not call_id:
+                continue
+            # A reject or a block on a repeated id must win over an approve.
+            if call_id not in decisions_by_call_id or d.get('action', 'approve') != 'approve':
+                decisions_by_call_id[call_id] = d
 
         # Continue executing tools until no more tool calls or max iterations reached
         current_completion = completion
