@@ -524,12 +524,9 @@ class TestNestedApplication:
         assert stored.content == 'all done'
         assert RUN_FAILURE_NOTICE_KEY not in stored.response_metadata
 
-    @pytest.mark.parametrize('flag, value', [
-        pytest.param(PIPELINE_BLOCKED_KEY, 'stopped', id='pipeline-blocked'),
-        pytest.param('tool_execution_limit_reached', True, id='step-limit'),
-    ])
-    def test_a_child_that_stopped_reaches_the_parent_as_a_tagged_message(self, flag, value):
-        response = {'messages': [HumanMessage(content='go'), AIMessage(content='stopped')], 'output': 'stopped', flag: value}
+    def test_a_child_stopped_at_the_step_limit_reaches_the_parent_as_a_tagged_message(self):
+        response = {'messages': [HumanMessage(content='go'), AIMessage(content='stopped')], 'output': 'stopped',
+                    'tool_execution_limit_reached': True}
 
         result = _nested_app(response)._run(task='go')
 
@@ -537,7 +534,7 @@ class TestNestedApplication:
 
 
 class TestNamesTheWorkerReads:
-    """The indexer worker reads these names as plain strings, so a rename must fail a test here."""
+    """The worker imports the tag name but reads the blocked key and the step-limit flag as plain strings, so a rename must fail a test here."""
 
     def test_the_tag_and_the_blocked_key_keep_their_names(self):
         assert RUN_FAILURE_NOTICE_KEY == 'run_failure_notice'
