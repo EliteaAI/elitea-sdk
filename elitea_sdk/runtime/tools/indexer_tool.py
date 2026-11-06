@@ -7,8 +7,8 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from typing import Any, Optional, Union
 from langchain_core.messages import ToolCall
-from langchain_core.utils.function_calling import convert_to_openai_tool
 from ..langchain.utils import _extract_json, propagate_the_input_mapping
+from ..tool_outcome import run_failure_message
 from pydantic import ValidationError
 from time import time
 
@@ -37,9 +37,6 @@ class IndexerNode(BaseTool):
         # TODO: Not cool, but will work for now
         from elitea_sdk.tools.chunkers import __all__ as chunkers
         start_time = time()
-        params = convert_to_openai_tool(self.tool).get(
-            'function', {'parameters': {}}).get(
-            'parameters', {'properties': {}}).get('properties', {})
         func_args = propagate_the_input_mapping(input_mapping=self.input_mapping, input_variables=self.input_variables, state=state)
         try:
             result = self.tool.invoke(func_args, config=config, kwargs=kwargs)
@@ -70,7 +67,7 @@ class IndexerNode(BaseTool):
                     )
                 except Exception as e:
                     logger.error(f"Chunking error: {format_exc()}")
-                    return {"messages": [{"role": "assistant", "content": f"""Chunking tool {self.chunking_tool} raised an error.\n\nError: {format_exc()}"""}]}
+                    return {"messages": [run_failure_message(f"Chunking tool {self.chunking_tool} raised an error. Open the run log for details.")]}
             index_results = self.index_tool.invoke({"documents": chunks if chunks else result}, config=config, kwargs=kwargs)
             logger.info(f"IndexNode response: {index_results}")
             total_time = round((time() - start_time), 2)
@@ -80,11 +77,9 @@ class IndexerNode(BaseTool):
             }
 
         except Exception as e:
-            logger.error(f"ValidationError: {format_exc()}")
+            logger.error("IndexerNode %s failed", self.tool.name, exc_info=True)
             return {
-                "messages": [{"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {result} raised ValidationError. 
-        \n\nTool schema is {dumps(params)} \n\nand the input to LLM was 
-        {func_args}\n{e}"""}]}
+                "messages": [run_failure_message(f"The tool {self.tool.name} failed. Open the run log for details.")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)

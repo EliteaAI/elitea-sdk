@@ -22,10 +22,10 @@ from ..tool_outcome import (
     outcome_sink,
     record_outcome,
     retriable_for,
+    run_failure_message,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from typing import Any, Optional, Union
-from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict, log_tool_result
 from .sandbox import CLIENT_ALIAS_LINE
@@ -318,7 +318,7 @@ alita_state = elitea_state.copy()
         message = "\n\n".join(parts)
 
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
 
@@ -356,7 +356,7 @@ alita_state = elitea_state.copy()
         )
         self._record_blocked_error(tool_name, 'authorization skipped')
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
         for var in self.output_variables or []:
@@ -377,7 +377,7 @@ alita_state = elitea_state.copy()
         )
         self._record_blocked_error(tool_name, 'authorized toolkit not available')
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
         for var in self.output_variables or []:
@@ -488,10 +488,6 @@ alita_state = elitea_state.copy()
             config: Optional[RunnableConfig] = None,
             **kwargs: Any,
     ) -> Any:
-        params = convert_to_openai_tool(self.tool).get(
-            'function', {'parameters': {}}).get(
-            'parameters', {'properties': {}}).get('properties', {})
-
         func_args = propagate_the_input_mapping(input_mapping=self.input_mapping, input_variables=self.input_variables,
                                                 state=state)
 
@@ -704,9 +700,9 @@ alita_state = elitea_state.copy()
                 exception_type=type(e).__name__,
                 retry_after=getattr(e, 'retry_after', None),
             ))
+            logger.error("FunctionTool %s failed", self.tool.name, exc_info=True)
             return {"messages": [
-                {"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
-                        \n\nTool schema is {safe_serialize(params)}. \n\n Details: {e}"""}]}
+                run_failure_message(f"The tool {self.tool.name} failed. Open the run log for details.")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)
