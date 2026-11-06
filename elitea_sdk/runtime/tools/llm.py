@@ -1360,6 +1360,7 @@ class LLMNode(BaseTool):
             logger.error(f"Error type: {type(e).__name__}")
             _error_msg = AIMessage(content=f"Error: {describe_llm_error(e, _llm_idle_timeout(self.client))}")
             _error_msg.response_metadata['llm_node_error'] = True
+            _error_msg.response_metadata[RUN_FAILURE_NOTICE_KEY] = True
             _error_msg.response_metadata['llm_node_exception_type'] = type(e).__name__
             result = {"messages": [_error_msg]}
 
@@ -4841,6 +4842,7 @@ class LLMNode(BaseTool):
                     error_msg = "\n".join(error_details)
                     _tagged = AIMessage(content=error_msg)
                     _tagged.response_metadata['llm_node_error'] = True
+                    _tagged.response_metadata[RUN_FAILURE_NOTICE_KEY] = True
                     _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
                     new_messages.append(_tagged)
                     break
@@ -4978,6 +4980,7 @@ class LLMNode(BaseTool):
                     error_msg = f"Error processing tool results in iteration {iteration}: {describe_llm_error(e, _llm_idle_timeout(self.client))}"
                     _tagged = AIMessage(content=error_msg)
                     _tagged.response_metadata['llm_node_error'] = True
+                    _tagged.response_metadata[RUN_FAILURE_NOTICE_KEY] = True
                     _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
                     new_messages.append(_tagged)
                     break

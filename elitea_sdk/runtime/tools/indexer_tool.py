@@ -71,7 +71,7 @@ class IndexerNode(BaseTool):
                     )
                 except Exception as e:
                     logger.error(f"Chunking error: {format_exc()}")
-                    return {"messages": [run_failure_message(f"""Chunking tool {self.chunking_tool} raised an error.\n\nError: {format_exc()}""")]}
+                    return {"messages": [run_failure_message(f"Chunking tool {self.chunking_tool} raised an error. Open the run log for details.")]}
             index_results = self.index_tool.invoke({"documents": chunks if chunks else result}, config=config, kwargs=kwargs)
             logger.info(f"IndexNode response: {index_results}")
             total_time = round((time() - start_time), 2)

@@ -705,9 +705,9 @@ alita_state = elitea_state.copy()
                 exception_type=type(e).__name__,
                 retry_after=getattr(e, 'retry_after', None),
             ))
+            logger.error("FunctionTool %s failed", self.tool.name, exc_info=True)
             return {"messages": [
-                run_failure_message(f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
-                        \n\nTool schema is {safe_serialize(params)}. \n\n Details: {e}""")]}
+                run_failure_message(f"The tool {self.tool.name} failed. Open the run log for details.")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)

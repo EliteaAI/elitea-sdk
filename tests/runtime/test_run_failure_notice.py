@@ -8,13 +8,16 @@ messages whose text reads like a normal answer. Each carries
 import json
 from unittest.mock import patch
 
-from langchain_core.messages import AIMessage, HumanMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 from elitea_sdk.runtime.langchain.langraph_agent import _make_mcp_auth_skip_node
 from elitea_sdk.runtime.tool_outcome import RUN_FAILURE_NOTICE_KEY, run_failure_message
+from elitea_sdk.runtime.tools.agent import AgentNode
+from elitea_sdk.runtime.tools.application import Application
 from elitea_sdk.runtime.tools.function import PIPELINE_BLOCKED_KEY, FunctionTool
 from elitea_sdk.runtime.tools.indexer_tool import IndexerNode
 from elitea_sdk.runtime.tools.llm import LLMNode
@@ -77,14 +80,15 @@ class TestRunFailureMessage:
 
 
 class TestFunctionTool:
-    def test_exception_branch_message_is_tagged(self):
+    def test_exception_branch_message_hides_arguments_schema_and_error(self):
         result = _run(_function_node(_tool(_raise_runtime)))
 
         _assert_tagged(result["messages"])
         content = result["messages"][0]["content"]
-        assert content.startswith("Tool input to the update_issue with value")
-        assert "raised Exception" in content
-        assert "connection refused" in content
+        assert "update_issue" in content
+        assert "connection refused" not in content
+        assert "42" not in content
+        assert "Tool schema" not in content
 
     def test_successful_call_message_is_not_tagged(self):
         result = _run(_function_node(_tool(lambda issue_number: "done")))
@@ -182,6 +186,30 @@ class TestValidationFailureNodes:
         _assert_tagged(result["messages"])
         assert "no_such_chunker raised an error" in result["messages"][0]["content"]
 
+    def test_indexer_node_chunking_error_has_no_traceback(self):
+        node = IndexerNode(
+            tool=_make_schema_tool(), chunking_tool="no_such_chunker", chunking_config={},
+            input_mapping={"issue_number": {"type": "fixed", "value": "1"}},
+            input_variables=[], output_variables=["out"],
+        )
+        with patch("elitea_sdk.runtime.tools.indexer_tool.dispatch_custom_event"):
+            result = node.invoke({})
+
+        content = result["messages"][0]["content"]
+        assert "Traceback" not in content
+        assert "File \"" not in content
+
+    def test_agent_node_validation_error_is_tagged(self):
+        node = AgentNode(
+            tool=_make_schema_tool(), task="Do {text}",
+            input_variables=["text"], output_variables=["out"],
+        )
+        with patch("elitea_sdk.runtime.tools.agent.dispatch_custom_event"):
+            result = node.invoke({"text": "go"})
+
+        _assert_tagged(result["messages"])
+        assert "raised ValidationError" in result["messages"][0]["content"]
+
     def test_indexer_node_index_error_is_tagged(self):
         node = IndexerNode(
             tool=_make_schema_tool(), index_tool=_tool(_raise_runtime, name="index_docs"),
@@ -277,3 +305,146 @@ class TestLlmNode:
         answers = _ai_messages(result)
         assert answers[-1].content == 'all done'
         assert all(RUN_FAILURE_NOTICE_KEY not in m.response_metadata for m in answers)
+
+
+class _RaisingCompletionClient(_ScriptedClient):
+    """Fails every call with the same exception."""
+
+    def __init__(self, error):
+        super().__init__([error])
+
+
+def _run_llm(node):
+    return node.invoke(
+        {'messages': [HumanMessage(content='go')]}, config={'configurable': {'thread_id': 't-notice'}},
+    )
+
+
+def _error_messages(result, text):
+    return [m for m in _ai_messages(result) if text in str(m.content)]
+
+
+class TestLlmProviderErrors:
+    def test_provider_error_in_the_first_call_carries_both_tags(self):
+        result = _run_llm(_llm_node(_RaisingCompletionClient(RuntimeError('provider down'))))
+
+        error = _ai_messages(result)[-1]
+        assert error.content.startswith('Error:')
+        assert error.response_metadata.get('llm_node_error') is True
+        assert error.response_metadata.get(RUN_FAILURE_NOTICE_KEY) is True
+
+    @pytest.mark.parametrize('error_text, expected', [
+        pytest.param('invalid credentials for the model', 'Model configuration error', id='non-recoverable'),
+        pytest.param('provider down', 'Error processing tool results', id='other'),
+    ])
+    def test_provider_error_in_the_tool_loop_carries_both_tags(self, error_text, expected):
+        client = _ScriptedClient([_tool_call(1), RuntimeError(error_text)])
+        result = _run_llm(_llm_node(client))
+
+        failed = _error_messages(result, expected)
+        assert len(failed) == 1
+        assert failed[0].response_metadata.get('llm_node_error') is True
+        assert failed[0].response_metadata.get(RUN_FAILURE_NOTICE_KEY) is True
+
+    @pytest.mark.parametrize('error_text, expected', [
+        pytest.param('maximum context length exceeded', 'Context window exceeded', id='context-window'),
+        pytest.param('output token limit reached', 'Model output limit exceeded', id='output-limit'),
+    ])
+    def test_context_or_output_limit_without_a_tool_message_is_tagged(self, error_text, expected):
+        client = _ScriptedClient([_tool_call(1), RuntimeError(error_text)])
+        node = _llm_node(client)
+        # The follow-up call sees a history with no tool message in it
+        with patch.object(
+            LLMNode, '_filter_orphaned_tool_calls',
+            side_effect=lambda msgs: [m for m in msgs if not isinstance(m, ToolMessage) and not getattr(m, 'tool_calls', None)],
+        ):
+            result = _run_llm(node)
+
+        failed = _error_messages(result, expected)
+        assert len(failed) == 1
+        assert failed[0].response_metadata.get(RUN_FAILURE_NOTICE_KEY) is True
+
+
+class _StubRunnable:
+    """Stands in for a child agent or pipeline: returns the scripted response."""
+
+    def __init__(self, response):
+        self.response = response
+
+    def invoke(self, payload, config=None, **kwargs):
+        return self.response
+
+
+def _nested_app(response):
+    return Application(
+        name='child', description='child agent', application=_StubRunnable(response), client=None,
+    )
+
+
+def _notice(text='Pipeline stopped'):
+    return AIMessage(content=text, response_metadata={RUN_FAILURE_NOTICE_KEY: True})
+
+
+class TestNestedApplication:
+    @pytest.mark.parametrize('response, expected', [
+        pytest.param(
+            {'messages': [HumanMessage(content='go'), _notice()], 'output': 'x'}, True, id='last-message-tagged',
+        ),
+        pytest.param(
+            {'messages': [HumanMessage(content='go'), {'role': 'assistant', 'content': 'x', 'response_metadata': {RUN_FAILURE_NOTICE_KEY: True}}]},
+            True, id='last-message-tagged-dict',
+        ),
+        pytest.param(
+            {'messages': [HumanMessage(content='go'), AIMessage(content='ok')], PIPELINE_BLOCKED_KEY: 'blocked'},
+            True, id='pipeline-blocked',
+        ),
+        pytest.param(
+            {'messages': [HumanMessage(content='go'), AIMessage(content='ok')], 'tool_execution_limit_reached': True},
+            True, id='step-limit',
+        ),
+        pytest.param(
+            {'messages': [_notice(), HumanMessage(content='go'), AIMessage(content='ok')]},
+            False, id='tag-before-this-run',
+        ),
+        pytest.param(
+            {'messages': [HumanMessage(content='go'), _notice(), AIMessage(content='recovered')]},
+            False, id='clean-last-reply',
+        ),
+        pytest.param({'messages': [], 'output': 'text'}, False, id='no-messages'),
+        pytest.param('not a dict', False, id='not-a-dict'),
+    ])
+    def test_child_failed_reads_the_tag_the_blocked_key_and_the_step_limit(self, response, expected):
+        from elitea_sdk.runtime.tools.application import _child_failed
+
+        assert _child_failed(response) is expected
+
+    def test_a_failed_child_reaches_the_parent_as_a_tagged_message(self):
+        response = {
+            'messages': [HumanMessage(content='go'), _notice('The tool failed')],
+            'output': 'The tool failed',
+        }
+
+        result = _nested_app(response)._run(task='go')
+
+        _assert_tagged(result['messages'])
+        assert result['messages'][0]['content'] == 'The tool failed'
+
+    def test_a_blocked_child_reaches_the_parent_as_a_tagged_message(self):
+        response = {
+            'messages': [HumanMessage(content='go'), AIMessage(content='stopped')],
+            'output': 'stopped',
+            PIPELINE_BLOCKED_KEY: 'stopped',
+        }
+
+        result = _nested_app(response)._run(task='go')
+
+        _assert_tagged(result['messages'])
+
+    def test_a_clean_child_reply_is_not_tagged(self):
+        response = {'messages': [HumanMessage(content='go'), AIMessage(content='all done')], 'output': 'all done'}
+
+        result = _nested_app(response)._run(task='go')
+
+        stored = _after_add_messages(result['messages'])[0]
+        assert stored.content == 'all done'
+        assert RUN_FAILURE_NOTICE_KEY not in stored.response_metadata

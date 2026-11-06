@@ -11,6 +11,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
 from ..langchain.utils import log_tool_result
+from ..tool_outcome import run_failure_message
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
 
 logger = logging.getLogger(__name__)
@@ -74,9 +75,9 @@ class AgentNode(BaseTool):
         except ValidationError:
             logger.error(f"ValidationError: {format_exc()}")
             return {
-                "messages": [{"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {agent_input} raised ValidationError. 
+                "messages": [run_failure_message(f"""Tool input to the {self.tool.name} with value {agent_input} raised ValidationError. 
         \n\nTool schema is {dumps(params)} \n\nand the input to LLM was 
-        {input_[-1].content}"""}]}
+        {task}""")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)

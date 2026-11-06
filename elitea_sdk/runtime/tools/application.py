@@ -4,7 +4,9 @@ from uuid import uuid4
 from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 from ..models.agent_response import AgentResponse
 from ..utils.utils import clean_string
+from ..tool_outcome import RUN_FAILURE_NOTICE_KEY, run_failure_message
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
+from .function import PIPELINE_BLOCKED_KEY
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -195,6 +197,25 @@ def _raise_if_llm_node_error(response: Any) -> None:
                     f"Nested agent LLM failed ({_exc_type}): {_msg.content}"
                 )
             return  # final non-Human message is clean; no error
+
+
+def _child_failed(response: Any) -> bool:
+    """True when a nested agent or pipeline run ended in a failure the SDK reported.
+
+    A failure is a blocked pipeline, a reached step limit, or a last message of this run that
+    carries the failure tag. The scan stops at the first HumanMessage (the input boundary of
+    the current run), so a tag from an earlier turn of the same thread does not count.
+    """
+    if not isinstance(response, dict):
+        return False
+    if response.get(PIPELINE_BLOCKED_KEY) or response.get('tool_execution_limit_reached'):
+        return True
+    for _msg in reversed(response.get('messages') or []):
+        if isinstance(_msg, HumanMessage):
+            return False
+        meta = _msg.get('response_metadata') if isinstance(_msg, dict) else getattr(_msg, 'response_metadata', None)
+        return bool((meta or {}).get(RUN_FAILURE_NOTICE_KEY))
+    return False
 
 
 class Application(BaseTool):
@@ -890,7 +911,11 @@ class Application(BaseTool):
         # Build standardized AgentResponse
         agent_response = AgentResponse(
             output=normalized_output,
-            messages=[{"role": "assistant", "content": normalized_output}],
+            # The parent reads the tag, not the text, to tell a failed child from an answer
+            messages=[
+                run_failure_message(normalized_output) if _child_failed(response)
+                else {"role": "assistant", "content": normalized_output}
+            ],
             thread_id=response.get('thread_id') if isinstance(response, dict) else None,
             execution_finished=response.get('execution_finished', True) if isinstance(response, dict) else True,
         )
