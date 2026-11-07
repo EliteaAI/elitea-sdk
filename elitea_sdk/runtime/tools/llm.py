@@ -139,6 +139,7 @@ from .hitl import (
     HITL_VIA_CALL_ID_KEY,
     PendingHITLEntry,
 )
+from .skill_script_runner import ScriptRunContext, SkillScriptRunner, is_canonical_uuid
 from .skill_tools import (
     LoadSkillTool,
     ReadSkillFileTool,
@@ -773,6 +774,7 @@ class LLMNode(BaseTool):
             skill_search=configurable.get('skill_search'),
             skill_body_fetcher=self._resolve_skill_body_fetcher(configurable),
             skill_file_fetcher=getattr(self.elitea_client, 'get_skill_file', None),
+            skill_script_runner=self._build_skill_script_runner(configurable),
         )
 
         def merge_skill_tools(tools):
@@ -1053,6 +1055,25 @@ class LLMNode(BaseTool):
             for skill in configurable.get('invoked_skills') or [] if isinstance(skill, dict)
         }
         return invoked | loaded_skill_names_from_messages(list(chat_history or []))
+
+    def _build_skill_script_runner(self, configurable: dict):
+        """A runner for this turn's scripts, keyed by the conversation the platform verified for the run, or None when
+        the run has no client or the platform sent no such conversation."""
+        scratch = configurable.get('skill_scratch') or {}
+        conversation_uuid = scratch.get('conversation_uuid')
+        if not is_canonical_uuid(conversation_uuid) or not scratch.get('bucket'):
+            return None
+        if not callable(getattr(self.elitea_client, 'get_skill_file', None)):
+            return None
+        return SkillScriptRunner(
+            ScriptRunContext(
+                client=self.elitea_client,
+                scratch_bucket=scratch['bucket'],
+                attachment_bucket=configurable.get('attachment_bucket') or scratch['bucket'],
+                conversation_uuid=conversation_uuid,
+            ),
+            file_fetcher=self.elitea_client.get_skill_file,
+        )
 
     def _resolve_skill_body_fetcher(self, configurable: dict):
         fetcher = configurable.get('skill_body_fetcher')

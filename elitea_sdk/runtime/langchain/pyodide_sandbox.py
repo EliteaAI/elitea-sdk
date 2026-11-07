@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from typing import Annotated, Any, Literal
 
@@ -68,6 +69,7 @@ class BasePyodideSandbox:
         allow_net: list[str] | bool = False,
         allow_run: list[str] | bool = False,
         allow_ffi: list[str] | bool = False,
+        allow_remote_modules: bool = True,
         node_modules_dir: str = "auto",
         skip_deno_check: bool = False,
         pkg_name: str | None = None,
@@ -82,6 +84,7 @@ class BasePyodideSandbox:
             allow_net: Network access (False/True/list of domains).
             allow_run: Subprocess execution (False/True/list of commands).
             allow_ffi: FFI access (False/True/list of libraries).
+            allow_remote_modules: Whether code may import remote, JSR or npm modules.
             node_modules_dir: Node modules directory setting.
             skip_deno_check: Skip Deno installation check.
             pkg_name: Path to the Deno entrypoint script. If not provided,
@@ -94,6 +97,7 @@ class BasePyodideSandbox:
         self.allow_net = allow_net
         self.allow_run = allow_run
         self.allow_ffi = allow_ffi
+        self.allow_remote_modules = allow_remote_modules
         self.node_modules_dir = node_modules_dir
         self.pkg_name = pkg_name or get_default_pkg_name()
 
@@ -140,6 +144,9 @@ class BasePyodideSandbox:
             if permission_flag := build_permission_flag(flag, value=value):
                 cmd.append(permission_flag)
 
+        if not self.allow_remote_modules:
+            cmd.extend(["--no-remote", "--no-npm"])
+
         # WASM memory cap — bounds Pyodide's heap (Python objects, numpy arrays,
         # etc.), which lives in WASM linear memory. This REPLACES the old
         # --max-old-space-size flag, which only capped the V8 JS heap and had no
@@ -182,6 +189,16 @@ class BasePyodideSandbox:
 
         return cmd
 
+    @staticmethod
+    def _run_directory() -> tempfile.TemporaryDirectory:
+        """A temporary directory of one run's own, removed after it: Deno writes what a run's code puts in its caches
+        and web storage under TMPDIR and DENO_DIR, which would otherwise be shared by every run on the worker."""
+        return tempfile.TemporaryDirectory(prefix="pyodide-run-", ignore_cleanup_errors=True)
+
+    @staticmethod
+    def _run_environment(run_directory: tempfile.TemporaryDirectory) -> dict:
+        return {**os.environ, "TMPDIR": run_directory.name, "DENO_DIR": os.path.join(run_directory.name, "deno_dir")}
+
 
 class PyodideSandbox(BasePyodideSandbox):
     """Asynchronous implementation of PyodideSandbox."""
@@ -222,12 +239,14 @@ class PyodideSandbox(BasePyodideSandbox):
                 stderr=f"Failed to encode code as UTF-8: {e}",
             )
 
+        run_directory = self._run_directory()
         spawn_start = time.time()
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._run_environment(run_directory),
         )
         spawn_s = time.time() - spawn_start
         sandbox_timings = None
@@ -262,6 +281,11 @@ class PyodideSandbox(BasePyodideSandbox):
             timed_out = True
         except asyncio.CancelledError:
             pass
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            run_directory.cleanup()
 
         end_time = time.time()
         logger.debug(
@@ -320,6 +344,7 @@ class SyncPyodideSandbox(BasePyodideSandbox):
                 stderr=f"Failed to encode code as UTF-8: {e}",
             )
 
+        run_directory = self._run_directory()
         try:
             process = subprocess.run(
                 cmd,
@@ -328,6 +353,7 @@ class SyncPyodideSandbox(BasePyodideSandbox):
                 text=False,
                 timeout=timeout_seconds,
                 check=False,
+                env=self._run_environment(run_directory),
             )
 
             stdout_bytes = process.stdout
@@ -353,6 +379,8 @@ class SyncPyodideSandbox(BasePyodideSandbox):
             status = "error"
             stderr = f"Execution timed out after {timeout_seconds} seconds"
             timed_out = True
+        finally:
+            run_directory.cleanup()
 
         end_time = time.time()
 
