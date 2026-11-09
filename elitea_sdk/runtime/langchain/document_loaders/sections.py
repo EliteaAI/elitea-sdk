@@ -39,6 +39,8 @@ NUMBER_GAP = 2                      # missed headings tolerated between two acce
 # A heading that starts within this many characters of a chunk's start still names the chunk:
 # page chunks usually begin with a running header line above the first heading.
 HEADING_TOP_SLACK_CHARS = 200
+# This many headings on consecutive lines with no text between them are a contents block or a list.
+MAX_ADJACENT_HEADINGS = 2
 
 _NUMBERED_RE = re.compile(r'^(\d{1,2}(?:\.\d{1,2}){0,5})\.?\s+(\S.*)$')
 _KEYWORD_RE = re.compile(
@@ -60,7 +62,8 @@ class Heading:
     offset: int
     number: Optional[str]
     title: Optional[str]
-    numeric: Optional[tuple] = None  # parsed number, for numbered headings only
+    numeric: Optional[tuple] = None  # parsed number, for the continuity check
+    kind: str = ''                   # '' for "4.2 Title", the keyword ("chapter", ...) otherwise
 
     def metadata(self) -> dict:
         meta = {}
@@ -115,10 +118,27 @@ def heading_candidate(line: str, page: int, offset: int) -> Optional[Heading]:
     match = _KEYWORD_RE.match(line)
     if match:
         title = _clean(match.group(3))
-        if title and not _plausible_title(title):
+        numeric = _keyword_number(match.group(2))
+        if numeric is None or (title and not _plausible_title(title)):
             return None
-        return Heading(page, offset, f'{match.group(1)} {match.group(2)}', title or None)
+        return Heading(page, offset, f'{match.group(1)} {match.group(2)}', title or None, numeric,
+                       match.group(1).lower())
     return None
+
+
+_ROMAN = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100}
+
+
+def _keyword_number(token: str) -> Optional[tuple]:
+    """``4.2`` -> (4, 2); ``IV`` -> (4,); ``B`` -> (2,); anything else -> None."""
+    if token[0].isdigit():
+        numeric = tuple(int(part) for part in token.split('.'))
+        return numeric if all(part <= MAX_NUMBER_COMPONENT for part in numeric) else None
+    if len(token) == 1 and token not in _ROMAN:
+        return (ord(token) - ord('A') + 1,)
+    values = [_ROMAN[ch] for ch in token]
+    total = sum(-v if i + 1 < len(values) and v < values[i + 1] else v for i, v in enumerate(values))
+    return (total,) if 0 < total <= MAX_NUMBER_COMPONENT else None
 
 
 def _is_nested_start(parts: Sequence[int]) -> bool:
@@ -140,38 +160,56 @@ def follows(previous: Optional[tuple], number: tuple) -> bool:
     return False
 
 
-def detect_headings(page_texts: Sequence[str]) -> list[Heading]:
-    """Find headings in page texts (no outline available). Conservative: when in doubt, no heading."""
-    accepted: list[Heading] = []
-    previous: Optional[tuple] = None
-    pending: Optional[Heading] = None
-    for page, text in enumerate(page_texts):
-        candidates = []
-        for line in _CANDIDATE_LINE_RE.finditer(text or ''):
-            raw = line.group(0)
-            if len(raw) > MAX_HEADING_LINE_CHARS * 2:
-                continue
-            candidate = heading_candidate(raw, page, line.start() + len(raw) - len(raw.lstrip()))
-            if candidate is not None:
-                candidates.append(candidate)
-                if len(candidates) > MAX_HEADINGS_PER_PAGE:
-                    break
-        if len(candidates) > MAX_HEADINGS_PER_PAGE:
+def _page_candidates(text: str, page: int) -> list[Heading]:
+    """Heading candidates of one page, without contents blocks (runs of adjacent heading lines)."""
+    candidates: list[Heading] = []
+    run: list[Heading] = []
+    run_end = None
+    for line in _CANDIDATE_LINE_RE.finditer(text):
+        raw = line.group(0)
+        if len(raw) > MAX_HEADING_LINE_CHARS * 2:
             continue
-        for candidate in candidates:
-            if candidate.numeric is None:
+        candidate = heading_candidate(raw, page, line.start() + len(raw) - len(raw.lstrip()))
+        if candidate is None:
+            continue
+        between = text[run_end:line.start()] if run_end is not None else None
+        if between is not None and not between.strip() and between.count('\n') <= 1:
+            run.append(candidate)
+        else:
+            if len(run) <= MAX_ADJACENT_HEADINGS:
+                candidates.extend(run)
+            run = [candidate]
+        run_end = line.end()
+        if len(candidates) + len(run) > MAX_HEADINGS_PER_PAGE:
+            return []
+    if len(run) <= MAX_ADJACENT_HEADINGS:
+        candidates.extend(run)
+    return candidates
+
+
+def detect_headings(page_texts: Sequence[str]) -> list[Heading]:
+    """Find headings in page texts (no outline available). Conservative: when in doubt, no heading.
+
+    "4.2 Title" headings and each keyword ("Chapter 4", "Article 5") form their own numbering chain; a
+    heading is accepted only when it continues its chain, or when two headings agree with each other.
+    """
+    accepted: list[Heading] = []
+    previous: dict[str, tuple] = {}
+    pending: dict[str, Heading] = {}
+    for page, text in enumerate(page_texts):
+        for candidate in _page_candidates(text or '', page):
+            kind, waiting = candidate.kind, pending.get(candidate.kind)
+            if follows(previous.get(kind), candidate.numeric):
                 accepted.append(candidate)
-                continue
-            if follows(previous, candidate.numeric):
-                accepted.append(candidate)
-                previous, pending = candidate.numeric, None
-            elif pending is not None and follows(pending.numeric, candidate.numeric):
-                # Two headings that agree with each other restart the numbering (e.g. after a contents
-                # page or a heading the text extraction lost).
-                accepted.extend((pending, candidate))
-                previous, pending = candidate.numeric, None
+            elif waiting is not None and follows(waiting.numeric, candidate.numeric):
+                # Two headings that agree with each other restart the numbering (e.g. after a heading
+                # the text extraction lost).
+                accepted.extend((waiting, candidate))
             else:
-                pending = candidate
+                pending[kind] = candidate
+                continue
+            previous[kind] = candidate.numeric
+            pending.pop(kind, None)
     return accepted
 
 
@@ -182,6 +220,7 @@ def outline_headings(toc: Iterable[Sequence], page_texts: Sequence[str]) -> list
     is taken to start at the top of its page.
     """
     headings = []
+    folded: dict[int, str] = {}
     for index, entry in enumerate(toc):
         if index >= MAX_OUTLINE_ENTRIES:
             break
@@ -194,19 +233,21 @@ def outline_headings(toc: Iterable[Sequence], page_texts: Sequence[str]) -> list
         number, clean_title = split_heading_text(title)
         if not number and not clean_title:
             continue
-        offset = _find_offset(page_texts[page - 1], title)
+        offset = _find_offset(page_texts[page - 1], title, folded, page)
         headings.append(Heading(page - 1, offset, number, clean_title))
     headings.sort(key=lambda h: (h.page, h.offset))
     return headings
 
 
-def _find_offset(page_text: str, title: str) -> int:
+def _find_offset(page_text: str, title: str, folded: dict, page: int) -> int:
     needle = _clean(title)[:60]
     if not needle or not page_text:
         return 0
     position = page_text.find(needle)
     if position < 0:
-        position = page_text.casefold().find(needle.casefold())
+        if page not in folded:
+            folded[page] = page_text.lower()   # once per page, not once per entry
+        position = folded[page].find(needle.lower())
     return max(position, 0)
 
 
@@ -221,8 +262,9 @@ class SectionIndex:
         return bool(self._headings)
 
     def section_at(self, page: int, offset: int = 0) -> dict:
+        """Section of a chunk starting at ``offset`` of ``page``; the top-of-page slack applies at offset 0 only."""
         from bisect import bisect_right
-        position = bisect_right(self._keys, (page, offset + HEADING_TOP_SLACK_CHARS))
+        position = bisect_right(self._keys, (page, offset + (HEADING_TOP_SLACK_CHARS if offset == 0 else 0)))
         if position == 0:
             return {}
         return self._headings[position - 1].metadata()

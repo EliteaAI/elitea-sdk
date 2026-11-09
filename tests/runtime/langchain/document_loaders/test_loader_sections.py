@@ -96,6 +96,7 @@ def numbered_pdf(tmp_path):
         [*_wrap(BODY * 2), "2 Roles and duties", *_wrap(BODY)],
         ["2.1 Owner duties", *_wrap(BODY), "7 Reasons to stop", *_wrap(BODY)],
         ["Chapter 4: Operations", *_wrap(BODY)],
+        ["Chapter 5: Review", *_wrap(BODY), "Article 5 Data rules apply to every request", *_wrap(BODY)],
     ]
     return _pdf(tmp_path / "numbered.pdf", pages)
 
@@ -130,9 +131,11 @@ class TestPdfOutline:
         docs = [d for d in _load_pdf(outline_pdf, max_tokens=40) if d.metadata["page_number"] == 3]
         assert len(docs) > 2
         assert docs[0].metadata["section_title"] == "Scope"
-        after = [d for d in docs if d.page_content.lstrip().startswith("2 Access control")
-                 or "2 Access control" in d.page_content[:150]]
-        assert after and after[-1].metadata["section_title"] == "Access control"
+        index = next(i for i, d in enumerate(docs) if "2 Access control" in d.page_content)
+        # the chunk that contains the heading starts in section 1; the chunks after it are in section 2
+        if not docs[index].page_content.lstrip().startswith("2 Access control"):
+            assert docs[index].metadata["section_title"] == "Scope"
+        assert all(d.metadata["section_title"] == "Access control" for d in docs[index + 1:])
         assert docs[-1].metadata["section_number"] == "2"
         assert all("start_index" not in d.metadata for d in docs)
 
@@ -151,7 +154,10 @@ class TestPdfHeadings:
         assert (meta[3]["section_number"], meta[3]["section_title"]) == ("1", "Introduction")
         # "7 Reasons to stop" does not continue 2.1, so it is not a heading
         assert (meta[4]["section_number"], meta[4]["section_title"]) == ("2.1", "Owner duties")
+        # two agreeing chapters are needed before a chapter chain starts
         assert (meta[5]["section_number"], meta[5]["section_title"]) == ("Chapter 4", "Operations")
+        # a lone "Article 5 ..." line in body text is not a section
+        assert (meta[6]["section_number"], meta[6]["section_title"]) == ("Chapter 5", "Review")
 
     def test_split_chunk_after_heading_gets_that_heading(self, numbered_pdf):
         docs = [d for d in _load_pdf(numbered_pdf, max_tokens=40) if d.metadata["page_number"] == 3]
@@ -337,3 +343,22 @@ def test_docx_auto_number_skips_overridden_lists(tmp_path):
     assert doc.paragraphs[0].text == "Scope"
     buffer = io.BytesIO()
     doc.save(buffer)
+
+
+class TestReviewFixes:
+    def test_short_contents_block_is_not_a_section(self):
+        pages = ["Contents\n1 Introduction\n2 Scope\n3 Roles\nPreface text follows here.",
+                 "1 Introduction\nbody\n2 Scope\nbody"]
+        found = [(h.page, h.number) for h in detect_headings(pages)]
+        assert found == [(1, "1"), (1, "2")]
+
+    def test_mid_page_chunk_gets_no_slack(self):
+        index = sections.SectionIndex([sections.Heading(0, 0, "1", "A", (1,)), sections.Heading(0, 500, "2", "B", (2,))])
+        assert index.section_at(0, 0)["section_number"] == "1"
+        assert index.section_at(0, 400)["section_number"] == "1"   # heading 100 chars later does not count
+        assert index.section_at(0, 500)["section_number"] == "2"
+
+    def test_heading_text_starting_with_digits_still_gets_its_number(self, tmp_path):
+        path = _docx(tmp_path / "digits.docx", [(1, "Scope"), (1, "2FA rollout")], auto_numbered=True)
+        docs = EliteADocxMammothLoader(file_path=str(path), max_tokens=512).load()
+        assert _sections_of(docs) == [("1", "Scope"), ("2", "2FA rollout")]

@@ -199,13 +199,18 @@ class EliteAPDFLoader:
             splitter = TokenTextSplitter(encoding_name="cl100k_base", chunk_size=self.max_tokens, chunk_overlap=0,
                                          add_start_index=True)
             docs = splitter.split_documents(docs)
+            cursor = {}   # page -> where the previous chunk of that page ended
             for idx, doc in enumerate(docs):
                 doc.metadata['chunk_id'] = idx
-                start = doc.metadata.pop('start_index', 0)
+                page = doc.metadata['page']
+                start = doc.metadata.pop('start_index', -1)
+                if start < 0:   # chunk text not found verbatim in the page (token split inside a character)
+                    start = cursor.get(page, 0)
+                cursor[page] = start + len(doc.page_content)
                 if sections:
                     for key in SECTION_KEYS:
                         doc.metadata.pop(key, None)
-                    doc.metadata.update(sections.section_at(doc.metadata['page'], max(start, 0)))
+                    doc.metadata.update(sections.section_at(page, start))
         return docs
 
     def _section_index(self, docs) -> SectionIndex:
@@ -218,6 +223,8 @@ class EliteAPDFLoader:
             with pymupdf.open(filename=self.file_path, filetype="pdf") as report:
                 if report.needs_pass and self.password:
                     report.authenticate(self.password)
+                # get_toc() is native and proportional to the file's size; outline_headings bounds the work
+                # done with it. (Walking pymupdf.Outline by hand crashes on documents without an outline.)
                 toc = report.get_toc(simple=True)
         except Exception as e:  # pylint: disable=broad-except
             # An unreadable outline only costs the outline; the heading heuristic still runs.

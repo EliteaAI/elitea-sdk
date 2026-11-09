@@ -46,7 +46,7 @@ def _int(value: Optional[str], default: Optional[int] = None) -> Optional[int]:
 
 
 def _numbering_definitions(doc) -> dict[str, tuple[str, dict[int, _Level]]]:
-    """numId -> (abstractNumId, levels). Lists with level overrides are left out (not rendered)."""
+    """numId -> (abstractNumId, levels). Definitions used with a level override are left out (not rendered)."""
     try:
         numbering = doc.part.numbering_part.element
     except Exception:  # pylint: disable=broad-except
@@ -61,10 +61,14 @@ def _numbering_definitions(doc) -> dict[str, tuple[str, dict[int, _Level]]]:
             levels[ilvl] = _Level(start=_int(_val(lvl, 'w:start'), 1), fmt=_val(lvl, 'w:numFmt') or '',
                                   text=_val(lvl, 'w:lvlText') or '', style_id=_val(lvl, 'w:pStyle'))
         abstracts[abstract.get(qn('w:abstractNumId'))] = levels
+    nums = numbering.findall(qn('w:num'))
+    # A level override restarts or reshapes a list; counting it right needs Word's full rules, so every
+    # list sharing that definition is left unrendered.
+    overridden = {_val(num, 'w:abstractNumId') for num in nums if num.find(qn('w:lvlOverride')) is not None}
     definitions = {}
-    for num in numbering.findall(qn('w:num')):
+    for num in nums:
         abstract_id = _val(num, 'w:abstractNumId')
-        if abstract_id in abstracts and num.find(qn('w:lvlOverride')) is None:
+        if abstract_id in abstracts and abstract_id not in overridden:
             definitions[num.get(qn('w:numId'))] = (abstract_id, abstracts[abstract_id])
     return definitions
 
@@ -133,7 +137,8 @@ def number_headings(doc) -> int:
         if not is_heading(paragraph):
             continue
         label = _label(levels, state, ilvl)
-        if not label or paragraph.text.strip().startswith(label.rstrip('.')):
+        first_word = (paragraph.text.split(maxsplit=1) or [''])[0]
+        if not label or first_word.rstrip('.') == label.rstrip('.'):   # number already typed in the text
             continue
         run = OxmlElement('w:r')
         text = OxmlElement('w:t')
