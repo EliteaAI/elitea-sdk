@@ -131,13 +131,15 @@ class AuthSessionExpiredError(Exception):
 # Values the Schedules API of elitea_core accepts (models/pd/schedule_list.py)
 SCHEDULE_LIST_MAX_LIMIT = 100
 SCHEDULE_LIST_FILTERS = frozenset(
-    {'entity_type', 'status', 'enabled', 'owner_ids', 'entity_id', 'version_id', 'search', 'sort_by', 'sort_order'})
+    {'entity_type', 'status', 'enabled', 'owner_ids', 'entity_id', 'version_id', 'index_name', 'search', 'sort_by',
+     'sort_order'})
+SCHEDULE_INDEX_NAME_MAX_LENGTH = 256
 SCHEDULE_MAX_ID = 2 ** 31 - 1
 SCHEDULE_RUN_STATUSES = frozenset(
     {'running', 'success', 'failed', 'skipped', 'blocked', 'waiting_for_approval'})
 SCHEDULE_SORT_BY = frozenset({'name', 'entity_name', 'entity_type', 'next_run', 'last_run', 'enabled'})
 SCHEDULE_SORT_ORDER = frozenset({'asc', 'desc'})
-SCHEDULE_ENTITY_TYPES = frozenset({'agent', 'pipeline'})
+SCHEDULE_ENTITY_TYPES = frozenset({'agent', 'pipeline', 'toolkit_index'})
 SCHEDULE_TRIGGERS = ('manual', 'test')
 
 
@@ -284,7 +286,7 @@ class EliteAClient:
             limit: Rows per page, an int from 1 to 100.
             offset: Rows to skip, an int from 0 to 2**31-1.
             **filters: Query filters, for example entity_type, status, enabled,
-                owner_ids, entity_id, version_id, search. A filter set to None is not sent.
+                owner_ids, entity_id, version_id, index_name, search. A filter set to None is not sent.
                 A list or tuple (owner_ids) is sent as a list: the key repeats
                 once per item in the query string.
 
@@ -295,6 +297,7 @@ class EliteAClient:
             ValueError: limit is not an int from 1 to 100, offset is not an int
                 of 0 or more, a filter key is unknown, owner_ids is not a list
                 of ints, entity_id or version_id is not an int from 1 to 2**31-1,
+                index_name is not a string of 1 to 256 characters,
                 enabled is not a bool, or sort_by, sort_order, entity_type or status
                 is not an allowed value. No request is sent.
             ApiDetailsRequestError: The API answers 400 or more. The error has
@@ -314,6 +317,11 @@ class EliteAClient:
             if value is not None and not (
                     isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= SCHEDULE_MAX_ID):
                 raise ValueError(f"{key} must be an int from 1 to {SCHEDULE_MAX_ID}, got {value!r}")
+        index_name = filters.get('index_name')
+        if index_name is not None and not (
+                isinstance(index_name, str) and 1 <= len(index_name) <= SCHEDULE_INDEX_NAME_MAX_LENGTH):
+            raise ValueError(
+                f"index_name must be a string of 1 to {SCHEDULE_INDEX_NAME_MAX_LENGTH} characters, got {index_name!r}")
         if filters.get('enabled') is not None and not isinstance(filters['enabled'], bool):
             raise ValueError(f"enabled must be a bool, got {filters['enabled']!r}")
         for key, allowed in (('sort_by', SCHEDULE_SORT_BY), ('sort_order', SCHEDULE_SORT_ORDER),
