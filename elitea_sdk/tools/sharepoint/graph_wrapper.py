@@ -97,7 +97,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                  oauth_discovery_endpoint: Optional[str] = None,
                  configuration_uuid: Optional[str] = None,
                  toolkit_id: Optional[int] = None,
-                 toolkit_name: Optional[str] = None):
+                 toolkit_name: Optional[str] = None,
+                 auto_refresh_token: Optional[bool] = None):
         self.site_url = site_url.rstrip('/')
         self._token = token
         self._scopes = scopes
@@ -110,6 +111,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         self._oauth_discovery_endpoint = oauth_discovery_endpoint
         self._configuration_uuid = configuration_uuid
         self._toolkit_id = toolkit_id
+        self._auto_refresh_token = auto_refresh_token
         self._toolkit_name = toolkit_name
         # Lazily resolved and cached
         self.__site_id: Optional[str] = None
@@ -155,6 +157,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             toolkit_name=self._toolkit_name,
             client_id=self._client_id,
             client_secret=self._client_secret,
+            auto_refresh_token=self._auto_refresh_token,
         )
         # The LLM tool runner knows the exact leaf tool from BaseAction metadata.
         # Let it supply that name instead of presenting the SharePoint site URL.
