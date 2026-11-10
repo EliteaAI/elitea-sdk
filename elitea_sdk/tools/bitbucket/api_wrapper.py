@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Dict, List, Optional
+import re
+import threading
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 import fnmatch
 
 from langchain_core.tools import ToolException
@@ -14,7 +16,7 @@ from pydantic.fields import PrivateAttr
 from ..code_indexer_toolkit import CodeIndexerToolkit
 from ..utils import normalize_base_url
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
-from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
+from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper, GrepFileInput, ReadMultipleFilesInput
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PATH
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
@@ -22,20 +24,74 @@ from ..utils.tool_groups import tool_group, with_tool_groups
 
 logger = logging.getLogger(__name__)
 
+# Values pipelines and LLMs send when they mean "no value".
+_EMPTY_TARGET_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined", "n/a"})
+NO_REPOSITORY_MESSAGE = (
+    "No repository specified: pass project='<project key or workspace>' and "
+    "repository='<repository slug>', or configure them on the toolkit."
+)
+FOREIGN_CLIENT_CACHE_SIZE = 32
+_TARGETS_LOCK = threading.Lock()
+
+PROJECT_DESCRIPTION = (
+    "Project key (Bitbucket Server) or workspace (Bitbucket Cloud) of the repository to use. "
+    "Leave empty to use the toolkit's project."
+)
+REPOSITORY_DESCRIPTION = (
+    "Slug of the repository to use. Leave empty to use the toolkit's repository; "
+    "required only when the toolkit has no repository configured."
+)
+
+
+def _normalize_target(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip().strip("'\"").strip()
+    if not value or value.lower() in _EMPTY_TARGET_PLACEHOLDERS:
+        return None
+    return value
+
+
+# Project keys, workspaces and repository slugs are single path segments; a Cloud
+# workspace may also be given as its {uuid}. Anything else would let a call reach
+# REST paths outside the repository, since neither client escapes them.
+_TARGET_SEGMENT = re.compile(r"\{[0-9A-Fa-f-]+\}|[A-Za-z0-9_~-][A-Za-z0-9._~-]*")
+
+
+def _validated_target(value: Optional[str], label: str) -> Optional[str]:
+    if value is not None and not _TARGET_SEGMENT.fullmatch(value):
+        raise ToolException(
+            f"Invalid {label} '{value}': use the project key / workspace and the repository "
+            f"slug exactly as they appear in the repository URL."
+        )
+    return value
+
+
+def _target_fields() -> Dict[str, Any]:
+    # Fresh FieldInfo objects per model: pydantic may adjust them while building one.
+    return {
+        "project": (Optional[str], Field(default=None, description=PROJECT_DESCRIPTION)),
+        "repository": (Optional[str], Field(default=None, description=REPOSITORY_DESCRIPTION)),
+    }
+
+
 # Pydantic model definitions for tool arguments
 CreateBranchModel = create_model(
     "CreateBranchModel",
     branch_name=(str, Field(description="The name of the branch, e.g. `my_branch`.")),
+    **_target_fields(),
 )
 
 DeleteBranchModel = create_model(
     "DeleteBranchModel",
     branch_name=(str, Field(description="The name of the branch to delete, e.g. `my_branch`. Cannot delete main or master branches.")),
+    **_target_fields(),
 )
 
 CreatePullRequestModel = create_model(
     "CreatePullRequestModel",
     pr_json_data=(str, Field(description=create_pr_data)),
+    **_target_fields(),
 )
 
 CreateFileModel = create_model(
@@ -43,6 +99,7 @@ CreateFileModel = create_model(
     file_path=(str, Field(description="The path of the file")),
     file_contents=(str, Field(description="The contents of the file")),
     branch=(str, Field(description="The branch to create the file in")),
+    **_target_fields(),
 )
 
 UpdateFileModel = create_model(
@@ -50,6 +107,7 @@ UpdateFileModel = create_model(
     file_path=(str, Field(description="The path of the file")),
     update_query=(str, Field(description=UPDATE_FILE_PROMPT_NO_PATH, json_schema_extra={'multiline': True})),
     branch=(str, Field(description="The branch to update the file in")),
+    **_target_fields(),
 )
 
 ReadFileModel = create_model(
@@ -58,17 +116,20 @@ ReadFileModel = create_model(
     branch=(str, Field(description="The branch to read the file from")),
     start_line=(Optional[int], Field(default=None, ge=1, description="Starting line number (1-indexed, inclusive) for a partial read. Omit to read from the beginning.")),
     end_line=(Optional[int], Field(default=None, ge=1, description="Ending line number (1-indexed, inclusive) for a partial read. Omit to read to the end.")),
+    **_target_fields(),
 )
 
 SetActiveBranchModel = create_model(
     "SetActiveBranchModel",
     branch_name=(str, Field(description="The name of the branch, e.g. `my_branch`.")),
+    **_target_fields(),
 )
 
 ListBranchesInRepoModel = create_model(
     "ListBranchesInRepoModel",
     limit=(Optional[int], Field(default=20, description="Maximum number of branches to return. If not provided, all branches will be returned.", gt=0)),
-    branch_wildcard=(Optional[str], Field(default=None, description="Wildcard pattern to filter branches by name. If not provided, all branches will be returned."))
+    branch_wildcard=(Optional[str], Field(default=None, description="Wildcard pattern to filter branches by name. If not provided, all branches will be returned.")),
+    **_target_fields(),
 )
 
 ListFilesModel = create_model(
@@ -76,34 +137,40 @@ ListFilesModel = create_model(
     path=(Optional[str], Field(description="The path to list files from", default=None)),
     recursive=(bool, Field(description="Whether to list files recursively", default=True)),
     branch=(Optional[str], Field(description="The branch to list files from")),
+    **_target_fields(),
 )
 
 GetPullRequestsCommitsModel = create_model(
     "GetPullRequestsCommitsModel",
     pr_id=(str, Field(description="The ID of the pull request to get commits from")),
+    **_target_fields(),
 )
 
 GetPullRequestModel = create_model(
     "GetPullRequestModel",
     pr_id=(str, Field(description="The ID of the pull request to get details from")),
+    **_target_fields(),
 )
 
 GetPullRequestsChangesModel = create_model(
     "GetPullRequestsChangesModel",
     pr_id=(str, Field(description="The ID of the pull request to get changes from")),
+    **_target_fields(),
 )
 
 AddPullRequestCommentModel = create_model(
     "AddPullRequestCommentModel",
     pr_id=(str, Field(description="The ID of the pull request to add a comment to")),
     content=(str, Field(description="The comment content")),
-    inline=(Optional[dict], Field(default=None, description="Inline comment details. Example: {'from': 57, 'to': 122, 'path': '<string>'}"))
+    inline=(Optional[dict], Field(default=None, description="Inline comment details. Example: {'from': 57, 'to': 122, 'path': '<string>'}")),
+    **_target_fields(),
 )
 
 ClosePullRequestModel = create_model(
     "ClosePullRequestModel",
     pr_id=(str, Field(description="The ID of the pull request to close")),
     message=(Optional[str], Field(default=None, description="Optional message explaining why the pull request is being closed")),
+    **_target_fields(),
 )
 
 DeleteFileModel = create_model(
@@ -111,6 +178,7 @@ DeleteFileModel = create_model(
     file_path=(str, Field(description="The path of the file")),
     branch=(str, Field(description="The branch to delete the file from")),
     commit_message=(Optional[str], Field(default=None, description="Commit message for deleting the file. Optional.")),
+    **_target_fields(),
 )
 
 AppendFileModel = create_model(
@@ -138,8 +206,13 @@ CommentOnIssueModel = create_model(
 class BitbucketAPIWrapper(CodeIndexerToolkit):
     """Wrapper for Bitbucket API."""
 
-    _bitbucket: Any = PrivateAttr()
-    _active_branch: Any = PrivateAttr()
+    # The client and branch of the configured repository, per instance: two toolkits
+    # in one process must never share them.
+    _bitbucket: Any = PrivateAttr(default=None)
+    _active_branch: Any = PrivateAttr(default=None)
+    # Other repositories a call names, keyed by the lowercased (project, repository).
+    _foreign_clients: Any = PrivateAttr(default=None)
+    _foreign_branches: Any = PrivateAttr(default=None)
 
     # Suppress the decorator-injected 'edit_file' tool: Bitbucket already exposes
     # 'update_file' (which calls self.edit_file internally), so both tools would be
@@ -153,10 +226,10 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
     search_file = BaseCodeToolApiWrapper.search_file
     edit_file = BaseCodeToolApiWrapper.edit_file
     url: str = ''
-    project: str = ''
-    """The key of the project this repo belongs to"""
-    repository: str = ''
-    """The name of the Bitbucket repository"""
+    project: Optional[str] = None
+    """The key of the project this repo belongs to. A default each call may override."""
+    repository: Optional[str] = None
+    """The name of the Bitbucket repository. A default each call may override."""
     username: str = None
     """Username required for authentication."""
     password: SecretStr = None
@@ -186,41 +259,145 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             get_from_dict_or_env(values, ["url"], "BITBUCKET_BASE_URL", default='https://api.bitbucket.org/')
         )
         values['url'] = url_value
-        cls._bitbucket = BitbucketCloudApi(
-            url=url_value,
-            username=values['username'],
-            password=values['password'],
-            workspace=values['project'],
-            repository=values['repository']
-        ) if values.get('cloud') else BitbucketServerApi(
-            url=url_value,
-            username=values['username'],
-            password=values['password'],
-            project=values['project'],
-            repository=values['repository']
-        )
-        cls._active_branch = values.get('branch')
+        values['project'] = _normalize_target(values.get('project'))
+        values['repository'] = _normalize_target(values.get('repository'))
         return super().validate_toolkit(values)
 
+    @model_validator(mode='after')
+    def connect_configured_repository(self) -> 'BitbucketAPIWrapper':
+        # Without a configured repository there is nothing to connect to yet: every call
+        # names its own, and Bitbucket Cloud would fail to look up an empty one.
+        if self.project and self.repository:
+            self._bitbucket = self._build_client(self.project, self.repository)
+        self._active_branch = self.branch
+        return self
+
+    def _build_client(self, project: str, repository: str):
+        password = self.password.get_secret_value() if isinstance(self.password, SecretStr) else self.password
+        if self.cloud:
+            return BitbucketCloudApi(url=self.url, username=self.username, password=password,
+                                     workspace=project, repository=repository)
+        return BitbucketServerApi(url=self.url, username=self.username, password=password,
+                                  project=project, repository=repository)
+
+    def _target_key(self, project: Optional[str] = None, repository: Optional[str] = None) -> Optional[Tuple[str, str]]:
+        """None for the configured repository, else the (project, repository) a call names.
+
+        A call naming only one of the two takes the other from the toolkit configuration.
+        """
+        project = _validated_target(_normalize_target(project), "project")
+        repository = _validated_target(_normalize_target(repository), "repository")
+        if not project and not repository:
+            return None
+        configured = (_normalize_target(self.project), _normalize_target(self.repository))
+        project, repository = project or configured[0], repository or configured[1]
+        if not project or not repository:
+            raise ToolException(NO_REPOSITORY_MESSAGE)
+        if (project.lower(), repository.lower()) == tuple((value or '').lower() for value in configured):
+            return None
+        return project, repository
+
+    def _resolve_target(self, project: Optional[str] = None, repository: Optional[str] = None) -> Tuple[str, str]:
+        """Runtime project/repository, then the configured ones, then an actionable error."""
+        key = self._target_key(project, repository)
+        if key is not None:
+            return key
+        configured = (_normalize_target(self.project), _normalize_target(self.repository))
+        if not all(configured):
+            raise ToolException(NO_REPOSITORY_MESSAGE)
+        return configured
+
+    def _foreign_state(self, name: str) -> Dict:
+        # Caller holds _TARGETS_LOCK.
+        state = getattr(self, name, None)
+        if state is None:
+            state = {}
+            setattr(self, name, state)
+        return state
+
+    def _remember(self, name: str, key: Tuple[str, str], value: Any) -> None:
+        with _TARGETS_LOCK:
+            state = self._foreign_state(name)
+            if key not in state and len(state) >= FOREIGN_CLIENT_CACHE_SIZE:
+                state.pop(next(iter(state)))
+            state[key] = value
+
+    def _client_for(self, project: Optional[str] = None, repository: Optional[str] = None):
+        """The client of the repository a call targets. Never stored as the configured one."""
+        key = self._target_key(project, repository)
+        if key is None:
+            client = getattr(self, '_bitbucket', None)
+            if client is None:
+                raise ToolException(NO_REPOSITORY_MESSAGE)
+            return client
+        cache_key = (key[0].lower(), key[1].lower())
+        # Cached per repository: an index run reads every file of it through one client.
+        with _TARGETS_LOCK:
+            client = self._foreign_state('_foreign_clients').get(cache_key)
+        if client is None:
+            client = self._build_client(*key)
+            self._remember('_foreign_clients', cache_key, client)
+        return client
+
+    def _active_branch_for(self, project: Optional[str] = None, repository: Optional[str] = None) -> Optional[str]:
+        """The configured branch belongs to the configured repository; another one starts on its default."""
+        key = self._target_key(project, repository)
+        if key is None:
+            return getattr(self, '_active_branch', None)
+        cache_key = (key[0].lower(), key[1].lower())
+        with _TARGETS_LOCK:
+            branch = self._foreign_state('_foreign_branches').get(cache_key)
+        if branch is None:
+            client = self._client_for(*key)
+            try:
+                branch = client.default_branch()
+            except Exception as e:
+                raise ToolException(
+                    f"Can't read the default branch of `{key[0]}/{key[1]}`: {e}. "
+                    f"Check the project and repository, or pass the branch explicitly."
+                )
+            if not branch:
+                raise ToolException(
+                    f"Repository `{key[0]}/{key[1]}` has no default branch (it may be empty); "
+                    f"pass the branch explicitly."
+                )
+            self._remember('_foreign_branches', cache_key, branch)
+        return branch
+
+    def _record_active_branch(self, branch: str, project: Optional[str] = None,
+                              repository: Optional[str] = None) -> None:
+        key = self._target_key(project, repository)
+        if key is None:
+            self._active_branch = branch
+        else:
+            self._remember('_foreign_branches', (key[0].lower(), key[1].lower()), branch)
+
+    def _target_suffix(self, project: Optional[str], repository: Optional[str]) -> str:
+        key = self._target_key(project, repository)
+        return f" in `{key[0]}/{key[1]}`" if key else ""
+
     @tool_group('write')
-    def set_active_branch(self, branch_name: str) -> str:
+    def set_active_branch(self, branch_name: str, project: Optional[str] = None, repository: Optional[str] = None) -> str:
         """
         Switches the active branch to the specified branch.
 
         Parameters:
             branch_name (str): The name of the branch to be the current branch
+            project (str, optional): project key/workspace; defaults to the toolkit's
+            repository (str, optional): repository slug; defaults to the toolkit's
 
         Returns:
             str: Success message if branch exists, or ToolException if branch doesn't exist
         """
+        client = self._client_for(project, repository)
         try:
             # Fetch all branches from the repository (no caching)
-            branches = self._bitbucket.list_branches()
+            branches = client.list_branches()
 
             # Check if the requested branch exists
             if branch_name in branches:
-                self._active_branch = branch_name
-                return f"Switched to branch `{branch_name}`"
+                self._record_active_branch(branch_name, project, repository)
+                return f"Switched to branch `{branch_name}`{self._target_suffix(project, repository)}"
             else:
                 # Format branch list for error message
                 if len(branches) <= 30:
@@ -240,7 +417,8 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             raise ToolException(f"Failed to validate branch '{branch_name}': {str(e)}")
 
     @tool_group('read')
-    def list_branches_in_repo(self, limit: Optional[int] = 20, branch_wildcard: Optional[str] = None) -> List[str]:
+    def list_branches_in_repo(self, limit: Optional[int] = 20, branch_wildcard: Optional[str] = None,
+                              project: Optional[str] = None, repository: Optional[str] = None) -> List[str]:
         """
         Lists branches in the repository with optional limit and wildcard filtering.
 
@@ -251,8 +429,9 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             List[str]: List containing names of branches
         """
+        client = self._client_for(project, repository)
         try:
-            branches = self._bitbucket.list_branches()
+            branches = client.list_branches()
 
             if branch_wildcard:
                 branches = [branch for branch in branches if fnmatch.fnmatch(branch, branch_wildcard)]
@@ -265,22 +444,23 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             raise ToolException(f"Failed to list branches: {str(e)}")
 
     @tool_group('write')
-    def create_branch(self, branch_name: str) -> None:
+    def create_branch(self, branch_name: str, project: Optional[str] = None, repository: Optional[str] = None) -> None:
         """Create a new branch in the repository."""
+        client = self._client_for(project, repository)
         try:
-            self._bitbucket.create_branch(branch_name, self._active_branch)
+            client.create_branch(branch_name, self._active_branch_for(project, repository))
         except Exception as e:
             if "not permitted to access this resource" in str(e):
                 return f"Please, verify you token/password: {str}"
             if "already exists" in str(e):
-                self._active_branch = branch_name
+                self._record_active_branch(branch_name, project, repository)
                 return f"Branch {branch_name} already exists. set it as active"
             return f"Unable to create branch due to error:\n{e}"
-        self._active_branch = branch_name
-        return f"Branch {branch_name} created successfully and set as active"
+        self._record_active_branch(branch_name, project, repository)
+        return f"Branch {branch_name} created successfully{self._target_suffix(project, repository)} and set as active"
 
     @tool_group('delete')
-    def delete_branch(self, branch_name: str) -> str:
+    def delete_branch(self, branch_name: str, project: Optional[str] = None, repository: Optional[str] = None) -> str:
         """
         Delete a branch from the repository.
         
@@ -300,9 +480,10 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
                 "Deletion of main or master branches is forbidden for safety reasons."
             )
         
+        client = self._client_for(project, repository)
         try:
             # Fetch all branches to verify the branch exists
-            branches = self._bitbucket.list_branches()
+            branches = client.list_branches()
             
             if branch_name not in branches:
                 raise ToolException(
@@ -311,14 +492,14 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
                 )
             
             # If the deleted branch was the active branch, switch to main
-            if self._active_branch == branch_name:
+            if self._active_branch_for(project, repository) == branch_name:
                 raise ToolException(
                     f"Branch '{branch_name}' cannot be deleted because it is currently the active branch. "
                     "Please switch to a different branch before deleting."
                 )
             
             # Delete the branch
-            self._bitbucket.delete_branch(branch_name)
+            client.delete_branch(branch_name)
 
             return f"Branch '{branch_name}' has been deleted successfully."
             
@@ -331,7 +512,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             raise ToolException(f"Failed to delete branch '{branch_name}': {str(e)}")
 
     @tool_group('write')
-    def create_pull_request(self, pr_json_data: str) -> str:
+    def create_pull_request(self, pr_json_data: str, project: Optional[str] = None, repository: Optional[str] = None) -> str:
         """
         Makes a pull request from the bot's branch to the base branch
         Parameters:
@@ -339,8 +520,9 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: A success or failure message
         """
+        client = self._client_for(project, repository)
         try:
-            pr = self._bitbucket.create_pull_request(pr_json_data)
+            pr = client.create_pull_request(pr_json_data)
             return {'message': 'Successfully created PR.', 'pull_request': pr}
         except Exception as e:
             if "Bad request" in str(e):
@@ -349,7 +531,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             raise ToolException(e)
 
     @tool_group('write')
-    def create_file(self, file_path: str, file_contents: str, branch: str) -> str:
+    def create_file(self, file_path: str, file_contents: str, branch: str, project: Optional[str] = None, repository: Optional[str] = None) -> str:
         """
         Creates a new file on the bitbucket repo
         Parameters:
@@ -359,9 +541,10 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: A success or failure message
         """
+        client = self._client_for(project, repository)
         # Check if file already exists to prevent silent overwrites
         try:
-            self._read_file(file_path, branch)
+            self._read_file(file_path, branch, project=project, repository=repository)
             # If read succeeds, file exists - raise error
             raise ToolException(
                 f"File already exists: {file_path}. Use update_file() to modify existing files."
@@ -379,13 +562,13 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             pass
         
         try:
-            self._bitbucket.create_file(file_path=file_path, file_contents=file_contents, branch=branch)
+            client.create_file(file_path=file_path, file_contents=file_contents, branch=branch)
             return f"File has been created: {file_path}."
         except Exception as e:
             raise ToolException(f"File was not created due to error: {str(e)}")
 
     @tool_group('delete')
-    def delete_file(self, file_path: str, branch: str, commit_message: str = None) -> str:
+    def delete_file(self, file_path: str, branch: str, commit_message: str = None, project: Optional[str] = None, repository: Optional[str] = None) -> str:
         """
         Deletes a file from the bitbucket repo
         Parameters:
@@ -395,14 +578,15 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: A success or failure message
         """
-        branch = branch or self._active_branch
+        client = self._client_for(project, repository)
+        branch = branch or self._active_branch_for(project, repository)
         try:
-            self._read_file(file_path, branch)
+            self._read_file(file_path, branch, project=project, repository=repository)
         except Exception as e:
             raise ToolException(f"File '{file_path}' not found on branch '{branch}': {str(e)}")
 
         try:
-            self._bitbucket.delete_file(
+            client.delete_file(
                 file_path=file_path,
                 branch=branch,
                 commit_message=commit_message or f"Delete {file_path}",
@@ -414,7 +598,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             raise ToolException(f"File was not deleted due to error: {str(e)}")
 
     @tool_group('write')
-    def update_file(self, file_path: str, update_query: str, branch: str) -> ToolException | str:
+    def update_file(self, file_path: str, update_query: str, branch: str, project: Optional[str] = None, repository: Optional[str] = None) -> ToolException | str:
         """
         Updates file on the bitbucket repo
         Parameters:
@@ -442,6 +626,8 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
                 file_path=file_path,
                 branch=branch,
                 file_query=update_query,
+                project=project,
+                repository=repository,
             )
             return result
         except ToolException as e:
@@ -451,7 +637,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             raise ToolException(f"File was not updated due to error: {str(e)}")
 
     @tool_group('read')
-    def get_pull_requests_commits(self, pr_id: str) -> List[Dict[str, Any]]:
+    def get_pull_requests_commits(self, pr_id: str, project: Optional[str] = None, repository: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Get commits from a pull request
         Parameters:
@@ -459,22 +645,23 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             List[Dict[str, Any]]: List of commits in the pull request
         """
+        client = self._client_for(project, repository)
         try:
-            result = self._bitbucket.get_pull_request_commits(pr_id=pr_id)
+            result = client.get_pull_request_commits(pr_id=pr_id)
             return result
         except Exception as e:
             raise ToolException(f"Can't get commits from pull request `{pr_id}` due to error:\n{str(e)}")
 
-    def get_pull_requests(self) -> List[Dict[str, Any]]:
+    def get_pull_requests(self, project: Optional[str] = None, repository: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Get pull requests from the repository
         Returns:
             List[Dict[str, Any]]: List of pull requests in the repository
         """
-        return self._bitbucket.get_pull_requests()
+        return self._client_for(project, repository).get_pull_requests()
 
     @tool_group('read')
-    def get_pull_request(self, pr_id: str) -> Dict[str, Any]:
+    def get_pull_request(self, pr_id: str, project: Optional[str] = None, repository: Optional[str] = None) -> Dict[str, Any]:
         """
         Get details of a pull request
         Parameters:
@@ -482,13 +669,14 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             dict: Details of the pull request as a dictionary
         """
+        client = self._client_for(project, repository)
         try:
-            return self._bitbucket.get_pull_request(pr_id=pr_id)
+            return client.get_pull_request(pr_id=pr_id)
         except Exception as e:
             raise ToolException(f"Can't get pull request `{pr_id}` due to error:\n{str(e)}")
 
     @tool_group('read')
-    def get_pull_requests_changes(self, pr_id: str) -> Dict[str, Any]:
+    def get_pull_requests_changes(self, pr_id: str, project: Optional[str] = None, repository: Optional[str] = None) -> Dict[str, Any]:
         """
         Get changes of a pull request
         Parameters:
@@ -496,13 +684,14 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             dict: Changes of the pull request as a dictionary
         """
+        client = self._client_for(project, repository)
         try:
-            return self._bitbucket.get_pull_requests_changes(pr_id=pr_id)
+            return client.get_pull_requests_changes(pr_id=pr_id)
         except Exception as e:
             raise ToolException(f"Can't get changes from pull request `{pr_id}` due to error:\n{str(e)}")
 
     @tool_group('write')
-    def add_pull_request_comment(self, pr_id: str, content, inline=None) -> str:
+    def add_pull_request_comment(self, pr_id: str, content, inline=None, project: Optional[str] = None, repository: Optional[str] = None) -> str:
         """
         Add a comment to a pull request. Supports multiple content types and inline comments.
         Parameters:
@@ -512,13 +701,14 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: A success or failure message
         """
+        client = self._client_for(project, repository)
         try:
-            return self._bitbucket.add_pull_request_comment(pr_id=pr_id, content=content, inline=inline)
+            return client.add_pull_request_comment(pr_id=pr_id, content=content, inline=inline)
         except Exception as e:
             raise ToolException(f"Can't add comment to pull request `{pr_id}` due to error:\n{str(e)}")
 
     @tool_group('write')
-    def close_pull_request(self, pr_id: str, message: str = None) -> str:
+    def close_pull_request(self, pr_id: str, message: str = None, project: Optional[str] = None, repository: Optional[str] = None) -> str:
         """
         Close (decline) a pull request without merging it.
         Parameters:
@@ -527,13 +717,14 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: A success or failure message
         """
+        client = self._client_for(project, repository)
         try:
-            result = self._bitbucket.close_pull_request(pr_id=pr_id, message=message)
+            result = client.close_pull_request(pr_id=pr_id, message=message)
             return {'message': f'Successfully closed pull request {pr_id}.', 'pull_request': result}
         except Exception as e:
             raise ToolException(f"Can't close pull request `{pr_id}` due to error:\n{str(e)}")
 
-    def _get_files(self, path: str, branch: str, recursive: bool = True) -> List[str]:
+    def _get_files(self, path: str, branch: str, recursive: bool = True, project: Optional[str] = None, repository: Optional[str] = None) -> List[str]:
         """
         Get files from the bitbucket repo
         Parameters:
@@ -543,7 +734,15 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: List of the files
         """
-        return self._bitbucket.get_files_list(file_path=path if path else '', branch=branch if branch else self._active_branch, recursive=recursive)
+        client = self._client_for(project, repository)
+        return client.get_files_list(file_path=path if path else '',
+                                     branch=branch if branch else self._active_branch_for(project, repository),
+                                     recursive=recursive)
+
+    def _get_files_with_identity(self, path: str, branch: str, **target) -> Optional[Dict[str, str]]:
+        # Bitbucket listings carry no blob identity; accepting the target keeps the
+        # indexer's listing call uniform.
+        return None
 
     # TODO: review this method, it may not work as expected
     # def _file_commit_hash(self, file_path: str, branch: str):
@@ -560,7 +759,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
     #     except Exception as e:
     #         raise ToolException(f"Can't extract file commit hash (`{file_path}`) due to error:\n{str(e)}")
 
-    def _read_file(self, file_path: str, branch: str, **kwargs) -> str:
+    def _read_file(self, file_path: str, branch: str, project: Optional[str] = None, repository: Optional[str] = None, **kwargs) -> str:
         """
         Reads a file from the bitbucket repo with optional partial read support.
         
@@ -572,25 +771,28 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         Returns:
             str: The file decoded as a string
         """
-        branch = branch.strip() if branch and branch.strip() else self._active_branch
+        client = self._client_for(project, repository)
+        branch = branch.strip() if branch and branch.strip() else self._active_branch_for(project, repository)
         try:
-            return self._bitbucket.get_file(file_path=file_path, branch=branch)
+            return client.get_file(file_path=file_path, branch=branch)
         except Exception as e:
             raise ToolException(f"Can't extract file content (`{file_path}`) due to error:\n{str(e)}")
 
     @tool_group('read')
-    def list_files(self, path: str = None, recursive: bool = True, branch: str = None) -> List[str]:
+    def list_files(self, path: str = None, recursive: bool = True, branch: str = None,
+                   project: Optional[str] = None, repository: Optional[str] = None) -> List[str]:
         """List files in the repository with optional path, recursive search, and branch."""
-        branch = branch if branch else self._active_branch
+        branch = branch if branch else self._active_branch_for(project, repository)
         try:
-            files = self._get_files(path, branch, recursive)
+            files = self._get_files(path, branch, recursive, project=project, repository=repository)
             return files if isinstance(files, list) else [str(files)]
         except Exception as e:
             raise ToolException(f"Failed to list files: {str(e)}")
 
     @tool_group('read')
     def read_file(self, file_path: str, branch: str,
-                  start_line: Optional[int] = None, end_line: Optional[int] = None) -> Any:
+                  start_line: Optional[int] = None, end_line: Optional[int] = None,
+                  project: Optional[str] = None, repository: Optional[str] = None) -> Any:
         """Read the contents of a file in the repository.
 
         Parameters:
@@ -604,7 +806,7 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             guidance object (dict) if it exceeds the size limit.
         """
         try:
-            full_content = self._read_file(file_path, branch)
+            full_content = self._read_file(file_path, branch, project=project, repository=repository)
         except Exception as e:
             raise ToolException(f"Failed to read file {file_path}: {str(e)}")
 
@@ -623,7 +825,8 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
 
     @tool_group('read')
     def read_multiple_files(self, file_paths: List[str], branch: str = None,
-                            offset: Optional[int] = None, limit: Optional[int] = None) -> Dict[str, Any]:
+                            offset: Optional[int] = None, limit: Optional[int] = None,
+                            project: Optional[str] = None, repository: Optional[str] = None) -> Dict[str, Any]:
         """
         Read multiple files in batch, capped both per-file and cumulatively.
 
@@ -631,7 +834,10 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         file alone exceeds the per-file cap, or a skip notice once the batch's
         cumulative cap is reached (remaining files are not fetched at all).
         """
-        return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
+        def read_file(file_path, **kwargs):
+            return self.read_file(file_path, project=project, repository=repository, **kwargs)
+
+        return capped_read_multiple_files(read_file, file_paths, branch=branch, offset=offset, limit=limit)
 
     def _write_file(
         self,
@@ -639,6 +845,8 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         content: str,
         branch: str = None,
         commit_message: str = None,
+        project: Optional[str] = None,
+        repository: Optional[str] = None,
     ) -> str:
         """Write content to a file (create or update) via the underlying Bitbucket client.
 
@@ -646,11 +854,12 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         implementations, so all backend-specific commit behavior (server vs cloud) is
         centralized there. Used by BaseCodeToolApiWrapper.edit_file.
         """
-        branch = branch or self._active_branch
+        client = self._client_for(project, repository)
+        branch = branch or self._active_branch_for(project, repository)
         try:
             # Delegate actual write/commit to the underlying API wrapper, which
             # implements _write_file(file_path, content, branch, commit_message).
-            self._bitbucket._write_file(
+            client._write_file(
                 file_path=file_path,
                 content=content,
                 branch=branch,
@@ -661,6 +870,35 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
             raise
         except Exception as e:
             raise ToolException(f"Unable to write file {file_path} on branch {branch}: {str(e)}")
+
+    def _index_tool_params(self):
+        return {**super()._index_tool_params(), **_target_fields()}
+
+    def _index_target(self, index_kwargs: dict) -> Dict[str, str]:
+        # Resolved before any listing, so an index without a repository fails with the actionable message.
+        project, repository = self._resolve_target(index_kwargs.get('project'), index_kwargs.get('repository'))
+        return {'project': project, 'repository': repository}
+
+    def _index_target_metadata(self, target: Dict[str, str]) -> Dict[str, str]:
+        if target.get('project') and target.get('repository'):
+            return {'repository': f"{target['project']}/{target['repository']}"}
+        return {}
+
+    def _index_branch(self, branch: Optional[str], target: Dict[str, str]) -> Optional[str]:
+        # The toolkit's branches belong to its own repository; another one is read on its default branch.
+        if branch or self._target_key(target.get('project'), target.get('repository')) is None:
+            return super()._index_branch(branch, target)
+        return self._active_branch_for(target.get('project'), target.get('repository'))
+
+    def _get_file_operation_schemas(self):
+        # The injected file operations take the same per-call repository as every other tool.
+        return {
+            name: create_model(f"Bitbucket{name.title().replace('_', '')}Input", __base__=schema, **_target_fields())
+            for name, schema in (
+                ("read_multiple_files", ReadMultipleFilesInput),
+                ("grep_file", GrepFileInput),
+            )
+        }
 
     @with_tool_groups
     @extend_with_parent_available_tools
