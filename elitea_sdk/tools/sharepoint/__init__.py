@@ -70,11 +70,27 @@ def _resolve_sharepoint_site_url(sp_config: dict, site_path: Optional[str]) -> d
     return resolved_config
 
 
+SITE_URL_REQUIRED = "SharePoint Site URL is required: set it in the toolkit configuration."
+
+
+def _with_toolkit_site_url(sp_config: dict, site_url: Optional[str]) -> dict:
+    """The site belongs to the toolkit (#7197). A credential saved before may still carry one: it is the fallback for a
+    toolkit that has none yet, so nothing stops working before its site is moved over."""
+    resolved = dict(sp_config)
+    toolkit_site = site_url.strip() if isinstance(site_url, str) else ''
+    if toolkit_site:
+        resolved['site_url'] = toolkit_site
+    elif not (resolved.get('site_url') or '').strip():
+        raise ToolException(SITE_URL_REQUIRED)
+    return resolved
+
+
 def get_tools(tool):
     return (SharepointToolkit()
             .get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         sharepoint_configuration=tool['settings']['sharepoint_configuration'],
+        site_url=tool['settings'].get('site_url'),
         site_path=tool['settings'].get('site_path'),
         tokens = tool['settings'].get('tokens', {}),
         toolkit_name=tool.get('toolkit_name'),
@@ -101,13 +117,14 @@ class SharepointToolkit(BaseToolkit):
             name,
             sharepoint_configuration=(SharepointConfiguration, Field(description=get_credentials_tooltip("SharePoint"), json_schema_extra={'configuration_types': ['sharepoint']})),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
+            site_url=(str, Field(description="SharePoint Site URL, e.g. https://tenant.sharepoint.com/sites/site-name")),
             site_path=(Optional[str], Field(
                 default=None,
                 description=(
-                    "SharePoint site path relative to the tenant URL. "
-                    "Use when the credential site_url is only the tenant URL. "
+                    "SharePoint site path relative to the tenant URL of the Site URL. "
+                    "Use when the Site URL is only the tenant URL. "
                     "Examples: sites/site-name or teams/team-name. "
-                    "Leave empty for credentials where site_url already includes the site path."
+                    "Leave empty when the Site URL already includes the site path."
                 ),
             )),
             # indexer settings
@@ -133,9 +150,9 @@ class SharepointToolkit(BaseToolkit):
         # Extract toolkit_id from kwargs before constructing wrapper_payload
         toolkit_id = kwargs.get('toolkit_id')
 
-        # Resolve site URL: combine credential site_url + toolkit site_path if provided.
+        # Resolve site URL: the toolkit's site_url (credential's only as a fallback), then the toolkit site_path.
         sp_config = _resolve_sharepoint_site_url(
-            kwargs.get('sharepoint_configuration', {}),
+            _with_toolkit_site_url(kwargs.get('sharepoint_configuration', {}), kwargs.get('site_url')),
             kwargs.get('site_path'),
         )
 

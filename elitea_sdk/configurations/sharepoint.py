@@ -18,6 +18,10 @@ DELEGATION_UNSUPPORTED = (
     "works in runs you start yourself from Elitea."
 )
 
+# Stands in for the site while a credential is signed in without one (#7197)
+GRAPH_RESOURCE = "https://graph.microsoft.com"
+
+
 class SharepointConfiguration(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
@@ -59,7 +63,13 @@ class SharepointConfiguration(BaseModel):
     oauth_app_id: Optional[str] = OAUTH_APP_ID_FIELD
     client_id: Optional[str] = Field(default=None, description="SharePoint Client ID")
     client_secret: Optional[SecretStr] = Field(default=None, description="SharePoint Client Secret")
-    site_url: str = Field(description="SharePoint Site URL")
+    # Deprecated (#7197): the site belongs to the toolkit, so one credential can serve many sites. Kept optional and
+    # hidden so credentials (and toolkits) saved before keep working: the toolkit falls back to it.
+    site_url: Optional[str] = Field(
+        default=None,
+        description="Deprecated: set the Site URL on the toolkit instead",
+        json_schema_extra={"hidden": True},
+    )
 
     # Additional fields for delegated/OAuth flows
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth Discovery Endpoint. Usually in format: https://login.microsoftonline.com/{tenant_id}")
@@ -122,7 +132,8 @@ class SharepointConfiguration(BaseModel):
 
         Args:
             settings: Dictionary that may contain:
-                - site_url (required for both flows)
+                - site_url (optional, deprecated: since #7197 the site is set on the toolkit; without it
+                  only the credentials themselves are checked)
                 - oauth_discovery_endpoint: activates the delegated flow
                 - access_token: pre-obtained OAuth bearer token (delegated flow)
                 - client_id / client_secret: app credentials
@@ -149,6 +160,12 @@ class SharepointConfiguration(BaseModel):
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _site_absent(settings: dict) -> bool:
+        """True when the credential carries no site (the normal case since #7197)."""
+        site_url = settings.get("site_url")
+        return site_url is None or (isinstance(site_url, str) and not site_url.strip())
 
     @staticmethod
     def _validate_site_url(settings: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -471,7 +488,10 @@ class SharepointConfiguration(BaseModel):
         ``www_authenticate``, and ``resource_metadata_url``, so upstream
         handlers need no special-casing for SharePoint.
         """
-        site_url, err = SharepointConfiguration._validate_site_url(settings)
+        if SharepointConfiguration._site_absent(settings):
+            site_url, err = GRAPH_RESOURCE, None   # no site to probe: only the sign-in itself can be checked
+        else:
+            site_url, err = SharepointConfiguration._validate_site_url(settings)
         if err:
             return err
 
@@ -498,6 +518,8 @@ class SharepointConfiguration(BaseModel):
                 client_id=app_client_id,
             )
 
+        if site_url == GRAPH_RESOURCE:
+            return None   # signed in; which site is probed is decided by each toolkit
         # Use Graph API for health-check — delegated tokens are Graph tokens
         return SharepointConfiguration._call_graph_api(
             site_url, access_token, oauth_discovery_endpoint, scopes, configuration_uuid,
@@ -533,6 +555,8 @@ class SharepointConfiguration(BaseModel):
         if not client_secret or not client_secret.strip():
             return "Client secret cannot be empty"
 
+        if SharepointConfiguration._site_absent(settings):
+            return None   # client id and secret are present; there is no site to try them on (#7197)
         site_url, err = SharepointConfiguration._validate_site_url(settings)
         if err:
             return err
