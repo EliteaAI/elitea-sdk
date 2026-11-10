@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 # not reviewed twice while a different sensitive tool called inside it (a sub-agent) is still reviewed.
 _REVIEWED: ContextVar[frozenset] = ContextVar('sensitive_tool_reviewed', default=frozenset())
 
+# (tool id, input) pairs that an async call approved just before it raised NotImplementedError or
+# AttributeError. The caller then runs the sync invoke for the same logical call. The approval was
+# already taken from the resume value, so a second review would pause again on the same call.
+# The first sync invoke with an equal input takes its pair out, so a later call is still reviewed.
+_FALLBACK_APPROVED: ContextVar[tuple] = ContextVar('sensitive_tool_fallback_approved', default=())
+
 from ..toolkits.security import (
     find_sensitive_tool_match,
     get_sensitive_tool_policy,
@@ -395,8 +401,16 @@ class SensitiveToolGuardMiddleware(Middleware):
         # handler) re-binds them to its own copy, so its patch of func/_run is still reached.
         # A tool without a native coroutine runs its sync invoke from ainvoke; the flag keeps
         # that inner call from asking the user a second time. Executors copy the context.
+        def take_fallback_approval(input: Any) -> bool:
+            pending = _FALLBACK_APPROVED.get()
+            for entry in pending:
+                if entry[0] == id(original_tool) and entry[1] == input:
+                    _FALLBACK_APPROVED.set(tuple(item for item in pending if item is not entry))
+                    return True
+            return False
+
         def guarded_invoke(tool_self: BaseTool, input: Any, config: Any = None, **kwargs: Any) -> Any:
-            if id(original_tool) not in _REVIEWED.get():
+            if id(original_tool) not in _REVIEWED.get() and not take_fallback_approval(input):
                 blocked = guard._blocked_result_if_rejected(original_tool, input)
                 if blocked is not None:
                     return blocked
@@ -407,13 +421,20 @@ class SensitiveToolGuardMiddleware(Middleware):
                 _REVIEWED.reset(token)
 
         async def guarded_ainvoke(tool_self: BaseTool, input: Any, config: Any = None, **kwargs: Any) -> Any:
-            if id(original_tool) not in _REVIEWED.get():
+            reviewed_here = id(original_tool) not in _REVIEWED.get()
+            if reviewed_here:
+                # A new async call is a new logical call: an approval left by an earlier one is stale.
+                _FALLBACK_APPROVED.set(tuple(e for e in _FALLBACK_APPROVED.get() if e[0] != id(original_tool)))
                 blocked = guard._blocked_result_if_rejected(original_tool, input)
                 if blocked is not None:
                     return blocked
             token = _REVIEWED.set(_REVIEWED.get() | {id(original_tool)})
             try:
                 return await type(tool_self).ainvoke(tool_self, input, config, **kwargs)
+            except (NotImplementedError, AttributeError):
+                if reviewed_here:
+                    _FALLBACK_APPROVED.set(_FALLBACK_APPROVED.get() + ((id(original_tool), input),))
+                raise
             finally:
                 _REVIEWED.reset(token)
 
