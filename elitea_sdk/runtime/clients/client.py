@@ -1064,7 +1064,6 @@ class EliteAClient:
                 "default_headers": {
                     "openai-organization": str(self.project_id),
                     **({"Authorization": f"Bearer {self.auth_token}"} if getattr(self, 'auth_token', None) else {}),
-                    "anthropic-beta": "prompt-caching-2024-07-31",
                     **(getattr(self, "api_extra_headers", None) or {}),
                     **self._llm_cookie_headers,
                     **owner_headers,

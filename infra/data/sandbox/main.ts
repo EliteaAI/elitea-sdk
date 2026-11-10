@@ -22,11 +22,23 @@
  * CLI arguments. This avoids Linux kernel's MAX_ARG_STRLEN 128KB limit on
  * individual command-line arguments when passing large code payloads.
  * Issue: EliteaAI/elitea_issues#6249
+ *
+ * FIX 4: Loads Pyodide from <SANDBOX_BASE>/pyodide, the local distribution, with the Node globals it expects,
+ * and takes the path and argument helpers from node: built-ins, so the sandbox loads no npm or JSR module.
  */
 
-import { loadPyodide } from "npm:pyodide@0.29.0";
-import { join } from "jsr:@std/path@^1.0.8";
-import { parseArgs } from "jsr:/@std/cli@^1.0.16/parse-args";
+import { createRequire } from "node:module";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
+
+const nodeGlobals = globalThis as any;
+nodeGlobals.require ??= createRequire(import.meta.url);
+nodeGlobals.__filename ??= fileURLToPath(import.meta.url);
+nodeGlobals.__dirname ??= fileURLToPath(new URL(".", import.meta.url));
+
+const sandboxBase = Deno.env.get("SANDBOX_BASE") ?? fileURLToPath(new URL("../../", import.meta.url));
+const { loadPyodide } = await import(pathToFileURL(join(sandboxBase, "pyodide", "pyodide.mjs")).href);
 
 
 const pkgVersion = "0.0.4-patched";
@@ -347,19 +359,18 @@ async function runPython(
 }
 
 async function main(): Promise<void> {
-  const flags = parseArgs(Deno.args, {
-    string: ["code", "file", "session-bytes", "session-metadata"],
-    alias: {
-      c: "code",
-      f: "file",
-      h: "help",
-      V: "version",
-      s: "stateful",
-      b: "session-bytes",
-      m: "session-metadata",
+  const { values: flags } = parseArgs({
+    args: Deno.args,
+    options: {
+      code: { type: "string", short: "c" },
+      file: { type: "string", short: "f" },
+      "session-bytes": { type: "string", short: "b" },
+      "session-metadata": { type: "string", short: "m" },
+      help: { type: "boolean", short: "h", default: false },
+      version: { type: "boolean", short: "V", default: false },
+      stateful: { type: "boolean", short: "s", default: false },
+      stdin: { type: "boolean", default: false },
     },
-    boolean: ["help", "version", "stateful", "stdin"],
-    default: { help: false, version: false, stateful: false, stdin: false },
   });
 
   if (flags.help) {

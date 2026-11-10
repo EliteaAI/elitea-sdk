@@ -22,6 +22,7 @@ from typing import Any, Callable, List, Optional
 from xml.sax.saxutils import escape as xml_escape
 
 from langchain_core.callbacks import CallbackManagerForToolRun
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -47,6 +48,8 @@ from ..langchain.constants import (
     READ_SKILL_FILE_PREFIX_RE,
     READ_SKILL_FILE_RESULT,
     READ_SKILL_FILE_TOOL_DESCRIPTION,
+    READ_SKILL_OUTPUT_TOOL_DESCRIPTION,
+    RUN_SKILL_SCRIPT_TOOL_DESCRIPTION,
     SEARCH_SKILLS_DESCRIPTION_MAX_CHARS,
     SEARCH_SKILLS_NAME_WEIGHT,
     SEARCH_SKILLS_NO_MATCH,
@@ -87,12 +90,15 @@ from ..langchain.constants import (
     SKILL_FILES_LISTING_FILE,
     SKILL_FILES_LISTING_LIMIT,
     SKILL_FILES_LISTING_MORE,
+    SKILL_FILES_RUN_SCRIPTS_NOTE,
     SKILL_FILES_SCRIPTS_NOTE,
     SKILL_ROOT_URI,
     SKILL_SCRIPT_DIRECTORY,
     SKILL_SCRIPT_EXTENSIONS,
     SKILL_SHELL_UNAVAILABLE,
 )
+from .sandbox import _read_sandbox_limits_from_env
+from .skill_script_runner import INLINE_OUTPUT_CHARS, is_python_script
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +151,7 @@ def loaded_skill_names_from_messages(messages) -> set:
     re-load becomes possible again. The worst case of an unmappable call id is one
     duplicate body, never a permanently unloadable skill."""
     results = [
-        content for tool_name in ('load_skill', 'read_skill_file', 'list_skill_files')
+        content for tool_name in ('load_skill', 'read_skill_file', 'list_skill_files', 'run_skill_script')
         for content in collect_tool_results(messages, tool_name)
     ]
     return {
@@ -208,6 +214,19 @@ def has_scripts(files: list) -> bool:
     )
 
 
+def has_python_scripts(files: list) -> bool:
+    """Whether a skill bundles a script the offline sandbox can run."""
+    return any(is_python_script(entry['path']) for entry in files)
+
+
+def render_scripts_note(name: str, files: list, scripts_runnable: bool) -> str:
+    """How the model may use the skill's scripts: run them when a runner is bound, read them otherwise."""
+    if scripts_runnable and has_python_scripts(files):
+        example = min((entry['path'] for entry in files if is_python_script(entry['path'])), key=str.casefold)
+        return SKILL_FILES_RUN_SCRIPTS_NOTE.format(name=name, example=example)
+    return SKILL_FILES_SCRIPTS_NOTE if has_scripts(files) else ''
+
+
 def render_skill_files_listing(files: list) -> str:
     """Top-level files with sizes and folders collapsed to a file count, capped at the listing limit."""
     folders = Counter(entry['path'].split('/', 1)[0] for entry in files if '/' in entry['path'])
@@ -224,7 +243,7 @@ def render_skill_files_listing(files: list) -> str:
     return '\n'.join(lines)
 
 
-def render_skill_files_block(name: str, files) -> str:
+def render_skill_files_block(name: str, files, scripts_runnable: bool = False) -> str:
     """The skill root, how to read its files and their listing; empty for a skill without files."""
     files = select_skill_files(files)
     if not files:
@@ -232,15 +251,15 @@ def render_skill_files_block(name: str, files) -> str:
     return SKILL_FILES_BLOCK.format(
         name=name,
         example=min((entry['path'] for entry in files), key=lambda path: (path.count('/'), path.casefold())),
-        scripts_note=SKILL_FILES_SCRIPTS_NOTE if has_scripts(files) else '',
+        scripts_note=render_scripts_note(name, files, scripts_runnable),
         listing=render_skill_files_listing(files),
     )
 
 
-def render_loaded_skill(template: str, name: str, instructions: str, files=None) -> str:
+def render_loaded_skill(template: str, name: str, instructions: str, files=None, scripts_runnable: bool = False) -> str:
     """A loaded skill as the model reads it: the template around the rendered body, then its files block."""
     rendered = template.format(name=name, instructions=render_skill_body(name, str(instructions)))
-    files_block = render_skill_files_block(name, files)
+    files_block = render_skill_files_block(name, files, scripts_runnable)
     return f"{rendered}\n\n{files_block}" if files_block else rendered
 
 
@@ -371,6 +390,7 @@ class LoadSkillTool(BaseTool):
     invoked_skills: list = Field(default_factory=list, exclude=True)
     body_fetcher: Optional[Any] = Field(default=None, exclude=True)
     listed: bool = Field(default=False, exclude=True)
+    scripts_runnable: bool = Field(default=False, exclude=True)
     metadata: dict = {
         "toolkit_type": "internal",
         "toolkit_name": "skills",
@@ -401,7 +421,7 @@ class LoadSkillTool(BaseTool):
             return LOAD_SKILL_UNAVAILABLE.format(name=name, reason=reason)
         self._already_loaded.add(normalized_name)
         logger.info("[Skills] load_skill served %r", name)
-        return render_loaded_skill(LOADED_SKILL_RESULT, name, instructions, matched.get('files'))
+        return render_loaded_skill(LOADED_SKILL_RESULT, name, instructions, matched.get('files'), self.scripts_runnable)
 
     def _is_invoked(self, matched: dict) -> bool:
         invoked_keys = {_build_skill_identity(s) for s in self.invoked_skills if s.get('skill_id') is not None}
@@ -660,6 +680,115 @@ class ListSkillFilesTool(SkillFileTool):
         return self._list(skill, dir)
 
 
+class RunSkillScriptInput(BaseModel):
+    skill: str = Field(description="Exact name of a loaded skill that has Python scripts.")
+    path: str = Field(description="Path of the .py script relative to the skill root, as listed in <skill_files>, such as \"scripts/check.py\".")
+    args: List[str] = Field(default_factory=list, description="Command-line arguments for the script, one string each, as sys.argv[1:].")
+    files: List[str] = Field(default_factory=list, description="Names of conversation attachments the script must read; each appears under inputs/ in the working directory.")
+
+
+class RunSkillScriptTool(SkillFileTool):
+    name: str = "run_skill_script"
+    description: str = RUN_SKILL_SCRIPT_TOOL_DESCRIPTION.format(
+        timeout=int(_read_sandbox_limits_from_env()['timeout_seconds']), inline_chars=INLINE_OUTPUT_CHARS,
+    )
+    args_schema: type[BaseModel] = RunSkillScriptInput
+    runner: Any = Field(exclude=True)
+
+    def _resolve_script(self, skill: str, path: str):
+        """The loaded skill, its manifest, the script's path and the body this call loaded, or the reason the model
+        gets instead."""
+        matched, manifest, refusal, loaded = self._resolve_loaded_skill(skill)
+        if refusal:
+            return None, refusal
+        name = matched.get('name')
+        relative_path = normalize_skill_path(name, path)
+        if relative_path is None:
+            return None, self._after_load(loaded, SKILL_FILE_OUTSIDE_ROOT.format(name=name, path=path))
+        entry, suggestions = find_skill_file(manifest, relative_path)
+        if entry is None:
+            return None, self._after_load(loaded, SKILL_FILE_NOT_FOUND.format(
+                name=name, path=path, suggestions=', '.join(f'"{s}"' for s in suggestions),
+            ))
+        if not is_python_script(entry['path']):
+            return None, self._after_load(loaded, (
+                f'"{entry["path"]}" cannot run here: only Python (.py) scripts run on this platform. '
+                'Read it with read_skill_file and follow it yourself.'
+            ))
+        return (matched, manifest, entry['path'], loaded), None
+
+    def _result(self, loaded: str, outcome):
+        """The run's text, after the body this call loaded, carrying the run's facts when the sandbox ran it."""
+        text, facts = outcome
+        content = self._after_load(loaded, text)
+        if facts is None:
+            return content
+        return ToolMessage(content=content, artifact=facts, name=self.name, tool_call_id='')
+
+    def _run(self, skill: str, path: str, args: Optional[List[str]] = None, files: Optional[List[str]] = None,
+             run_manager: Optional[CallbackManagerForToolRun] = None):
+        target, refusal = self._resolve_script(skill, path)
+        if refusal:
+            return refusal
+        matched, manifest, script, loaded = target
+        return self._result(loaded, self.runner.run(
+            matched, manifest, script, args or [], files or [], run_manager.get_child() if run_manager else None,
+        ))
+
+    async def _arun(self, skill: str, path: str, args: Optional[List[str]] = None, files: Optional[List[str]] = None,
+                    run_manager: Optional[CallbackManagerForToolRun] = None):
+        target, refusal = self._resolve_script(skill, path)
+        if refusal:
+            return refusal
+        matched, manifest, script, loaded = target
+        return self._result(loaded, await self.runner.arun(
+            matched, manifest, script, args or [], files or [], run_manager.get_child() if run_manager else None,
+        ))
+
+
+class ReadSkillOutputInput(BaseModel):
+    ref: str = Field(description="The skill-output://<id> reference a run_skill_script result gave.")
+    start_line: Optional[int] = Field(default=None, description="First line to read (1-based, inclusive). Omit to read from the beginning.")
+    end_line: Optional[int] = Field(default=None, description="Last line to read (1-based, inclusive). Omit to read to the end.")
+
+
+class ReadSkillOutputTool(BaseTool):
+    """Serves the saved output of this conversation's script runs, by line range, and nothing else."""
+
+    name: str = "read_skill_output"
+    description: str = READ_SKILL_OUTPUT_TOOL_DESCRIPTION
+    args_schema: type[BaseModel] = ReadSkillOutputInput
+    store: Any = Field(exclude=True)
+    metadata: dict = {
+        "toolkit_type": "internal",
+        "toolkit_name": "skills",
+        "display_name": "Skills",
+    }
+
+    def _read(self, ref: str, start_line: Optional[int] = None, end_line: Optional[int] = None):
+        """A saved script output as text, or the reason the model gets instead."""
+        text = self.store.read_output(ref)
+        if text is None:
+            return (
+                f'"{ref}" is not an available saved script output. Pass the skill-output://<id> reference exactly as '
+                "a run_skill_script result gave it; if it has expired with the conversation's script storage, run the "
+                "script again."
+            )
+        bounded = bound_read_result(text, "script-output.txt", start_line=start_line, end_line=end_line)
+        if not isinstance(bounded, str):
+            return json.dumps(bounded, ensure_ascii=False)
+        lines = describe_line_range(start_line, end_line)
+        return f"Script output {ref}{lines}:\n<script_output>\n{bounded}\n</script_output>"
+
+    def _run(self, ref: str, start_line: Optional[int] = None, end_line: Optional[int] = None,
+             run_manager: Optional[CallbackManagerForToolRun] = None):
+        return self._read(ref, start_line, end_line)
+
+    async def _arun(self, ref: str, start_line: Optional[int] = None, end_line: Optional[int] = None,
+                    run_manager: Optional[CallbackManagerForToolRun] = None):
+        return self._read(ref, start_line, end_line)
+
+
 class SearchSkillsInput(BaseModel):
     query: str = Field(description='Short description of what the user needs, in plain words. Wrap words in double quotes to require that exact phrase.')
 
@@ -833,7 +962,7 @@ def rank_skills_scored(query: str, skills: list, limit: int = SEARCH_SKILLS_RESU
 
 def build_load_skill_tools(
     attached_skills, invoked_skills=None, project_skills=None, skill_search=None, skill_body_fetcher=None,
-    skill_file_fetcher=None,
+    skill_file_fetcher=None, skill_script_runner=None,
 ) -> List[BaseTool]:
     if not attached_skills and not project_skills:
         return []
@@ -857,11 +986,21 @@ def build_load_skill_tools(
         return tools
     logger.debug("[Skills] Binding read_skill_file + list_skill_files: a registry skill has files")
     loader = tools[-1]
-    return tools + [
+    tools = tools + [
         ReadSkillFileTool(
             registry=registry, invoked_skills=invoked_skills or [], loader=loader, file_fetcher=skill_file_fetcher,
         ),
         ListSkillFilesTool(registry=registry, invoked_skills=invoked_skills or [], loader=loader),
+    ]
+    if skill_script_runner is None or not any(
+        has_python_scripts(select_skill_files(skill.get('files'))) for skill in registry.entries
+    ):
+        return tools
+    logger.debug("[Skills] Binding run_skill_script + read_skill_output: a registry skill has Python scripts")
+    loader.scripts_runnable = True
+    return tools + [
+        RunSkillScriptTool(registry=registry, invoked_skills=invoked_skills or [], loader=loader, runner=skill_script_runner),
+        ReadSkillOutputTool(store=skill_script_runner.store),
     ]
 
 

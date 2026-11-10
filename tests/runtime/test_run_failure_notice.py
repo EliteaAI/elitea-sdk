@@ -22,7 +22,7 @@ from elitea_sdk.runtime.tools.agent import AgentNode
 from elitea_sdk.runtime.tools.application import Application
 from elitea_sdk.runtime.tools.function import PIPELINE_BLOCKED_KEY, FunctionTool
 from elitea_sdk.runtime.tools.indexer_tool import IndexerNode
-from elitea_sdk.runtime.tools.llm import LLMNode
+from elitea_sdk.runtime.tools.llm import LLMNode, _llm_error_message
 from elitea_sdk.runtime.tools.loop_output import LoopToolNode
 from elitea_sdk.runtime.tools.tool import ToolNode
 
@@ -386,12 +386,12 @@ def _error_messages(result, text):
 
 
 class TestLlmProviderErrors:
-    def test_provider_error_in_the_first_call_carries_both_tags(self):
+    def test_provider_error_in_the_first_call_carries_the_tag_and_the_exception_type(self):
         result = _run_llm(_llm_node(_RaisingCompletionClient(RuntimeError('provider down'))))
 
         error = _ai_messages(result)[-1]
         assert error.content.startswith('Error:')
-        assert error.response_metadata.get('llm_node_error') is True
+        assert error.response_metadata.get('llm_node_exception_type') == 'RuntimeError'
         assert error.response_metadata.get(RUN_FAILURE_NOTICE_KEY) is True
 
     @pytest.mark.parametrize('error, expected', [
@@ -412,13 +412,13 @@ class TestLlmProviderErrors:
         pytest.param('invalid credentials for the model', 'Model configuration error', id='non-recoverable'),
         pytest.param('provider down', 'Error processing tool results', id='other'),
     ])
-    def test_provider_error_in_the_tool_loop_carries_both_tags(self, error_text, expected):
+    def test_provider_error_in_the_tool_loop_carries_the_tag_and_the_exception_type(self, error_text, expected):
         client = _ScriptedClient([_tool_call(1), RuntimeError(error_text)])
         result = _run_llm(_llm_node(client))
 
         failed = _error_messages(result, expected)
         assert len(failed) == 1
-        assert failed[0].response_metadata.get('llm_node_error') is True
+        assert failed[0].response_metadata.get('llm_node_exception_type') == 'RuntimeError'
         assert failed[0].response_metadata.get(RUN_FAILURE_NOTICE_KEY) is True
 
     @pytest.mark.parametrize('error_text, expected', [
@@ -542,6 +542,11 @@ class TestNamesTheWorkerReads:
         assert run_failure_message('text') == {
             'role': 'assistant', 'content': 'text', 'response_metadata': {'run_failure_notice': True},
         }
+
+    def test_a_model_error_message_keeps_the_exception_type_key(self):
+        message = _llm_error_message('Error: boom', RuntimeError('boom'), SimpleNamespace())
+
+        assert message.response_metadata == {'run_failure_notice': True, 'llm_node_exception_type': 'RuntimeError'}
 
     def test_a_run_stopped_at_the_step_limit_carries_the_flag_and_the_output(self):
         fake = SimpleNamespace(get_state=lambda config: SimpleNamespace(values={'messages': [], 'output': 'old'}))

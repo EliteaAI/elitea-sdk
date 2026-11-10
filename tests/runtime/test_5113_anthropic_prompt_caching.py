@@ -360,7 +360,7 @@ class TestSwarmGateBoundTools:
 
 
 class TestAnthropicBetaHeader:
-    """get_llm() sends the prompt-caching beta header only for Anthropic models."""
+    """get_llm() never sends the obsolete prompt-caching beta header (#7461: DIAL Bedrock rejects it)."""
 
     def _make_client(self):
         from elitea_sdk.runtime.clients.client import EliteAClient
@@ -373,12 +373,12 @@ class TestAnthropicBetaHeader:
         client.project_id = "1"
         return client
 
-    def test_anthropic_model_gets_beta_header(self):
+    def test_anthropic_model_has_no_beta_header(self):
         client = self._make_client()
         with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
             client.get_llm("claude-sonnet-4-6", {"max_output_tokens": 64000})
         headers = mock_anthropic.call_args.kwargs["default_headers"]
-        assert headers.get("anthropic-beta") == "prompt-caching-2024-07-31"
+        assert "anthropic-beta" not in headers
 
     def test_openai_model_has_no_anthropic_header(self):
         client = self._make_client()
@@ -419,8 +419,8 @@ class TestAnthropicBetaHeader:
         base_url = mock_openai.call_args.kwargs.get("base_url")
         assert base_url == "http://proxy/openai"
 
-    def test_claude_default_still_uses_chatanthropic_with_beta_header(self):
-        """Claude model without the flag uses ChatAnthropic with the full beta header."""
+    def test_claude_default_uses_chatanthropic_without_beta_header(self):
+        """Claude model without the flag uses ChatAnthropic; caching relies on cache_control, not the beta header."""
         client = self._make_client()
         with patch("elitea_sdk.runtime.clients.client.ChatAnthropic") as mock_anthropic:
             client.get_llm(
@@ -428,7 +428,7 @@ class TestAnthropicBetaHeader:
                 {"max_output_tokens": 64000},
             )
         headers = mock_anthropic.call_args.kwargs.get("default_headers", {})
-        assert headers.get("anthropic-beta") == "prompt-caching-2024-07-31"
+        assert "anthropic-beta" not in headers
 
 
 class TestApplicationOpenAICompatibleParam:
