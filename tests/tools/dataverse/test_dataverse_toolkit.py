@@ -145,6 +145,23 @@ def test_sign_in_signal_of_a_tool_call_leaves_the_tool_name_to_the_runner(http):
     assert exc.value.toolkit_type == "dataverse"
 
 
+def test_sign_in_signal_carries_the_toolkit_id_the_loader_sets(http):
+    from elitea_sdk.tools import _inject_toolkit_id
+    kit = DataverseToolkit.get_toolkit(dataverse_configuration=dict(LOGGED_OUT), toolkit_name="crm")
+    loaded = kit.get_tools()
+    _inject_toolkit_id({"id": 77, "type": "dataverse"}, loaded)
+    with pytest.raises(McpAuthorizationRequired) as exc:
+        {t.name: t for t in loaded}["who_am_i"].run({})
+    assert exc.value.toolkit_id == 77
+    assert exc.value.to_dict()["toolkit_id"] == 77
+
+
+def test_sign_in_signal_without_a_toolkit_id_leaves_it_empty(http):
+    with pytest.raises(McpAuthorizationRequired) as exc:
+        tools(LOGGED_OUT)["who_am_i"].run({})
+    assert exc.value.toolkit_id is None
+
+
 @pytest.mark.parametrize("error", [
     "AADSTS65001: The user or administrator has not consented",
     "AADSTS700082: The refresh token has expired due to inactivity",
