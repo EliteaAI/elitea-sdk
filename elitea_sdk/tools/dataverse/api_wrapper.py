@@ -92,6 +92,8 @@ class DataverseApiWrapper(BaseToolApiWrapper):
     refresh_token: Optional[SecretStr] = None
     access_token: Optional[SecretStr] = None
     configuration_uuid: Optional[str] = None
+    # Set by the tool loader (_inject_toolkit_id); the chat sign-in reads the client secret by it
+    toolkit_id: Optional[int] = None
 
     def _settings(self) -> dict:
         return {
@@ -109,6 +111,7 @@ class DataverseApiWrapper(BaseToolApiWrapper):
         if isinstance(signal, DataverseError):
             return ToolException(str(signal))
         signal.tool_name = None  # the runner names the leaf tool
+        signal.toolkit_id = self.toolkit_id
         return signal
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
