@@ -300,6 +300,16 @@ GetWorkflowStatus = create_model(
     repo_name=(Optional[str], Field(description="Name of the repository to get workflow status from", default=None))
 )
 
+GetWorkflowRuns = create_model(
+    "GetWorkflowRuns",
+    workflow_id=(Optional[str], Field(description="Optional workflow ID or file name (e.g., 'build.yml', '1234567') to list runs of. If None, lists runs of all workflows in the repository.", default=None)),
+    branch=(Optional[str], Field(description="Only return runs for this branch.", default=None)),
+    status=(Optional[str], Field(description="Only return runs with this status or conclusion (e.g., 'queued', 'in_progress', 'completed', 'success', 'failure', 'cancelled').", default=None)),
+    event=(Optional[str], Field(description="Only return runs triggered by this event (e.g., 'push', 'pull_request', 'workflow_dispatch', 'schedule').", default=None)),
+    limit=(int, Field(description="Maximum number of runs to return (1-100). Most recent first.", default=10, ge=1, le=100)),
+    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+)
+
 GetWorkflowLogs = create_model(
     "GetWorkflowLogs",
     run_id=(str, Field(description="The ID of the workflow run to get logs for")),
