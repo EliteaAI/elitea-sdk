@@ -89,7 +89,7 @@ def test_update_file_passes_explicit_branch_to_edit_file(monkeypatch):
     client = _make_client(repo)
     captured = {}
 
-    def fake_edit_file(self, file_path, file_query, branch=None, commit_message=None):
+    def fake_edit_file(self, file_path, file_query, branch=None, commit_message=None, **target):
         captured['file_path'] = file_path
         captured['file_query'] = file_query
         captured['branch'] = branch

@@ -18,45 +18,67 @@ class GitHubRepoConfig(BaseModel):
     active_branch: Optional[str] = None
     github_base_branch: Optional[str] = None
 
+# Runtime target: the configured repository is only a default, so every repository-level tool takes this.
+REPO_NAME_DESCRIPTION = (
+    "Repository in format 'owner/repo'. Leave empty to use the toolkit's repository; "
+    "required only when the toolkit has no repository configured."
+)
+
+
+def _repo_name_field():
+    return (Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
+
+
 # Schemas for API methods
 NoInput = create_model("NoInput")
 
+RepoOnlyInput = create_model(
+    "RepoOnlyInput",
+    repo_name=_repo_name_field(),
+)
+
 ListBranchesInput = create_model(
     "ListBranchesInput",
-    max_count=(Optional[int], Field(default=100, description="Maximum number of branches to return (default: 100, max: 100)"))
+    max_count=(Optional[int], Field(default=100, description="Maximum number of branches to return (default: 100, max: 100)")),
+    repo_name=_repo_name_field(),
 )
 
 ListPullRequestsInput = create_model(
     "ListPullRequestsInput",
-    max_count=(Optional[int], Field(default=100, description="Maximum number of pull requests to return (default: 100, max: 100)"))
+    max_count=(Optional[int], Field(default=100, description="Maximum number of pull requests to return (default: 100, max: 100)")),
+    repo_name=_repo_name_field(),
 )
 
 BranchName = create_model(
     "BranchName",
-    branch_name=(str, Field(description="The name of the branch, e.g. `main`"))
+    branch_name=(str, Field(description="The name of the branch, e.g. `main`")),
+    repo_name=_repo_name_field(),
 )
 
 CreateBranchName = create_model(
     "CreateBranchName",
-    proposed_branch_name=(str, Field(description="The name of the new branch to create, e.g. `feature-branch`"))
+    proposed_branch_name=(str, Field(description="The name of the new branch to create, e.g. `feature-branch`")),
+    repo_name=_repo_name_field(),
 )
 
 DeleteBranchName = create_model(
     "DeleteBranchName",
     branch_name=(str, Field(description="The name of the branch to delete, e.g. `feature-branch`")),
-    force=(Optional[bool], Field(default=False, description="Force deletion even if branch is the current active branch"))
+    force=(Optional[bool], Field(default=False, description="Force deletion even if branch is the current active branch")),
+    repo_name=_repo_name_field(),
 )
 
 DirectoryPath = create_model(
     "DirectoryPath",
-    directory_path=(str, Field(description="The path of the directory, e.g. `src/my_dir`"))
+    directory_path=(str, Field(description="The path of the directory, e.g. `src/my_dir`")),
+    repo_name=_repo_name_field(),
 )
 
 ReadFile = create_model(
     "ReadFile",
     file_path=(str, Field(description="The path to the file to read, e.g. `src/main.py`")),
     branch=(Optional[str], Field(description="The branch to read the file from, e.g. `main`", default=None)),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION)),
     start_line=(Optional[int], Field(default=None, ge=1, description="Starting line number (1-indexed, inclusive). Omit to read from the beginning.")),
     end_line=(Optional[int], Field(default=None, ge=1, description="Ending line number (1-indexed, inclusive). Omit to read to the end.")),
 )
@@ -65,7 +87,7 @@ UpdateFile = create_model(
     "UpdateFile",
     file_query=(str, Field(description=UPDATE_FILE_PROMPT_WITH_PATH, json_schema_extra={'multiline': True})),
     branch=(str, Field(description="The branch to commit the update to.")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION)),
     commit_message=(Optional[str], Field(default=None, description="Commit message for the update operation")),
 )
 
@@ -73,7 +95,7 @@ CreateFile = create_model(
     "CreateFile",
     file_path=(str, Field(description="The path of the file to create in the repository, e.g. `src/new_file.py` or `images/photo.png`")),
     branch=(str, Field(description="The branch to create the file on.")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository.")),
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION)),
     file_contents=(Optional[str], Field(
         default=None,
         description="Content for creating new files. Use this for text, code, JSON, or structured data. Leave empty if using filepath to copy existing file."
@@ -88,7 +110,7 @@ DeleteFile = create_model(
     "DeleteFile",
     file_path=(str, Field(description="The path of the file to delete, e.g. `src/old_file.py`")),
     branch=(str, Field(description="The branch to delete the file from.")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 GetIssue = create_model(
@@ -99,13 +121,13 @@ GetIssue = create_model(
         description="How many comments to skip before the returned window. Use the value named in a previous response's comments_note to read the rest of a long thread.",
         ge=0
     )),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 GetPR = create_model(
     "GetPR",
     pr_number=(int, Field(description="The PR number as a int, e.g. `42`")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 CreatePR = create_model(
@@ -114,14 +136,14 @@ CreatePR = create_model(
     body=(str, Field(description="Body of the pull request")),
     head=(str, Field(description="The active branch containing the changes")),
     base=(Optional[str], Field(description="The target branch (defaults to github_base_branch)")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 CommentOnIssue = create_model(
     "CommentOnIssue",
     issue_number=(str, Field(description="The issue or PR number as a string, e.g. `42`")),
     comment=(str, Field(description="The comment text to add to the issue or PR")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 SearchIssues = create_model(
@@ -150,7 +172,7 @@ CreateIssue = create_model(
         default=None
     )),
     repo_name=(Optional[str], Field(
-        description="Repository to create the issue in. Format: 'owner/repo'. Example: 'microsoft/vscode'. If None, uses the default repository.",
+        description="Repository to create the issue in. Format: 'owner/repo'. Example: 'microsoft/vscode'. Leave empty to use the toolkit's repository.",
         default=None
     )),
     labels=(Optional[List[str]], Field(
@@ -227,7 +249,7 @@ GetCommits = create_model(
     "GetCommits",
     repo_name=(Optional[str], Field(
         default=None,
-        description="Repository to get commits from. Format: 'owner/repo'. Example: 'microsoft/vscode'. If None, uses the default repository."
+        description="Repository to get commits from. Format: 'owner/repo'. Example: 'microsoft/vscode'. Leave empty to use the toolkit's repository."
     )),
     sha=(Optional[str], Field(
         description="Commit SHA or branch name to start listing from. Example: 'main', 'abc123def'. Lists commits reachable from this ref.",
@@ -259,14 +281,14 @@ GetCommits = create_model(
 GetCommitChanges = create_model(
     "GetCommitChanges",
     sha=(str, Field(description="The commit SHA to get changed files for")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 GetCommitsDiff = create_model(
     "GetCommitsDiff",
     base_sha=(str, Field(description="The base commit SHA to compare from")),
     head_sha=(str, Field(description="The head commit SHA to compare to")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 ApplyGitPatch = create_model(
@@ -274,7 +296,7 @@ ApplyGitPatch = create_model(
     patch_content=(str, Field(description="The git patch content in unified diff format")),
     commit_message=(Optional[str], Field(description="Commit message for the patch application", default="Apply git patch")),
     branch=(str, Field(description="The branch to apply the patch to.")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 ApplyGitPatchFromArtifact = create_model(
@@ -283,7 +305,7 @@ ApplyGitPatchFromArtifact = create_model(
     file_name=(str, Field(description="Name of the patch file to download and apply")),
     commit_message=(Optional[str], Field(description="Commit message for the patch application", default="Apply git patch from artifact")),
     branch=(str, Field(description="The branch to apply the patch to.")),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 TriggerWorkflow = create_model(
@@ -291,7 +313,7 @@ TriggerWorkflow = create_model(
     workflow_id=(str, Field(description="The ID or file name of the workflow to trigger (e.g., 'build.yml', '1234567')")),
     ref=(str, Field(description="The branch or tag reference to trigger the workflow on (e.g., 'main', 'v1.0.0')")),
     inputs=(Optional[Dict[str, Any]], Field(description="Optional inputs for the workflow, as defined in the workflow file", default=None)),
-    repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))
+    repo_name=(Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
 )
 
 GetWorkflowStatus = create_model(
@@ -312,7 +334,10 @@ GetWorkflowLogs = create_model(
 GenericGithubAPICall = create_model(
     "GenericGithubAPICall",
     method=(str, Field(description="The GitHub API method to call (e.g., 'get_repo', 'get_user')")),
-    method_kwargs=(Optional[Dict[str, Any]], Field(description="Keyword arguments for the API method as a dictionary"))
+    method_kwargs=(Optional[Dict[str, Any]], Field(description="Keyword arguments for the API method as a dictionary")),
+    repo_name=(Optional[str], Field(default=None, description=(
+        "Repository that repository-level methods run on, in format 'owner/repo'. Leave empty to use the "
+        "toolkit's repository. Not needed for account-level methods such as 'get_user'."))),
 )
 
 # Schema for get_me - no input required
@@ -342,7 +367,10 @@ SearchCode = create_model(
         default=1,
         description="Page number for pagination",
         gt=0
-    ))
+    )),
+    repo_name=(Optional[str], Field(default=None, description=(
+        "Repository to search in format 'owner/repo'. Leave empty to use the toolkit's repository. "
+        "Ignored when the query already has a repo:, org: or user: qualifier."))),
 )
 
 ListProjectIssues = create_model(

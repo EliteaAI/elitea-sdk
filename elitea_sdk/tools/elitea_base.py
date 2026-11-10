@@ -750,7 +750,8 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         pattern: str,
         branch: str = None,
         is_regex: bool = True,
-        context_lines: int = 2
+        context_lines: int = 2,
+        **target
     ) -> str:
         """
         Search for text/pattern INSIDE a specific file (like grep). NOT for finding files by name.
@@ -764,6 +765,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
             branch: Branch name (None for active branch)
             is_regex: Whether pattern is regex (default True)
             context_lines: Lines of context before/after matches (default 2)
+            **target: Toolkit-specific target selector (e.g. repo_name), passed to _read_file
 
         Returns:
             Matching lines with context, or "No matches found" message
@@ -771,7 +773,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         from .utils.text_operations import search_in_content
         
         # Read full file content
-        content = self._read_file(file_path, branch)
+        content = self._read_file(file_path, branch, **target)
         
         # Search for pattern
         matches = search_in_content(content, pattern, is_regex, context_lines)
@@ -806,7 +808,8 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         file_path: str,
         file_query: str,
         branch: str = None,
-        commit_message: str = None
+        commit_message: str = None,
+        **target
     ) -> str:
         """
         Edit file using OLD/NEW markers for precise replacements.
@@ -818,7 +821,9 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
             file_query: Edit instructions with OLD/NEW markers
             branch: Branch name (None for active branch)
             commit_message: Commit message (VCS toolkits only)
-            
+            **target: Toolkit-specific target selector (e.g. repo_name), passed to
+                _read_file and _write_file so the edit never depends on shared state
+
         Returns:
             Success message or raises ToolException on failure.
         """
@@ -843,7 +848,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         
         # Read current file content
         try:
-            current_content = self._read_file(file_path, branch)
+            current_content = self._read_file(file_path, branch, **target)
             if not isinstance(current_content, str):
                 raise ToolException(str(current_content))
         except Exception as e:
@@ -877,7 +882,7 @@ class BaseCodeToolApiWrapper(BaseVectorStoreToolApiWrapper):
         
         # Write updated content
         try:
-            result = self._write_file(file_path, updated_content, branch, commit_message)
+            result = self._write_file(file_path, updated_content, branch, commit_message, **target)
         except NotImplementedError:
             raise ToolException(
                 f"Editing not supported for this toolkit. "

@@ -80,6 +80,7 @@ class TestGitHub:
                 patch.object(gh_module.CodeIndexerToolkit, "validate_toolkit",
                              side_effect=lambda values: values, create=True):
             client_cls.clean_repository_name.side_effect = lambda name: name
+            client_cls._normalize_repo_name.side_effect = lambda name: name
             try:
                 gh_module.EliteAGitHubAPIWrapper(
                     base_url=base_url, access_token='t', github_repository='org/repo',
