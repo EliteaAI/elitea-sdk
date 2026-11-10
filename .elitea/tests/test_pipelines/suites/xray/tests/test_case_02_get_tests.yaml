@@ -23,6 +23,12 @@ state:
     value: "created >= -3d AND labels in (ELITEA_AI_CREATED) ORDER BY assignee"
   get_tests_result:
     type: str
+  parsed_tests_count:
+    type: int
+  success_indicator_found:
+    type: str
+  error_indicator_found:
+    type: str
   expected_success_indicators:
     type: list
     value: ["issueId", "jira", "testType"]
@@ -47,6 +53,68 @@ nodes:
     structured_output: false
     tool: get_tests
     toolkit_name: ${XRAY_TOOLKIT_NAME}
+    transition: inspect_get_tests_result
+
+  - id: inspect_get_tests_result
+    type: code
+    code:
+      type: fixed
+      value: |
+        import ast
+        import json
+
+        raw = elitea_state.get("get_tests_result", "")
+        parsed = None
+
+        if isinstance(raw, list):
+            parsed = raw
+        elif isinstance(raw, str) and raw.strip():
+            text = raw.strip()
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(text)
+                except Exception:
+                    parsed = None
+
+        success_indicator_found = "none"
+        error_indicator_found = "none"
+        parsed_tests_count = 0
+
+        if isinstance(parsed, list):
+            parsed_tests_count = len(parsed)
+            if parsed_tests_count == 0:
+                success_indicator_found = "empty_list"
+            else:
+                first_item = parsed[0] if isinstance(parsed[0], dict) else {}
+                if isinstance(first_item, dict):
+                    if "issueId" in first_item:
+                        success_indicator_found = "issueId"
+                    elif "jira" in first_item:
+                        success_indicator_found = "jira"
+                    elif "testType" in first_item:
+                        success_indicator_found = "testType"
+        else:
+            text_lower = str(raw).lower()
+            for indicator in elitea_state.get("error_indicators", []):
+                if str(indicator).lower() in text_lower:
+                    error_indicator_found = indicator
+                    break
+
+        {
+            "parsed_tests_count": parsed_tests_count,
+            "success_indicator_found": success_indicator_found,
+            "error_indicator_found": error_indicator_found
+        }
+    input:
+      - get_tests_result
+      - error_indicators
+    output:
+      - parsed_tests_count
+      - success_indicator_found
+      - error_indicator_found
+    structured_output: true
     transition: validate_results
 
   - id: validate_results
@@ -56,6 +124,9 @@ nodes:
       - jql_query
       - expected_success_indicators
       - error_indicators
+      - parsed_tests_count
+      - success_indicator_found
+      - error_indicator_found
     input_mapping:
       chat_history:
         type: fixed
@@ -72,14 +143,17 @@ nodes:
           Get Tests Result: {get_tests_result}
           Expected Success Indicators: {expected_success_indicators}
           Error Indicators: {error_indicators}
+          Parsed Tests Count: {parsed_tests_count}
+          Success Indicator Found: {success_indicator_found}
+          Error Indicator Found: {error_indicator_found}
 
           This is a POSITIVE test - we expect successful test retrieval.
 
           Validation Criteria (ALL must pass for test_passed=true):
           1. tool_executed: Tool ran without throwing an exception
-          2. no_errors: Output does NOT contain TOOL error indicators (e.g., "Tool execution error", "failed to", "exception occurred"). Ignore the word "error" if it appears in test content like summaries or descriptions.
-          3. has_extracted_tests: Response is a JSON list of test objects (the tool returns the list directly, there is no "Extracted tests" header). An empty list [] is VALID - no tests matched the JQL.
-          4. has_test_data: If the list is non-empty, its items contain test details (issueId, jira fields). Pass this check for an empty list.
+          2. no_errors: Error Indicator Found must be 'none'
+          3. has_extracted_tests: Parsed Tests Count is 0 or greater, meaning the direct list response was parsed successfully. An empty list [] is VALID - no tests matched the JQL.
+          4. has_test_data: If Parsed Tests Count is non-zero, Success Indicator Found must not be 'none'. Pass this check for an empty list.
 
           Return JSON test_results:
           {{
@@ -88,13 +162,13 @@ nodes:
             "no_errors": boolean,
             "has_extracted_tests": boolean,
             "has_test_data": boolean,
-            "tests_count": integer (number of items in the list, 0 for an empty list),
-            "success_indicator_found": "which indicator was found or 'none'",
-            "error_indicator_found": "which error indicator was found or 'none'",
+            "tests_count": integer (use Parsed Tests Count),
+            "success_indicator_found": "copy Success Indicator Found",
+            "error_indicator_found": "copy Error Indicator Found",
             "error": string | null
           }}
 
-          Treat a JSON array of test objects as a valid successful response even if it does not literally say "Extracted tests".
+          Treat a direct parsed list response as valid successful output even if it originated from Python-style list formatting.
 
           Return ONLY the JSON object.
     model: ${DEFAULT_LLM_MODEL}
