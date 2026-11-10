@@ -89,7 +89,7 @@ def _short_reason(message: Optional[str]) -> str:
     return re.sub(r'\s+', ' ', text).strip()[:_MAX_ERROR_REASON_CHARS]
 
 
-def _note_run_error(outcome: ToolOutcome) -> None:
+def note_run_error(outcome: ToolOutcome) -> None:
     holder = _RUN_ERROR_FLAG.get()
     if holder is None or outcome.status is not ToolResultStatus.ERROR:
         return
@@ -114,7 +114,7 @@ def resolve_run_error(tool_name: Optional[str], toolkit_type: Optional[str] = No
 
 def record_outcome(outcome: ToolOutcome) -> None:
     """Notes the first error for an open run holder, then appends to the sink if one is open."""
-    _note_run_error(outcome)
+    note_run_error(outcome)
     sink = _OUTCOME_SINK.get()
     if sink is not None:
         sink.append(outcome)
