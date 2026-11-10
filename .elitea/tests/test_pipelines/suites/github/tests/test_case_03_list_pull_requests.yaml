@@ -10,14 +10,14 @@ state:
     type: str
   messages:
     type: list
-  pr_state:
-    type: str
-    value: "open"
   max_count:
     type: int
     value: 5
   tool_result:
     type: str
+  pr_number:
+    type: int
+    value: 5
   pr_result:
     type: str
   test_results:
@@ -45,11 +45,12 @@ nodes:
     type: toolkit
     tool: get_pull_request
     toolkit_name: ${GITHUB_TOOLKIT_NAME}
-    input: []
+    input:
+      - pr_number
     input_mapping:
       pr_number:
-        type: fixed
-        value: 5
+        type: variable
+        value: pr_number
     output:
       - pr_result
     structured_output: true
@@ -77,23 +78,23 @@ nodes:
 
           Perform the following checks:
 
-          1. Confirm list_open_pull_requests executed successfully (result is not empty or null).
-          2. Confirm PR #5 verification succeeded (pr_result is not an error).
-          3. Determine if any pull requests were found (PRs count >= 0).
-          4. Check if pull requests have proper structure with 'number' and 'title' fields.
-          
+          1. Confirm list_open_pull_requests executed successfully (result is not null and is a valid list output, even if empty).
+          2. Confirm PR #5 verification succeeded (pr_result is not an error and number matches 5).
+          3. Determine whether the pull request list has valid structure when items are present.
+          4. Treat an empty open-PR list as valid if the verification call for PR #5 succeeds, because PR #5 may be closed.
+
           If there is an error, return the error message in the error field.
 
           Return a JSON object named test_results with the following structure:
 
-          {
-          "test_passed": boolean (true if all checks pass),
+          {{
+          "test_passed": boolean,
           "tool_executed": boolean,
-          "has_pr_5": boolean (true if PR #5 verification succeeded),
+          "has_pr_5": boolean,
           "prs_have_numbers": boolean,
           "error": string | null,
-          "failed_checks": list of strings (failed checks)
-          }
+          "failed_checks": list of strings
+          }}
 
           Return **EXACTLY** **NONNEGOTIATABLE** only the `test_results` JSON object. Do not use markdown ```json when returning the json. Do not include any explanations, summaries, or additional text.
       chat_history:
