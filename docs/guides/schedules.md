@@ -281,7 +281,7 @@ Every refusal of the Schedules API has the same `body`:
 | 400 | A field is not valid: `code` is `invalid_input` and `field` names the field, for example a bad `cron` or a `run_mode` rule. |
 | 403 | The caller lacks the right for this action, for example a user without schedule rights. An admin who runs another user's schedule gets `code` `not_owner`. |
 | 404 | The schedule does not exist, or it belongs to another user and the caller is not an admin: `code` is `not_found` (`run_not_found` for a run). |
-| 409 | Run now: a run of this schedule is still active. `code` is `run_active`, and `body["active_run_id"]` holds its id. Resume: the project has its maximum number of active schedules. |
+| 409 | Run now: a run of this schedule is still active. `code` is `run_active`, and `body["active_run_id"]` is the id of the active run. It is null when that run belongs to another user or is an index run that has no run row. Resume: the project has its maximum number of active schedules. |
 
 `update_schedule` with `enabled` raises `ValueError` before any request.
 
@@ -295,7 +295,11 @@ try:
 except ApiDetailsRequestError as error:
     if error.status_code != 409 or error.body.get("code") != "run_active":
         raise
-    print(f"Status {error.status_code}: run {error.body['active_run_id']} is still active")
+    active_run_id = error.body.get("active_run_id")  # null for another user's run or an index run
+    if active_run_id is None:
+        print(f"Status {error.status_code}: a run is still active")
+    else:
+        print(f"Status {error.status_code}: run {active_run_id} is still active")
 ```
 
 ## Risk refusals
