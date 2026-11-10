@@ -64,7 +64,7 @@ def _after_add_messages(messages):
     return add_messages([], messages)
 
 
-def _raise_runtime(issue_number):
+def _raise_runtime(**_arguments):
     raise RuntimeError("connection refused")
 
 
@@ -256,7 +256,7 @@ class TestValidationFailureNodes:
         node = IndexerNode(
             tool=_tool(lambda issue_number: "secret-document"),
             index_tool=StructuredTool.from_function(
-                func=lambda documents: _raise_runtime(documents),
+                func=_raise_runtime,
                 name="index_docs", description="Index documents"),
             input_mapping={"issue_number": {"type": "fixed", "value": "1"}},
             input_variables=[], output_variables=["out"],
