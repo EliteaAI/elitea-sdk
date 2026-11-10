@@ -1,6 +1,10 @@
 import base64
 import binascii
+import contextlib
+import contextvars
+import functools
 import html
+import inspect
 import json
 import logging
 import os
@@ -9,14 +13,14 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from traceback import format_exc
-from typing import Any, List, Optional, Generator, Literal
+from typing import Annotated, Any, List, Optional, Generator, Literal
 
 import requests
 import swagger_client
 import urllib3
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
-from pydantic import Field, PrivateAttr, field_validator, model_validator, create_model, SecretStr
+from pydantic import BeforeValidator, Field, PrivateAttr, field_validator, model_validator, create_model, SecretStr
 from sklearn.feature_extraction.text import strip_tags
 from swagger_client import TestCaseApi, SearchApi, PropertyResource, ModuleApi, ProjectApi, FieldApi
 from swagger_client.rest import ApiException
@@ -159,7 +163,59 @@ QTEST_SEARCHABLE_ONLY_TYPES = {
 
 logger = logging.getLogger(__name__)
 
-QtestDataQuerySearch = create_model(
+PROJECT_ID_DESCRIPTION = "QTest project id; leave empty to use the toolkit's configured project"
+
+NO_PROJECT_MESSAGE = (
+    "No QTest project specified. Pass project_id in the tool call, or set "
+    "qtest_project_id in the toolkit configuration."
+)
+
+# Pipelines and LLMs send these for "not set"; they mean the configured project.
+_EMPTY_PROJECT_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined", "n/a"})
+
+# The project of the tool call in progress, as (wrapper id, project id). It is
+# per call and per thread, so concurrent calls on one wrapper never see each
+# other's project, and nested helpers need no project argument.
+_call_project: contextvars.ContextVar = contextvars.ContextVar('qtest_call_project', default=None)
+
+
+def _unset_project_to_none(value: Any) -> Any:
+    """Map "not set" placeholders to None and unquote ids before integer validation."""
+    if QtestApiWrapper._is_unset(value):
+        return None
+    if isinstance(value, str):
+        return value.strip().strip('\'"').strip()
+    return value
+
+
+ProjectIdArg = Annotated[Optional[int], BeforeValidator(_unset_project_to_none)]
+
+
+def _project_model(name: str, **fields):
+    """A tool schema with the optional project id last, so a plain-string tool input
+    still lands on the tool's own first argument."""
+    return create_model(name, **fields, project_id=(
+        ProjectIdArg, Field(default=None, description=PROJECT_ID_DESCRIPTION)))
+
+
+def _project_scoped(method):
+    """Run a tool method with its optional `project_id` argument as the project in scope."""
+    @functools.wraps(method)
+    def wrapper(self, *args, project_id=None, **kwargs):
+        with self._project_scope(project_id):
+            return method(self, *args, **kwargs)
+
+    signature = inspect.signature(method)
+    parameters = list(signature.parameters.values())
+    position = next((i for i, p in enumerate(parameters) if p.kind is inspect.Parameter.VAR_KEYWORD),
+                    len(parameters))
+    parameters.insert(position, inspect.Parameter(
+        'project_id', inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Optional[int]))
+    wrapper.__signature__ = signature.replace(parameters=parameters)
+    return wrapper
+
+
+QtestDataQuerySearch = _project_model(
     "QtestDataQuerySearch",
     dql=(str, Field(description="Qtest Data Query Language (DQL) query string")),
     extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled and no custom prompt is provided, the repository default image-processing prompt is used.", default=False)),
@@ -169,7 +225,7 @@ QtestDataQuerySearch = create_model(
     include_external_properties=(Optional[bool], Field(description="When True, include all external properties for every result. Defaults to False for lighter responses.", default=False))
 )
 
-QtestCreateTestCase = create_model(
+QtestCreateTestCase = _project_model(
     "QtestCreateTestCase",
     test_case_content=(str, Field(
         description=TEST_CASES_IN_JSON_FORMAT)),
@@ -177,7 +233,7 @@ QtestCreateTestCase = create_model(
         str, Field(description="Folder to place test cases to. Default is empty value", default="")),
 )
 
-QtestLinkTestCaseToJiraRequirement = create_model(
+QtestLinkTestCaseToJiraRequirement = _project_model(
     "QtestLinkTestCaseToJiraRequirement",
     requirement_external_id=(str, Field(description="Qtest requirement external id which represent jira issue id linked to Qtest as a requirement e.g. SITEPOD-4038")),
     json_list_of_test_case_ids=(str, Field(description="""List of the test case ids to be linked to particular requirement. 
@@ -185,7 +241,7 @@ QtestLinkTestCaseToJiraRequirement = create_model(
                                               It should be capable to be extracted directly by python json.loads method."""))
 )
 
-QtestLinkTestCaseToQtestRequirement = create_model(
+QtestLinkTestCaseToQtestRequirement = _project_model(
     "QtestLinkTestCaseToQtestRequirement",
     requirement_id=(str, Field(description="QTest internal requirement ID in format RQ-123")),
     json_list_of_test_case_ids=(str, Field(description="""List of the test case ids to be linked to particular requirement. 
@@ -193,26 +249,26 @@ QtestLinkTestCaseToQtestRequirement = create_model(
                                               It should be capable to be extracted directly by python json.loads method."""))
 )
 
-UpdateTestCase = create_model(
+UpdateTestCase = _project_model(
     "UpdateTestCase",
     test_id=(str, Field(description="Test ID e.g. TC-1234")),
     test_case_content=(str, Field(
         description=TEST_CASES_IN_JSON_FORMAT))
 )
 
-FindTestCaseById = create_model(
+FindTestCaseById = _project_model(
     "FindTestCaseById",
     test_id=(str, Field(description="Test case ID e.g. TC-1234")),
     extract_images=(Optional[bool], Field(description="Whether embedded images should be processed by LLM. If enabled and no custom prompt is provided, the repository default image-processing prompt is used.", default=False)),
     prompt=(Optional[str], Field(description="Optional override prompt for image processing. If omitted or empty, the repository default image-processing prompt is used.", default=None))
 )
 
-DeleteTestCase = create_model(
+DeleteTestCase = _project_model(
     "DeleteTestCase",
     qtest_id=(int, Field(description="Qtest id e.g. 3253490123")),
 )
 
-GetModules = create_model(
+GetModules = _project_model(
     "GetModules",
     parent_id=(Optional[int],
                Field(description="ID of the parent Module. Leave it blank to retrieve Modules under root",
@@ -223,35 +279,35 @@ GetModules = create_model(
 
 )
 
-GetAllTestCasesFieldsForProject = create_model(
+GetAllTestCasesFieldsForProject = _project_model(
     "GetAllTestCasesFieldsForProject",
     force_refresh=(Optional[bool],
                    Field(description="Set to true to reload field definitions from API if project configuration has changed (new fields added, dropdown values modified). Default: false (uses cached data).",
                          default=False)),
 )
 
-FindTestCasesByRequirementId = create_model(
+FindTestCasesByRequirementId = _project_model(
     "FindTestCasesByRequirementId",
     requirement_id=(str, Field(description="QTest requirement ID in format RQ-123. This will find all test cases linked to this requirement.")),
     include_details=(Optional[bool], Field(description="If true, returns full test case details. If false (default), returns Id, QTest Id, Name, and Description fields.", default=False)),
 )
 
-FindRequirementsByTestCaseId = create_model(
+FindRequirementsByTestCaseId = _project_model(
     "FindRequirementsByTestCaseId",
     test_case_id=(str, Field(description="Test case ID in format TC-123. This will find all requirements linked to this test case.")),
 )
 
-FindTestRunsByTestCaseId = create_model(
+FindTestRunsByTestCaseId = _project_model(
     "FindTestRunsByTestCaseId",
     test_case_id=(str, Field(description="Test case ID in format TC-123. This will find all test runs associated with this test case.")),
 )
 
-FindDefectsByTestRunId = create_model(
+FindDefectsByTestRunId = _project_model(
     "FindDefectsByTestRunId",
     test_run_id=(str, Field(description="Test run ID in format TR-123. This will find all defects associated with this test run.")),
 )
 
-addFileToTestCase = create_model(
+addFileToTestCase = _project_model(
     "addFileToTestCase",
     test_case_id=(str, Field(description="Test case ID in format TC-123 or QTest numeric ID")),
     filepath=(str, Field(description="File path in format /{bucket}/{filename} from artifact storage")),
@@ -262,7 +318,7 @@ addFileToTestCase = create_model(
     )),
 )
 
-UpdateTestRunStatus = create_model(
+UpdateTestRunStatus = _project_model(
     "UpdateTestRunStatus",
     test_run_id=(str, Field(description="Test run ID in format TR-123 or QTest numeric ID")),
     status=(str, Field(description="Manual test run status. Standard values: 'Passed', 'Failed', 'Blocked', 'Unexecuted', 'Incomplete'. Must match a status name configured in the project's Field Settings.")),
@@ -275,7 +331,7 @@ UpdateTestRunStatus = create_model(
         coerce_numbers_to_str=True)),
 )
 
-GetTestCaseVersions = create_model(
+GetTestCaseVersions = _project_model(
     "GetTestCaseVersions",
     test_case_id=(str, Field(description="Test case ID in format TC-123 or QTest numeric ID")),
     version_name=(Optional[str], Field(
@@ -283,7 +339,7 @@ GetTestCaseVersions = create_model(
         default=None)),
 )
 
-UploadAttachmentToTestRun = create_model(
+UploadAttachmentToTestRun = _project_model(
     "UploadAttachmentToTestRun",
     test_run_id=(str, Field(description="Test run ID in format TR-123 or QTest numeric ID")),
     attachment_type=(Literal["test-case", "test-log"], Field(description="Where to attach the file: 'test-case' attaches to the test run's underlying test case; 'test-log' attaches to the test run's latest test log (execution record). QTest has no attachment slot on the bare test run itself.")),
@@ -292,14 +348,14 @@ UploadAttachmentToTestRun = create_model(
 )
 
 # Generic search model for any entity type
-GenericDqlSearch = create_model(
+GenericDqlSearch = _project_model(
     "GenericDqlSearch",
     object_type=(str, Field(description="Entity type to search: 'test-cases', 'test-runs', 'defects', 'requirements', 'test-suites', 'test-cycles', 'test-logs', 'releases', or 'builds'. Note: test-logs only support date queries; modules are NOT searchable - use get_modules tool.")),
     dql=(str, Field(description="QTest Data Query Language (DQL) query string")),
 )
 
 # Generic find by ID model - only for entities with ID prefixes (NOT test-logs)
-FindEntityById = create_model(
+FindEntityById = _project_model(
     "FindEntityById",
     entity_id=(str, Field(description="Entity ID with prefix: TC-123 (test case), RQ-15 (requirement), DF-100 (defect), TR-39 (test run), TS-5 (test suite), CL-3 (test cycle), RL-1 (release), or BL-2 (build). Note: test-logs and modules do NOT have ID prefixes.")),
 )
@@ -382,7 +438,7 @@ class _TimeoutApiClient(swagger_client.ApiClient):
 class QtestApiWrapper(NonCodeIndexerToolkit):
     index_item_labels = ('test case', 'test cases')
     base_url: str
-    qtest_project_id: int
+    qtest_project_id: Optional[int] = None
     qtest_api_token: SecretStr
     no_of_items_per_page: int = 100
     page: int = 1
@@ -393,8 +449,9 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                     "the QTEST_API_TIMEOUT_SECONDS env var, or 180s when unset.",
     )
     _client: Any = PrivateAttr()
-    _field_definitions_cache: Optional[dict] = PrivateAttr(default=None)
-    _modules_cache: Optional[list] = PrivateAttr(default=None)
+    # Keyed by project id: a call may target any project the token can reach.
+    _field_definitions_cache: dict = PrivateAttr(default_factory=dict)
+    _modules_cache: dict = PrivateAttr(default_factory=dict)
     llm: Any
     elitea: Any = None
     _chunking_tool: Optional[str] = PrivateAttr(default=None)
@@ -458,6 +515,55 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
     def __instantiate_test_log_api_instance(self) -> "swagger_client.TestLogApi":
         return swagger_client.TestLogApi(self._client)
 
+    def _resolve_project_id(self, project_id: Any = None) -> int:
+        """The call's project, else the configured one, else an actionable error."""
+        for candidate in (project_id, self.qtest_project_id):
+            if self._is_unset(candidate):
+                continue
+            if isinstance(candidate, str):
+                candidate = candidate.strip().strip('\'"').strip()
+            try:
+                resolved = int(candidate)
+            except (TypeError, ValueError):
+                resolved = None
+            if (isinstance(candidate, bool) or resolved is None or resolved <= 0
+                    or (isinstance(candidate, float) and not candidate.is_integer())):
+                raise ToolException(f"QTest project id must be a positive number, got '{candidate}'.")
+            return resolved
+        raise ToolException(NO_PROJECT_MESSAGE)
+
+    @contextlib.contextmanager
+    def _project_scope(self, project_id: Any = None):
+        """Make `project_id` the project every helper sees for the rest of this call.
+
+        Resolution is lazy: a call whose helpers never need the project never fails for
+        lack of one. A nested tool call that names no project keeps the outer call's.
+        """
+        current = _call_project.get()
+        if current is not None and current[0] == id(self) and self._is_unset(project_id):
+            yield
+            return
+        token = _call_project.set((id(self), project_id))
+        try:
+            yield
+        finally:
+            _call_project.reset(token)
+
+    def _project_id(self) -> int:
+        """The project of the tool call in progress, else the configured project."""
+        current = _call_project.get()
+        runtime = current[1] if current is not None and current[0] == id(self) else None
+        return self._resolve_project_id(runtime)
+
+    @staticmethod
+    def _is_unset(project_id: Any) -> bool:
+        if project_id is None:
+            return True
+        if isinstance(project_id, str):
+            value = project_id.strip().strip('\'"').strip()
+            return not value or value.lower() in _EMPTY_PROJECT_PLACEHOLDERS
+        return False
+
     def __get_field_definitions_cached(self) -> dict:
         """Get field definitions with session-level caching.
         
@@ -468,9 +574,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         Returns:
             dict: Field definitions mapping
         """
-        if self._field_definitions_cache is None:
-            self._field_definitions_cache = self.__get_project_field_definitions()
-        return self._field_definitions_cache
+        project_id = self._project_id()
+        if project_id not in self._field_definitions_cache:
+            self._field_definitions_cache[project_id] = self.__get_project_field_definitions()
+        return self._field_definitions_cache[project_id]
 
     def refresh_field_definitions_cache(self) -> dict:
         """Manually refresh the field definitions cache.
@@ -482,7 +589,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         Returns:
             dict: Freshly loaded field definitions
         """
-        self._field_definitions_cache = None
+        self._field_definitions_cache.pop(self._project_id(), None)
         return self.__get_field_definitions_cached()
 
     def __map_properties_to_api_format(self, test_case_data: dict, field_definitions: dict,
@@ -719,12 +826,12 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         module_api = swagger_client.ModuleApi(self._client)
         expand = 'descendants'
         try:
-            modules = module_api.get_sub_modules_of(self.qtest_project_id, expand=expand)
+            modules = module_api.get_sub_modules_of(self._project_id(), expand=expand)
         except ApiException as e:
             stacktrace = format_exc()
             logger.error(f"Exception when calling ModuleApi->get_sub_modules_of:\n {stacktrace}")
             raise ValueError(
-                f"""Unable to get all the modules information from following qTest project - {self.qtest_project_id}.
+                f"""Unable to get all the modules information from following qTest project - {self._project_id()}.
                                 Exception: \n {stacktrace}""")
         return modules
 
@@ -754,7 +861,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         try:
             # Search for any test case - just need one
             response = search_instance.search_artifact(
-                self.qtest_project_id,
+                self._project_id(),
                 body,
                 page_size=1,
                 page=1
@@ -765,19 +872,19 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             # Check if permission denied (403) - surface the actual error
             if e.status == 403:
                 raise ToolException(
-                    f"Permission denied (HTTP 403) accessing test-cases in project {self.qtest_project_id}. "
+                    f"Permission denied (HTTP 403) accessing test-cases in project {self._project_id()}. "
                     f"Ensure the API token has READ permission on test-cases. "
                     f"Original error: {e.body}"
                 ) from e
             # For other errors, use the generic message
             raise ValueError(
                 f"Cannot find any test case to query field definitions. "
-                f"Please create at least one test case in project {self.qtest_project_id}"
+                f"Please create at least one test case in project {self._project_id()}"
             ) from e
         
         if not response or not response.get('items') or len(response['items']) == 0:
             raise ValueError(
-                f"No test cases found in project {self.qtest_project_id}. "
+                f"No test cases found in project {self._project_id()}. "
                 f"Please create at least one test case to retrieve field definitions."
             )
         
@@ -789,8 +896,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             "Authorization": f"Bearer {self.qtest_api_token.get_secret_value()}"
         }
 
-        properties_url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/test-cases/{test_case_id}/properties"
-        properties_info_url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/test-cases/{test_case_id}/properties-info"
+        properties_url = f"{self.base_url}/api/v3/projects/{self._project_id()}/test-cases/{test_case_id}/properties"
+        properties_info_url = f"{self.base_url}/api/v3/projects/{self._project_id()}/test-cases/{test_case_id}/properties-info"
 
         try:
             # Get properties with current values and field metadata
@@ -896,7 +1003,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         qtest_object = 'test-cases'
         
         try:
-            fields = fields_api.get_fields(self.qtest_project_id, qtest_object)
+            fields = fields_api.get_fields(self._project_id(), qtest_object)
         except ApiException as e:
             # Check if permission denied (403) - use fallback
             if e.status == 403:
@@ -910,7 +1017,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             stacktrace = format_exc()
             logger.error(f"Exception when calling FieldAPI->get_fields:\n {stacktrace}")
             raise ValueError(
-                f"Unable to get test case fields for project {self.qtest_project_id}. Exception: \n {stacktrace}")
+                f"Unable to get test case fields for project {self._project_id()}. Exception: \n {stacktrace}")
         
         # Build structured mapping
         field_mapping = {}
@@ -951,7 +1058,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         Returns:
             Formatted string with field information
         """
-        output = [f"Available Test Case Fields for Project {self.qtest_project_id}:\n"]
+        output = [f"Available Test Case Fields for Project {self._project_id()}:\n"]
         
         for field_name, field_info in sorted(field_definitions.items()):
             required_marker = " (Required)" if field_info.get('required') else ""
@@ -981,6 +1088,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         return '\n'.join(output)
 
     @tool_group('read')
+    @_project_scoped
     def get_all_test_cases_fields_for_project(self, force_refresh: bool = False) -> str:
         """
         Get formatted information about available test case fields and their values.
@@ -1001,8 +1109,9 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
     def _parse_modules(self) -> list[dict]:
         """Get parsed modules list with caching for the session."""
-        if self._modules_cache is not None:
-            return self._modules_cache
+        project_id = self._project_id()
+        if project_id in self._modules_cache:
+            return self._modules_cache[project_id]
         
         modules = self.__get_all_modules_for_project()
         result = []
@@ -1024,13 +1133,13 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         for module in modules:
             parse_module(module)
 
-        self._modules_cache = result
+        self._modules_cache[project_id] = result
         return result
 
     def __execute_single_create_test_case_request(self, test_case_api_instance: TestCaseApi, body,
                                                   test_case_content: str) -> dict:
         try:
-            response = test_case_api_instance.create_test_case(self.qtest_project_id, body)
+            response = test_case_api_instance.create_test_case(self._project_id(), body)
             test_case_id = response.pid
             qtest_id = response.id
             url = response.web_url
@@ -1045,7 +1154,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             stacktrace = format_exc()
             logger.error(f"Exception when calling TestCaseApi->create_test_case:\n {stacktrace}")
             raise ToolException(
-                f"Unable to create test case in project - {self.qtest_project_id} with the following content:\n{test_case_content}.\n\n Stacktrace was {stacktrace}") from e
+                f"Unable to create test case in project - {self._project_id()} with the following content:\n{test_case_content}.\n\n Stacktrace was {stacktrace}") from e
 
     def __format_property_value(self, prop: dict) -> Any:
         """Format property value for display, detecting field type from response structure.
@@ -1232,7 +1341,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         unlimited = effective_max <= 0
         
         try:
-            api_response = search_instance.search_artifact(self.qtest_project_id, body,
+            api_response = search_instance.search_artifact(self._project_id(), body,
                                                            page_size=self.no_of_items_per_page, page=self.page,
                                                            **search_kwargs)
             self.__parse_data(api_response, parsed_data, extract_images, prompt)
@@ -1248,7 +1357,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                         break
                     
                     next_page = self.page + 1
-                    api_response = search_instance.search_artifact(self.qtest_project_id, body,
+                    api_response = search_instance.search_artifact(self._project_id(), body,
                                                                    page_size=self.no_of_items_per_page, page=next_page,
                                                                    **search_kwargs)
                     self.__parse_data(api_response, parsed_data, extract_images, prompt)
@@ -1256,7 +1365,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             stacktrace = format_exc()
             logger.error(f"Exception when calling SearchApi->search_artifact: \n {stacktrace}")
             raise ToolException(
-                f"""Unable to get the test cases by dql: {dql} from following qTest project - {self.qtest_project_id}.
+                f"""Unable to get the test cases by dql: {dql} from following qTest project - {self._project_id()}.
                     Exception: \n{stacktrace}""")
         
         # Trim to max_results if specified
@@ -1289,10 +1398,10 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         body = swagger_client.ArtifactSearchParams(object_type=object_type, fields=['*'], query=dql)
         
         try:
-            response = search_instance.search_artifact(self.qtest_project_id, body)
+            response = search_instance.search_artifact(self._project_id(), body)
             if response['total'] == 0:
                 raise ValueError(
-                    f"{object_type.capitalize()} '{entity_id}' not found in project {self.qtest_project_id}. "
+                    f"{object_type.capitalize()} '{entity_id}' not found in project {self._project_id()}. "
                     f"Please verify the {entity_id} ID exists."
                 )
             return response['items'][0]['id']
@@ -1300,7 +1409,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             stacktrace = format_exc()
             logger.error(f"Exception when searching for '{object_type}': '{entity_id}': \n {stacktrace}")
             raise ToolException(
-                f"Unable to search for {object_type} '{entity_id}' in project {self.qtest_project_id}. "
+                f"Unable to search for {object_type} '{entity_id}' in project {self._project_id()}. "
                 f"Exception: \n{stacktrace}"
             ) from e
 
@@ -1349,7 +1458,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         body = swagger_client.ArtifactSearchParams(object_type=object_type, fields=['*'], query=dql)
         
         try:
-            response = search_instance.search_artifact(self.qtest_project_id, body)
+            response = search_instance.search_artifact(self._project_id(), body)
             if response['total'] == 0:
                 return None  # Not found, but don't raise - caller handles this
             
@@ -1379,7 +1488,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         )
         
         try:
-            response = search_instance.search_artifact(self.qtest_project_id, body)
+            response = search_instance.search_artifact(self._project_id(), body)
             if response['total'] > 0:
                 return response['items'][0].get('pid')
             return None
@@ -1408,7 +1517,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         body = swagger_client.ArtifactSearchParams(object_type='requirements', fields=['*'],
                                                    query=dql)
         try:
-            response = search_instance.search_artifact(self.qtest_project_id, body)
+            response = search_instance.search_artifact(self._project_id(), body)
             if response['total'] == 0:
                 return False, response
             return True, response
@@ -1432,13 +1541,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         is_present, response = self.__is_jira_requirement_present(jira_issue_id)
         if not is_present:
             raise ValueError(
-                f"Jira requirement '{jira_issue_id}' not found in QTest project {self.qtest_project_id}. "
+                f"Jira requirement '{jira_issue_id}' not found in QTest project {self._project_id()}. "
                 f"Please ensure the Jira issue is linked to QTest as a requirement."
             )
         return response['items'][0]['id']
 
 
     @tool_group('write')
+    @_project_scoped
     def link_tests_to_jira_requirement(self, requirement_external_id: str, json_list_of_test_case_ids: str) -> str:
         """Link test cases to external Jira requirement.
         
@@ -1458,7 +1568,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
         try:
             response = link_object_api_instance.link_artifacts(
-                self.qtest_project_id, 
+                self._project_id(), 
                 object_id=requirement_id,
                 type=linked_type,
                 object_type=source_type, 
@@ -1467,7 +1577,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             linked_test_cases = [link.pid for link in response[0].objects]
             return (
                 f"Successfully linked {len(linked_test_cases)} test case(s) to Jira requirement '{requirement_external_id}' "
-                f"in project {self.qtest_project_id}.\n"
+                f"in project {self._project_id()}.\n"
                 f"Linked test cases: {', '.join(linked_test_cases)}"
             )
         except ApiException as e:
@@ -1475,10 +1585,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error linking to Jira requirement: {stacktrace}")
             raise ToolException(
                 f"Unable to link test cases to Jira requirement '{requirement_external_id}' "
-                f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"in project {self._project_id()}. Exception: \n{stacktrace}"
             ) from e
 
     @tool_group('write')
+    @_project_scoped
     def link_tests_to_qtest_requirement(self, requirement_id: str, json_list_of_test_case_ids: str) -> str:
         """Link test cases to internal QTest requirement.
         
@@ -1506,7 +1617,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
         try:
             response = link_object_api_instance.link_artifacts(
-                self.qtest_project_id,
+                self._project_id(),
                 object_id=qtest_requirement_id,
                 type=linked_type,
                 object_type=source_type,
@@ -1515,7 +1626,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             linked_test_cases = [link.pid for link in response[0].objects]
             return (
                 f"Successfully linked {len(linked_test_cases)} test case(s) to QTest requirement '{requirement_id}' "
-                f"in project {self.qtest_project_id}.\n"
+                f"in project {self._project_id()}.\n"
                 f"Linked test cases: {', '.join(linked_test_cases)}"
             )
         except ApiException as e:
@@ -1523,10 +1634,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error linking to QTest requirement: {stacktrace}")
             raise ToolException(
                 f"Unable to link test cases to QTest requirement '{requirement_id}' "
-                f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"in project {self._project_id()}. Exception: \n{stacktrace}"
             ) from e
 
     @tool_group('read')
+    @_project_scoped
     def find_test_cases_by_requirement_id(self, requirement_id: str, include_details: bool = False) -> dict:
         """Find all test cases linked to a QTest requirement.
         
@@ -1555,7 +1667,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             # type='requirements' means we're searching from requirements
             # ids=[qtest_requirement_id] specifies which requirement(s) to check
             response = link_object_api_instance.find(
-                self.qtest_project_id,
+                self._project_id(),
                 type='requirements',
                 ids=[qtest_requirement_id]
             )
@@ -1638,10 +1750,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error finding test cases by requirement: {stacktrace}")
             raise ToolException(
                 f"Unable to find test cases linked to requirement '{requirement_id}' "
-                f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"in project {self._project_id()}. Exception: \n{stacktrace}"
             ) from e
 
     @tool_group('read')
+    @_project_scoped
     def find_requirements_by_test_case_id(self, test_case_id: str) -> dict:
         """Find all requirements linked to a test case.
         
@@ -1667,7 +1780,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             # Use ObjectLinkApi.find() to get linked artifacts
             # type='test-cases' means we're searching from test cases
             response = link_object_api_instance.find(
-                self.qtest_project_id,
+                self._project_id(),
                 type='test-cases',
                 ids=[qtest_test_case_id]
             )
@@ -1721,10 +1834,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error finding requirements by test case: {stacktrace}")
             raise ToolException(
                 f"Unable to find requirements linked to test case '{test_case_id}' "
-                f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"in project {self._project_id()}. Exception: \n{stacktrace}"
             ) from e
 
     @tool_group('read')
+    @_project_scoped
     def find_test_runs_by_test_case_id(self, test_case_id: str) -> dict:
         """Find all test runs associated with a test case.
         
@@ -1757,7 +1871,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         try:
             # Use ObjectLinkApi.find() to get linked artifacts
             response = link_object_api_instance.find(
-                self.qtest_project_id,
+                self._project_id(),
                 type='test-cases',
                 ids=[qtest_test_case_id]
             )
@@ -1812,10 +1926,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error finding test runs by test case: {stacktrace}")
             raise ToolException(
                 f"Unable to find test runs associated with test case '{test_case_id}' "
-                f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"in project {self._project_id()}. Exception: \n{stacktrace}"
             ) from e
 
     @tool_group('read')
+    @_project_scoped
     def find_defects_by_test_run_id(self, test_run_id: str) -> dict:
         """Find all defects associated with a test run.
         
@@ -1857,7 +1972,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         try:
             # Use ObjectLinkApi.find() to get linked artifacts
             response = link_object_api_instance.find(
-                self.qtest_project_id,
+                self._project_id(),
                 type='test-runs',
                 ids=[qtest_test_run_id]
             )
@@ -1917,10 +2032,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error finding defects by test run: {stacktrace}")
             raise ToolException(
                 f"Unable to find defects associated with test run '{test_run_id}' "
-                f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"in project {self._project_id()}. Exception: \n{stacktrace}"
             ) from e
 
     @tool_group('read')
+    @_project_scoped
     def search_by_dql(self, dql: str, extract_images:bool=False, prompt: str=None, max_results: int=None,
                       append_test_steps: bool=False, include_external_properties: bool=False) -> dict:
         """Search for the test cases in qTest using Data Query Language.
@@ -1948,6 +2064,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         return {'total': len(parsed_data), 'shown': len(shown), 'items': shown}
 
     @tool_group('read')
+    @_project_scoped
     def search_entities_by_dql(self, object_type: str, dql: str) -> dict:
         """Generic DQL search for any entity type (test-cases, requirements, defects, test-runs, etc.).
         
@@ -1979,7 +2096,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         )
         
         try:
-            response = search_instance.search_artifact(self.qtest_project_id, body)
+            response = search_instance.search_artifact(self._project_id(), body)
             
             # Parse all items using the generic parser
             items = []
@@ -2000,10 +2117,11 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error searching {object_type} by DQL: {stacktrace}")
             raise ToolException(
                 f"Unable to search {entity_info['name']}s with DQL '{dql}' "
-                f"in project {self.qtest_project_id}. Exception: \n{stacktrace}"
+                f"in project {self._project_id()}. Exception: \n{stacktrace}"
             ) from e
 
     @tool_group('read')
+    @_project_scoped
     def find_entity_by_id(self, entity_id: str) -> dict:
         """Find any QTest entity by its ID (TC-xxx, RQ-xxx, DF-xxx, TR-xxx).
         
@@ -2038,7 +2156,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         if result is None:
             entity_name = QTEST_OBJECT_TYPES[object_type]['name']
             raise ValueError(
-                f"{entity_name} '{entity_id}' not found in project {self.qtest_project_id}"
+                f"{entity_name} '{entity_id}' not found in project {self._project_id()}"
             )
         
         return result
@@ -2124,6 +2242,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         return result
 
     @tool_group('write')
+    @_project_scoped
     def create_test_cases(self, test_case_content: str, folder_to_place_test_cases_to: str) -> dict:
         """ Create the test case based on the incoming content. The input should be in json format. """
         test_cases_api_instance: TestCaseApi = self.__instantiate_test_api_instance()
@@ -2145,6 +2264,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             return result
 
     @tool_group('write')
+    @_project_scoped
     def update_test_case(self, test_id: str, test_case_content: str) -> str:
         """ Update the test case base on the incoming content. The input should be in json format. Also test id should be passed in following format TC-786. """
         input_obj = json.loads(test_case_content)
@@ -2159,8 +2279,8 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         test_cases_api_instance: TestCaseApi = self.__instantiate_test_api_instance()
         bodies = self.__build_body_for_create_test_case([test_case])
         try:
-            response = test_cases_api_instance.update_test_case(self.qtest_project_id, qtest_id, bodies[0])
-            return f"""Successfully updated test case in project with id - {self.qtest_project_id}.
+            response = test_cases_api_instance.update_test_case(self._project_id(), qtest_id, bodies[0])
+            return f"""Successfully updated test case in project with id - {self._project_id()}.
             Updated test case id - {response.pid}.
             Test id of updated test case - {test_id}.
             Updated with content:\n{test_case}"""
@@ -2168,26 +2288,28 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             stacktrace = format_exc()
             logger.error(f"Exception when calling TestCaseApi->update_test_case: \n {stacktrace}")
             raise ToolException(
-                f"""Unable to update test case in project with id - {self.qtest_project_id} and test id - {test_id}.\n Exception: \n {stacktrace}""") from e
+                f"""Unable to update test case in project with id - {self._project_id()} and test id - {test_id}.\n Exception: \n {stacktrace}""") from e
 
     @tool_group('read')
+    @_project_scoped
     def find_test_case_by_id(self, test_id: str, extract_images=False, prompt=None) -> dict:
         """ Find the test case by its id. Id should be in format TC-123. """
         dql: str = f"Id = '{test_id}'"
         return self.search_by_dql(dql=dql, extract_images=extract_images, prompt=prompt)
 
     @tool_group('delete')
+    @_project_scoped
     def delete_test_case(self, qtest_id: int) -> str:
         """ Delete the test case by its id. Id should be in format 3534653120. """
         test_cases_api_instance: TestCaseApi = self.__instantiate_test_api_instance()
         try:
-            test_cases_api_instance.delete_test_case(self.qtest_project_id, qtest_id)
-            return f"Successfully deleted test case in project with id - {self.qtest_project_id} and qtest id - {qtest_id}."
+            test_cases_api_instance.delete_test_case(self._project_id(), qtest_id)
+            return f"Successfully deleted test case in project with id - {self._project_id()} and qtest id - {qtest_id}."
         except ApiException as e:
             stacktrace = format_exc()
             logger.error(f"Exception when calling TestCaseApi->delete_test_case: \n {stacktrace}")
             raise ToolException(
-                f"""Unable to delete test case in project with id - {self.qtest_project_id} and qtest_id - {qtest_id}. \n Exception: \n {stacktrace}""") from e
+                f"""Unable to delete test case in project with id - {self._project_id()} and qtest_id - {qtest_id}. \n Exception: \n {stacktrace}""") from e
 
     def _upload_binary_file_to_qtest(self, object_type: str, object_id: int, file_bytes: bytes, filename: str, mime_type: str) -> str:
         """Internal method to upload binary file to QTest.
@@ -2203,7 +2325,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             str: Attachment ID from QTest
         """
         # Build upload URL
-        upload_url = f"{self.base_url.rstrip('/')}/api/v3/projects/{self.qtest_project_id}/{object_type}/{object_id}/blob-handles"
+        upload_url = f"{self.base_url.rstrip('/')}/api/v3/projects/{self._project_id()}/{object_type}/{object_id}/blob-handles"
         
         # Prepare headers
         headers = {
@@ -2228,6 +2350,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         return attachment_id
 
     @tool_group('write')
+    @_project_scoped
     def add_file_to_test_case(self, test_case_id: str, filepath: str, filename: str = None, 
                                test_step_number: Optional[int] = None) -> str:
         """Upload file from artifact and attach to QTest test case or test step."""
@@ -2269,7 +2392,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             else:
                 # Get test case to find step ID
                 test_api = self.__instantiate_test_api_instance()
-                test_case = test_api.get_test_case(self.qtest_project_id, qtest_id, expand='teststep')
+                test_case = test_api.get_test_case(self._project_id(), qtest_id, expand='teststep')
                 
                 # Find the step with matching order
                 steps = test_case.test_steps or []
@@ -2309,7 +2432,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         (that is a different id space and yields the 400). Match the project-specific
         status name case-insensitively, then submit only its id as required by qTest.
         """
-        url = f"{self.base_url}/api/v3/projects/{self.qtest_project_id}/test-runs/execution-statuses"
+        url = f"{self.base_url}/api/v3/projects/{self._project_id()}/test-runs/execution-statuses"
         response = requests.get(
             url, headers=self.__qtest_auth_headers(), timeout=self.qtest_api_timeout
         )
@@ -2326,7 +2449,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         logger.debug(
             "qTest execution-status lookup returned %d status(es) for project %s: %s",
             len(statuses),
-            self.qtest_project_id,
+            self._project_id(),
             status_summary,
         )
 
@@ -2359,7 +2482,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         allowed = ', '.join(sorted(by_name.keys()))
         raise ValueError(
             f"Status '{status}' is not a valid execution status in project "
-            f"{self.qtest_project_id}. Allowed values: {allowed}."
+            f"{self._project_id()}. Allowed values: {allowed}."
         )
 
     def __qtest_auth_headers(self) -> dict:
@@ -2373,7 +2496,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         the nested resources qTest returns with properties=None.
         """
         url = (
-            f"{self.base_url}/api/v3/projects/{self.qtest_project_id}"
+            f"{self.base_url}/api/v3/projects/{self._project_id()}"
             f"/test-cases/{qtest_test_case_id}/versions"
         )
         response = requests.get(
@@ -2417,7 +2540,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         which omits intermediate minor versions).
         """
         url = (
-            f"{self.base_url}/api/v3/projects/{self.qtest_project_id}"
+            f"{self.base_url}/api/v3/projects/{self._project_id()}"
             f"/test-cases/{qtest_test_case_id}/versions/{testcase_version_id}"
         )
         response = requests.get(
@@ -2426,7 +2549,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         if response.status_code in (400, 404):
             raise ToolException(
                 f"Test case version ID {testcase_version_id} does not exist for test case "
-                f"{qtest_test_case_id} in project {self.qtest_project_id}."
+                f"{qtest_test_case_id} in project {self._project_id()}."
                 f"{self.__describe_test_case_versions(qtest_test_case_id)}"
                 " Use the get_test_case_versions tool to resolve a version name to its ID."
             )
@@ -2466,13 +2589,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             ) or 'none'
             raise ToolException(
                 f"Version '{version_reference}' is not among the versions qTest lists for "
-                f"test case {qtest_test_case_id} in project {self.qtest_project_id}. "
+                f"test case {qtest_test_case_id} in project {self._project_id()}. "
                 f"Known versions: {available}. Use get_test_case_versions to retrieve "
                 "valid version names and IDs."
             )
         return int(match['version_id'])
 
     @tool_group('read')
+    @_project_scoped
     def get_test_case_versions(self, test_case_id: str, version_name: str = None) -> dict:
         """List the versions of a QTest test case with their numeric version IDs."""
         try:
@@ -2486,7 +2610,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Exception when listing versions of test case {test_case_id}: \n {stacktrace}")
             raise ToolException(
                 f"Unable to list versions of test case {test_case_id} in project "
-                f"{self.qtest_project_id}: {e}"
+                f"{self._project_id()}: {e}"
             ) from e
         except ValueError as e:
             raise ToolException(str(e)) from e
@@ -2498,7 +2622,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
                 available = ', '.join(str(v.get('version')) for v in versions) or 'none'
                 raise ToolException(
                     f"Version '{version_name}' is not among the versions qTest lists for test "
-                    f"case {test_case_id} in project {self.qtest_project_id}. Listed versions: "
+                    f"case {test_case_id} in project {self._project_id()}. Listed versions: "
                     f"{available}. qTest omits intermediate minor versions, so '{version_name}' "
                     f"may still exist and its ID remain usable if you already know it."
                 )
@@ -2512,6 +2636,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         }
 
     @tool_group('write')
+    @_project_scoped
     def update_test_run_status(self, test_run_id: str, status: str, note: str = None,
                                testcase_version_id: str = None) -> str:
         """Record a manual test run's execution result (status) in QTest."""
@@ -2522,13 +2647,13 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             test_run = self.__search_entity_by_id('test-runs', test_run_id)
             if not test_run:
                 raise ToolException(
-                    f"Test run {test_run_id} not found in project {self.qtest_project_id}."
+                    f"Test run {test_run_id} not found in project {self._project_id()}."
                 )
             qtest_test_run_id = test_run.get('QTest Id')
             if not qtest_test_run_id:
                 raise ToolException(
                     f"Test run {test_run_id} has no numeric QTest ID in project "
-                    f"{self.qtest_project_id}; a new execution log cannot be submitted."
+                    f"{self._project_id()}; a new execution log cannot be submitted."
                 )
 
             resolved_testcase_version_id = None
@@ -2568,7 +2693,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.debug(
                 "Submitting qTest manual execution log: project_id=%s, "
                 "test_run_id=%s, payload=%s, note_present=%s",
-                self.qtest_project_id,
+                self._project_id(),
                 qtest_test_run_id,
                 payload_for_log,
                 note is not None,
@@ -2579,7 +2704,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             # TestLogResource deserialization, which crashes when the nested
             # test-case has properties=None.
             response = test_log_api.submit_test_log(
-                self.qtest_project_id, body, qtest_test_run_id,
+                self._project_id(), body, qtest_test_run_id,
                 _preload_content=False,
             )
 
@@ -2599,7 +2724,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
 
             message = (
                 f"Successfully recorded test run {test_run_id} status as '{status}' "
-                f"in project {self.qtest_project_id} by creating a new manual execution log."
+                f"in project {self._project_id()} by creating a new manual execution log."
             )
             if testcase_version_id is not None:
                 message += f" Test case version id: {resolved_testcase_version_id}."
@@ -2611,13 +2736,14 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Exception when submitting test log for test run {test_run_id}: \n {stacktrace}")
             raise ToolException(
                 f"Unable to record status '{status}' for test run {test_run_id} in "
-                f"project {self.qtest_project_id} by submitting a new manual execution "
+                f"project {self._project_id()} by submitting a new manual execution "
                 f"log: {e}"
             ) from e
         except ValueError as e:
             raise ToolException(str(e)) from e
 
     @tool_group('write')
+    @_project_scoped
     def upload_attachment_to_test_run(self, test_run_id: str, attachment_type: str,
                                        filepath: str, filename: str = None) -> str:
         """Upload a file from artifact storage and attach it to a test run's test case or latest test log."""
@@ -2630,7 +2756,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             test_run = self.__search_entity_by_id('test-runs', test_run_id)
             if not test_run:
                 raise ToolException(
-                    f"Test run {test_run_id} not found in project {self.qtest_project_id}."
+                    f"Test run {test_run_id} not found in project {self._project_id()}."
                 )
             if attachment_type == 'test-case':
                 object_id = test_run.get('Test Case Id')
@@ -2679,9 +2805,9 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(str(e)) from e
 
     @tool_group('read')
+    @_project_scoped
     def get_modules(self, parent_id: int = None, search: str = None) -> List[dict]:
         """
-        :param int project_id: ID of the project (required)
         :param int parent_id: ID of the parent Module. Leave it blank to retrieve Modules under root
         :param str search: The free-text to search for Modules by names. You can utilize this parameter to search for Modules. Leave it blank to retrieve all Modules under root or the parent Module
         """
@@ -2692,7 +2818,7 @@ class QtestApiWrapper(NonCodeIndexerToolkit):
         if search:
             kwargs["search"] = search
         
-        modules = module_api.get_sub_modules_of(project_id=self.qtest_project_id, **kwargs)
+        modules = module_api.get_sub_modules_of(project_id=self._project_id(), **kwargs)
         
         # Format modules for output
         formatted = []
@@ -3090,6 +3216,9 @@ Examples:
             "extract_images": (Optional[bool], Field(
                 description="Whether to extract and process images from test steps using LLM",
                 default=False)),
+            "qtest_project_id": (ProjectIdArg, Field(
+                description="QTest project to index; leave empty to use the toolkit's configured project",
+                default=None)),
             "image_prompt": (Optional[str], Field(
                 description="Custom prompt for image analysis (only used if extract_images=True)",
                 default="Analyze this image from a test case step. Describe what the image shows, including any UI elements, text, buttons, or visual indicators. Focus on elements relevant to testing.",
@@ -3107,11 +3236,37 @@ Examples:
         self._extract_images = kwargs.get('extract_images', False)
         self._image_prompt = kwargs.get('image_prompt', None)
         
+        # Resolved before the first document, so a missing project fails the index up front.
+        project_id = self._resolve_project_id(kwargs.get('qtest_project_id'))
+        yield from self._iterate_in_project(project_id, lambda: self._load_test_cases(**kwargs))
+
+    def _iterate_in_project(self, project_id: int, make_generator) -> Generator[Document, None, None]:
+        """Run each step of the generator inside the project scope, never across a yield.
+
+        The consumer resumes the generator from its own context; a scope held open over a
+        yield would leak this project into it.
+        """
+        generator = None
+        try:
+            while True:
+                with self._project_scope(project_id):
+                    if generator is None:
+                        generator = make_generator()
+                    try:
+                        document = next(generator)
+                    except StopIteration:
+                        return
+                yield document
+        finally:
+            if generator is not None:
+                generator.close()
+
+    def _load_test_cases(self, **kwargs) -> Generator[Document, None, None]:
         indexing_mode = kwargs.get('indexing_mode', 'full')
         dql = kwargs.get('dql')
         module_name = kwargs.get('module_name')
 
-        logger.info(f"Starting QTest indexing in '{indexing_mode}' mode for project {self.qtest_project_id}")
+        logger.info(f"Starting QTest indexing in '{indexing_mode}' mode for project {self._project_id()}")
 
         if indexing_mode == 'dql':
             if not dql:
@@ -3124,7 +3279,7 @@ Examples:
             module_id = self._resolve_module_name_to_id(module_name)
             if not module_id:
                 raise ToolException(
-                    f"Module '{module_name}' not found in project {self.qtest_project_id}. "
+                    f"Module '{module_name}' not found in project {self._project_id()}. "
                     f"Use get_modules tool to see available modules."
                 )
             yield from self._load_test_cases_by_module(module_id)
@@ -3156,7 +3311,7 @@ Examples:
         while True:
             try:
                 response = search_instance.search_artifact(
-                    self.qtest_project_id, 
+                    self._project_id(), 
                     body,
                     append_test_steps='true',
                     include_external_properties='true',
@@ -3192,7 +3347,7 @@ Examples:
         while True:
             try:
                 response = test_case_api.get_test_cases(
-                    self.qtest_project_id,
+                    self._project_id(),
                     parent_id=module_id,
                     page=page,
                     size=self.no_of_items_per_page,
@@ -3222,14 +3377,14 @@ Examples:
 
     def _load_test_cases_full_project(self) -> Generator[Document, None, None]:
         """Load all test cases from the project using pagination."""
-        logger.info(f"Loading all test cases from project {self.qtest_project_id}")
+        logger.info(f"Loading all test cases from project {self._project_id()}")
         test_case_api: TestCaseApi = self.__instantiate_test_api_instance()
         
         page = 1
         while True:
             try:
                 response = test_case_api.get_test_cases(
-                    self.qtest_project_id,
+                    self._project_id(),
                     page=page,
                     size=self.no_of_items_per_page,
                     expand_steps='true'
@@ -3284,7 +3439,7 @@ Examples:
             'name': item.get('name', ''),
             'parent_id': parent_id,
             'module_name': module_name,
-            'project_id': self.qtest_project_id,
+            'project_id': self._project_id(),
             'type': 'test_case',
             # Store full item for later processing in _extend_data
             '_raw_item': item,
@@ -3294,10 +3449,7 @@ Examples:
 
     def _get_module_name(self, module_id: int) -> str:
         """Get module name by ID from cached modules."""
-        if self._modules_cache is None:
-            self._parse_modules()
-        
-        for module in self._modules_cache or []:
+        for module in self._parse_modules():
             if module.get('module_id') == module_id:
                 return module.get('full_module_name', module.get('module_name', ''))
         return ''
@@ -3315,8 +3467,12 @@ Examples:
                     yield document
                     continue
                 
-                # Build markdown content for the test case
-                content = self._format_test_case_as_markdown(raw_item)
+                # Runs on an indexer worker thread, so the project travels with the document.
+                project_id = document.metadata.get('project_id')
+                with (self._project_scope(project_id) if project_id is not None
+                      else contextlib.nullcontext()):
+                    # Build markdown content for the test case
+                    content = self._format_test_case_as_markdown(raw_item)
                 
                 # Store content for chunking
                 document.metadata[IndexerKeywords.CONTENT_IN_BYTES.value] = content.encode('utf-8')
