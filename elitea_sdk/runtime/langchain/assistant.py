@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 APP_TYPE_AGENT = "agent"      # Standard LangGraph react agent with tools
 APP_TYPE_PIPELINE = "pipeline"  # Graph-based workflow agent
 APP_TYPE_PREDICT = "predict"    # Special agent without memory store
+# Chat personas that bring an EliteA template; 'none' and 'bare' send instructions without one (#7467)
+TEMPLATE_PERSONAS = frozenset({"generic", "qa", "nerdy", "quirky", "cynical"})
 
 
 def _is_anthropic_model(model: Any) -> bool:
@@ -736,9 +738,12 @@ class Assistant:
                 # (LLMNode) omits the SystemMessage entirely for empty content.
                 escaped_prompt = functional_addons
             logger.debug("bare persona: skipping EliteA persona template (instructions + tool addons only)")
-        # For agent/predict types, use instructions directly without wrapping.
-        # Persona templates (DEFAULT_ASSISTANT, etc.) are only used when persona is specified.
-        elif self.app_type in [APP_TYPE_AGENT, APP_TYPE_PREDICT] and prompt_instructions:
+        # Agents use their own instructions directly. Chat (predict) does too unless a persona
+        # template applies: its instructions then go in the template's Custom instructions (#7467).
+        elif prompt_instructions and (
+            self.app_type == APP_TYPE_AGENT
+            or (self.app_type == APP_TYPE_PREDICT and self.persona not in TEMPLATE_PERSONAS)
+        ):
             # Use agent's own instructions as the base system prompt; append addons
             # only when their corresponding tools are present.
             escaped_prompt = (

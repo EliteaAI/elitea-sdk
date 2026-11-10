@@ -1,8 +1,8 @@
-"""LLMNode must tag error AIMessages with llm_node_error metadata on failure (#7041).
+"""LLMNode must tag error AIMessages with run_failure_notice metadata on failure (#7041).
 
 When the LLM raises (e.g. AuthenticationError 401) and routing_scope is None, LLMNode.invoke()
 catches the exception and converts it to an AIMessage so the graph can continue. The AIMessage
-is tagged with response_metadata['llm_node_error'] = True so that Application._run() can detect
+is tagged with response_metadata['run_failure_notice'] = True so that Application._run() can detect
 it downstream and re-raise as RuntimeError, causing BaseTool.run() to fire on_tool_error and
 the UI Application chip to show an error state instead of closing as "complete".
 
@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
+
+from elitea_sdk.runtime.tool_outcome import RUN_FAILURE_NOTICE_KEY
 
 
 class _TrackingCallback(BaseCallbackHandler):
@@ -54,7 +56,7 @@ def _config_with_callback(cb):
     return {"callbacks": [cb]}
 
 
-def test_llm_node_error_tags_response_metadata(llm_node):
+def test_model_error_tags_response_metadata(llm_node):
     """When the LLM raises with routing_scope=None, invoke() returns a tagged error AIMessage (#7041)."""
     from elitea_sdk.runtime.tools.llm import LLMNode
 
@@ -65,8 +67,8 @@ def test_llm_node_error_tags_response_metadata(llm_node):
     assert messages, "Expected at least one message in the result"
     last_msg = messages[-1]
     assert isinstance(last_msg, AIMessage), f"Expected AIMessage, got {type(last_msg)}"
-    assert last_msg.response_metadata.get("llm_node_error") is True, (
-        "Expected response_metadata['llm_node_error'] = True on error AIMessage"
+    assert last_msg.response_metadata.get(RUN_FAILURE_NOTICE_KEY) is True, (
+        "Expected response_metadata['run_failure_notice'] = True on error AIMessage"
     )
     assert last_msg.response_metadata.get("llm_node_exception_type") == "RuntimeError", (
         f"Expected llm_node_exception_type='RuntimeError', got "
@@ -112,18 +114,18 @@ def test_llm_node_error_no_custom_event_with_callback_manager(llm_node):
 
 def _tagged_error(text="Error: auth failed", exc_type="AuthenticationError"):
     msg = AIMessage(content=text)
-    msg.response_metadata["llm_node_error"] = True
+    msg.response_metadata[RUN_FAILURE_NOTICE_KEY] = True
     msg.response_metadata["llm_node_exception_type"] = exc_type
     return msg
 
 
 def test_application_run_raises_when_final_message_is_tagged():
     """A tagged final non-Human message must raise RuntimeError (#7041)."""
-    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+    from elitea_sdk.runtime.tools.application import _raise_if_model_error
 
     response = {"messages": [HumanMessage(content="go"), _tagged_error()]}
     with pytest.raises(RuntimeError, match="Nested agent LLM failed"):
-        _raise_if_llm_node_error(response)
+        _raise_if_model_error(response)
 
 
 def test_application_run_does_not_raise_when_tagged_message_is_not_final():
@@ -132,7 +134,7 @@ def test_application_run_does_not_raise_when_tagged_message_is_not_final():
     This prevents a tagged error from a previous call (committed to the child's
     checkpoint history) from poisoning every later call to the same sub-agent.
     """
-    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+    from elitea_sdk.runtime.tools.application import _raise_if_model_error
 
     successful_reply = AIMessage(content="all good now")
     response = {
@@ -144,7 +146,7 @@ def test_application_run_does_not_raise_when_tagged_message_is_not_final():
         ]
     }
     # Should not raise; the final non-Human message is the successful reply.
-    _raise_if_llm_node_error(response)
+    _raise_if_model_error(response)
 
 
 def test_application_run_does_not_raise_when_current_run_has_no_ai_message():
@@ -154,7 +156,7 @@ def test_application_run_does_not_raise_when_current_run_has_no_ai_message():
     and hits the HumanMessage first. Stopping there prevents it from crossing into a tagged
     error from a *previous* run.
     """
-    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+    from elitea_sdk.runtime.tools.application import _raise_if_model_error
 
     response = {
         "messages": [
@@ -165,4 +167,12 @@ def test_application_run_does_not_raise_when_current_run_has_no_ai_message():
         ]
     }
     # Must not raise: the scan hits the current run's HumanMessage and stops.
-    _raise_if_llm_node_error(response)
+    _raise_if_model_error(response)
+
+
+def test_application_run_does_not_raise_on_a_tagged_message_without_an_exception_type():
+    """A failure notice that is not a model error (a blocked tool, a step limit) is not a nested model failure."""
+    from elitea_sdk.runtime.tools.application import _raise_if_model_error
+
+    notice = AIMessage(content="Tool step limit reached", response_metadata={RUN_FAILURE_NOTICE_KEY: True})
+    _raise_if_model_error({"messages": [HumanMessage(content="go"), notice]})

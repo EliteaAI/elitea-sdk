@@ -52,7 +52,7 @@ runs:
         # Set DENO_DIR to node_modules under sandbox base for proper Deno package resolution
         DENO_DIR_REAL="${SANDBOX_BASE_REAL}/node_modules"
 
-        echo "SANDBOX_BASE=$SANDBOX_BASE_REAL" >> "$GITHUB_ENV"
+        echo "SANDBOX_BASE=/app" >> "$GITHUB_ENV"
         echo "DENO_DIR=$DENO_DIR_REAL" >> "$GITHUB_ENV"
 
         export SANDBOX_BASE="$SANDBOX_BASE_REAL"

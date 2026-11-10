@@ -107,10 +107,8 @@ class TestBuildBlockedTermination:
 class TestFunctionToolInvokeBlocked:
     """Test that FunctionTool.invoke() returns clean termination on blocked result."""
 
-    @patch('elitea_sdk.runtime.tools.function.convert_to_openai_tool',
-           return_value={'function': {'parameters': {'properties': {}}}})
     @patch('elitea_sdk.runtime.tools.function.dispatch_custom_event')
-    def test_blocked_result_triggers_clean_termination(self, _mock_dispatch, _mock_convert):
+    def test_blocked_result_triggers_clean_termination(self, _mock_dispatch):
         blocked_json = _make_blocked_json()
         mock_tool = _make_mock_tool("create_issue")
         mock_tool.invoke.return_value = blocked_json
@@ -129,10 +127,8 @@ class TestFunctionToolInvokeBlocked:
         assert result["issue_result"] is None
         assert "blocked" in result["messages"][0]["content"].lower()
 
-    @patch('elitea_sdk.runtime.tools.function.convert_to_openai_tool',
-           return_value={'function': {'parameters': {'properties': {}}}})
     @patch('elitea_sdk.runtime.tools.function.dispatch_custom_event')
-    def test_normal_result_passes_through(self, _mock_dispatch, _mock_convert):
+    def test_normal_result_passes_through(self, _mock_dispatch):
         mock_tool = _make_mock_tool("get_issue")
         mock_tool.invoke.return_value = {"number": 42, "title": "Test"}
 

@@ -874,6 +874,13 @@ Read this skill's files only with read_skill_file(skill="{name}", path="{example
 </skill_files>"""
 SKILL_FILES_BLOCK_END = "</skill_files>"
 SKILL_FILES_SCRIPTS_NOTE = "\nYou cannot run scripts here; read one and follow it yourself."
+SKILL_FILES_RUN_SCRIPTS_NOTE = (
+    "\nRun one of this skill's Python scripts with run_skill_script(skill=\"{name}\", path=\"{example}\", args=[...], "
+    "files=[...]): it runs offline in a sandbox with the skill's files at /skills/{name}/, in a working directory "
+    "that persists between script calls of this conversation (it may expire between sessions); attachments named in "
+    "files appear under inputs/, and anything the script writes directly under output/ is shared with the user. Only "
+    ".py files run; other scripts cannot run on this platform."
+)
 SKILL_FILES_LISTING_LIMIT = 30
 SKILL_FILES_LISTING_FILE = "{path} ({size})"
 SKILL_FILES_LISTING_DIRECTORY = "{path}/ ({count} {unit})"
@@ -934,6 +941,24 @@ SKILL_FILE_UNAVAILABLE = "Skill \"{name}\" file \"{path}\" could not be read: {r
 SKILL_FILE_UNAVAILABLE_DENIED = "it is no longer accessible"
 SKILL_FILE_UNAVAILABLE_TRANSIENT = "it could not be fetched right now"
 SKILL_FILE_SUGGESTION_LIMIT = 3
+
+RUN_SKILL_SCRIPT_TOOL_DESCRIPTION = (
+    "Run a Python script bundled with a loaded skill, when the skill's instructions say to. Pass the skill's exact "
+    "name, the script's path relative to the skill root (such as path=\"scripts/check.py\"), its command-line "
+    "arguments as a list of strings, and in files the names of conversation attachments the script must read. The "
+    "script runs offline in a Python sandbox with no network and no platform access, for at most "
+    "{timeout} seconds: the skill's files are at /skills/<name>/, the working directory persists between script "
+    "calls of this conversation (it may expire between sessions), attachments named in files appear under inputs/, "
+    "and files the script writes directly under output/ are shared with the user as attachments. Files a script "
+    "writes are kept even when it fails, so a later call sees what a failed one left behind. The result is "
+    "\"Exit code N\" followed by what the script printed; output over {inline_chars} characters is saved and "
+    "returned as a preview with a skill-output:// reference for read_skill_output. Only .py files run."
+)
+READ_SKILL_OUTPUT_TOOL_DESCRIPTION = (
+    "Read the saved output of an earlier run_skill_script call whose result named a skill-output:// reference, by "
+    "line range (1-based, inclusive). Omit start_line and end_line to read it from the beginning."
+)
+
 
 
 SEARCH_INDEX_ADDON = """

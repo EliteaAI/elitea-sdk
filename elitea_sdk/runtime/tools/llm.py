@@ -47,7 +47,15 @@ from ..context_floor import (
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
 from ..utils.internal_run_auth import run_token_refusal
-from ..tool_outcome import ToolOutcome, ToolResultStatus, outcome_sink, record_outcome, resolve_run_error
+from ..tool_outcome import (
+    RUN_FAILURE_NOTICE_KEY,
+    ToolOutcome,
+    ToolResultStatus,
+    note_run_error,
+    outcome_sink,
+    record_outcome,
+    resolve_run_error,
+)
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 from ..utils.failure_signals import describe_llm_error
@@ -139,6 +147,7 @@ from .hitl import (
     HITL_VIA_CALL_ID_KEY,
     PendingHITLEntry,
 )
+from .skill_script_runner import ScriptRunContext, SkillScriptRunner, is_canonical_uuid
 from .skill_tools import (
     LoadSkillTool,
     ReadSkillFileTool,
@@ -241,6 +250,27 @@ def _llm_idle_timeout(client):
         if isinstance(value, (int, float)):
             return value
     return None
+
+def _llm_error_message(content, exc, client):
+    """The AIMessage for a failed model call, tagged for nested agents and for the run status.
+
+    The graph carries on with this message as an answer, so the run would look successful.
+    The run-level error holder is what a non-interactive run reads to end as failed. Only the
+    holder is written: the outcome sink belongs to tool calls and would mislabel one.
+    """
+    message = AIMessage(content=content)
+    message.response_metadata[RUN_FAILURE_NOTICE_KEY] = True
+    message.response_metadata['llm_node_exception_type'] = type(exc).__name__
+    # The holder is never cleared by a later good call: a model error is final for its node,
+    # and a recovered nested agent must not hide a node that failed.
+    note_run_error(ToolOutcome(
+        status=ToolResultStatus.ERROR,
+        message=describe_llm_error(exc, _llm_idle_timeout(client)),
+        tool_name='model call',
+        toolkit_type='LLM',
+        exception_type=type(exc).__name__,
+    ))
+    return message
 
 class LLMNode(BaseTool):
     """Enhanced LLM node with chat history and tool binding support"""
@@ -773,6 +803,7 @@ class LLMNode(BaseTool):
             skill_search=configurable.get('skill_search'),
             skill_body_fetcher=self._resolve_skill_body_fetcher(configurable),
             skill_file_fetcher=getattr(self.elitea_client, 'get_skill_file', None),
+            skill_script_runner=self._build_skill_script_runner(configurable),
         )
 
         def merge_skill_tools(tools):
@@ -1053,6 +1084,25 @@ class LLMNode(BaseTool):
             for skill in configurable.get('invoked_skills') or [] if isinstance(skill, dict)
         }
         return invoked | loaded_skill_names_from_messages(list(chat_history or []))
+
+    def _build_skill_script_runner(self, configurable: dict):
+        """A runner for this turn's scripts, keyed by the conversation the platform verified for the run, or None when
+        the run has no client or the platform sent no such conversation."""
+        scratch = configurable.get('skill_scratch') or {}
+        conversation_uuid = scratch.get('conversation_uuid')
+        if not is_canonical_uuid(conversation_uuid) or not scratch.get('bucket'):
+            return None
+        if not callable(getattr(self.elitea_client, 'get_skill_file', None)):
+            return None
+        return SkillScriptRunner(
+            ScriptRunContext(
+                client=self.elitea_client,
+                scratch_bucket=scratch['bucket'],
+                attachment_bucket=configurable.get('attachment_bucket') or scratch['bucket'],
+                conversation_uuid=conversation_uuid,
+            ),
+            file_fetcher=self.elitea_client.get_skill_file,
+        )
 
     def _resolve_skill_body_fetcher(self, configurable: dict):
         fetcher = configurable.get('skill_body_fetcher')
@@ -1351,9 +1401,7 @@ class LLMNode(BaseTool):
             logger.error(f"Error in LLM Node: {format_exc()}")
             logger.error(f"Model being used: {model_info}")
             logger.error(f"Error type: {type(e).__name__}")
-            _error_msg = AIMessage(content=f"Error: {describe_llm_error(e, _llm_idle_timeout(self.client))}")
-            _error_msg.response_metadata['llm_node_error'] = True
-            _error_msg.response_metadata['llm_node_exception_type'] = type(e).__name__
+            _error_msg = _llm_error_message(f"Error: {describe_llm_error(e, _llm_idle_timeout(self.client))}", e, self.client)
             result = {"messages": [_error_msg]}
 
         # A before_model hook may have swapped stored messages for model-only copies (input
@@ -4832,10 +4880,7 @@ class LLMNode(BaseTool):
                         error_details.append("- Model ID doesn't contain unexpected prefixes")
                     
                     error_msg = "\n".join(error_details)
-                    _tagged = AIMessage(content=error_msg)
-                    _tagged.response_metadata['llm_node_error'] = True
-                    _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
-                    new_messages.append(_tagged)
+                    new_messages.append(_llm_error_message(error_msg, e, self.client))
                     break
 
                 if is_context_error or is_output_limit_error:
@@ -4949,7 +4994,7 @@ class LLMNode(BaseTool):
                             break
                         logger.error(f"Error retrying LLM after truncation: {retry_error}")
                         error_msg = f"Failed to retry after truncation: {str(retry_error)}"
-                        new_messages.append(AIMessage(content=error_msg))
+                        new_messages.append(_llm_error_message(error_msg, retry_error, self.client))
                         break
                     else:
                         # Couldn't find tool message, add error and break
@@ -4963,16 +5008,13 @@ class LLMNode(BaseTool):
                                 "Context window exceeded. The conversation or tool results are too large. "
                                 "Try using tools with smaller output limits (e.g., max_items, max_depth parameters)."
                             )
-                        new_messages.append(AIMessage(content=error_msg))
+                        new_messages.append(_llm_error_message(error_msg, e, self.client))
                         break
                 else:
                     logger.error(f"Error in LLM call during iteration {iteration}: {e}")
                     # Add error message and break the loop
                     error_msg = f"Error processing tool results in iteration {iteration}: {describe_llm_error(e, _llm_idle_timeout(self.client))}"
-                    _tagged = AIMessage(content=error_msg)
-                    _tagged.response_metadata['llm_node_error'] = True
-                    _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
-                    new_messages.append(_tagged)
+                    new_messages.append(_llm_error_message(error_msg, e, self.client))
                     break
 
         # Handle max iterations (against the local budget, which injections may have bumped)
@@ -5011,7 +5053,7 @@ class LLMNode(BaseTool):
             
             # Add warning message - CLI or calling code can detect this and prompt user
             warning_msg = f"Maximum tool execution iterations ({effective_limit}) reached. Stopping tool execution."
-            new_messages.append(AIMessage(content=warning_msg))
+            new_messages.append(AIMessage(content=warning_msg, response_metadata={RUN_FAILURE_NOTICE_KEY: True}))
         else:
             logger.info(f"Tool execution completed after {iteration} iterations")
 

@@ -618,4 +618,5 @@ class TestPipelineFailureShapes:
 
         # The declared output variable is absent entirely — not empty, absent.
         assert set(result) == {"messages", "tool_outcomes", "last_tool_outcome"}
-        assert "connection refused" in result["messages"][0]["content"]
+        assert "update_issue" in result["messages"][0]["content"]
+        assert "connection refused" not in result["messages"][0]["content"]

@@ -42,6 +42,17 @@ class ToolOutcome(BaseModel):
     original_size: Optional[int] = None
 
 
+# response_metadata key on an assistant message the SDK writes to report its own failure
+# (a failed node, a stopped pipeline, a step limit). The text reads like a normal answer,
+# so a consumer that must tell the two apart reads this flag, never the text.
+RUN_FAILURE_NOTICE_KEY = 'run_failure_notice'
+
+
+def run_failure_message(content: str) -> Dict[str, Any]:
+    """An assistant message dict that reports a failure, tagged for add_messages to keep."""
+    return {"role": "assistant", "content": content, "response_metadata": {RUN_FAILURE_NOTICE_KEY: True}}
+
+
 # Channel from the middleware that builds an outcome back to the caller that needs it.
 # Caller-owned so a stale read is impossible: no sink installed, nothing recorded.
 _OUTCOME_SINK: contextvars.ContextVar[Optional[List[ToolOutcome]]] = contextvars.ContextVar(
@@ -89,7 +100,7 @@ def _short_reason(message: Optional[str]) -> str:
     return re.sub(r'\s+', ' ', text).strip()[:_MAX_ERROR_REASON_CHARS]
 
 
-def _note_run_error(outcome: ToolOutcome) -> None:
+def note_run_error(outcome: ToolOutcome) -> None:
     holder = _RUN_ERROR_FLAG.get()
     if holder is None or outcome.status is not ToolResultStatus.ERROR:
         return
@@ -114,7 +125,7 @@ def resolve_run_error(tool_name: Optional[str], toolkit_type: Optional[str] = No
 
 def record_outcome(outcome: ToolOutcome) -> None:
     """Notes the first error for an open run holder, then appends to the sink if one is open."""
-    _note_run_error(outcome)
+    note_run_error(outcome)
     sink = _OUTCOME_SINK.get()
     if sink is not None:
         sink.append(outcome)

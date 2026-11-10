@@ -70,15 +70,11 @@ def _base_state(extra: dict | None = None) -> dict:
 def _invoke(ft: FunctionTool, state: dict) -> dict:
     """Invoke FunctionTool with standard patches applied."""
     with patch(
-        "elitea_sdk.runtime.tools.function.convert_to_openai_tool",
-        return_value={"function": {"parameters": {"properties": {}}}},
+        "elitea_sdk.runtime.tools.function.propagate_the_input_mapping",
+        return_value={"task": "hi"},
     ):
-        with patch(
-            "elitea_sdk.runtime.tools.function.propagate_the_input_mapping",
-            return_value={"task": "hi"},
-        ):
-            with patch("elitea_sdk.runtime.tools.function.dispatch_custom_event"):
-                return ft.invoke(state)
+        with patch("elitea_sdk.runtime.tools.function.dispatch_custom_event"):
+            return ft.invoke(state)
 
 
 # ---------------------------------------------------------------------------

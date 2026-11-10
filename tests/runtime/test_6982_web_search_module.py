@@ -71,4 +71,5 @@ def test_pipeline_node_yields_error_outcome_on_limit():
     message = outcome["message"] if isinstance(outcome, dict) else outcome.message
     assert status in (ToolResultStatus.ERROR, ToolResultStatus.ERROR.value)
     assert "limit reached" in message
-    assert "limit reached" in result["messages"][0]["content"]
+    assert "web_search" in result["messages"][0]["content"]
+    assert "limit reached" not in result["messages"][0]["content"]

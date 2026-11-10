@@ -8,7 +8,7 @@ from typing import Dict
 import yaml
 import ast
 from langchain_core.callbacks import dispatch_custom_event
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, RemoveMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, RemoveMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
@@ -31,7 +31,7 @@ from .utils import (
     propagate_the_input_mapping,
     safe_format,
 )
-from ..tool_outcome import ToolOutcome, ToolResultStatus, record_outcome
+from ..tool_outcome import ToolOutcome, ToolResultStatus, record_outcome, run_failure_message
 from ..utils.constants import TOOLKIT_NAME_META
 from ..tools.function import (
     FunctionTool, LAST_TOOL_OUTCOME_KEY, PIPELINE_BLOCKED_KEY, TOOL_OUTCOMES_KEY,
@@ -1072,7 +1072,7 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
             toolkit_type=toolkit_name,
         ))
         result = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
             LAST_TOOL_OUTCOME_KEY: None,
         }
@@ -1833,7 +1833,12 @@ def convert_dict_to_message(msg_dict):
         if role == 'user':
             return HumanMessage(content=content, additional_kwargs=additional_kwargs)
         elif role == 'assistant':
-            return AIMessage(content=content, additional_kwargs=additional_kwargs)
+            # Replayed tool-call stubs (#7460) keep their structure so the pair reaches the provider as tool_use
+            return AIMessage(content=content, additional_kwargs=additional_kwargs,
+                             tool_calls=msg_dict.get('tool_calls') or [])
+        elif role == 'tool' and msg_dict.get('tool_call_id'):
+            return ToolMessage(content=content, tool_call_id=msg_dict['tool_call_id'],
+                               additional_kwargs=additional_kwargs)
         elif role == 'system':
             return SystemMessage(content=content, additional_kwargs=additional_kwargs)
         else:
