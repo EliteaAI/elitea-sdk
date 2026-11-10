@@ -354,8 +354,9 @@ class EliteAClient:
         """Create a schedule.
 
         Args:
-            data: The body, sent unchanged. Keys: name, description, entity_type,
-                application_id, version_id, run_mode, prompt, variables, cron,
+            data: The body, sent unchanged. Keys: name, description, entity_type
+                (agent, pipeline or toolkit_index), application_id, toolkit_id,
+                index_name, version_id, run_mode, prompt, variables, cron,
                 timezone, expires_at, approval_rule, enabled (false saves the
                 schedule paused; default true), risk_ack (a dict with
                 `fingerprint` of a risk 409 and `confirmed_name`, the schedule
