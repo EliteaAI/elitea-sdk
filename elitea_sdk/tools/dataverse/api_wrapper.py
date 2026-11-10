@@ -7,7 +7,9 @@ from pydantic import Field, SecretStr, create_model
 
 from ..elitea_base import BaseToolApiWrapper
 from ..utils.tool_groups import tool_group, with_tool_groups
-from ...configurations.dataverse import DataverseError, dataverse_get, dataverse_patch
+from ...configurations.dataverse import (
+    DataverseError, DataverseLoginRequired, build_login_required, dataverse_get, dataverse_patch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,17 +91,31 @@ class DataverseApiWrapper(BaseToolApiWrapper):
     client_secret: Optional[SecretStr] = None
     refresh_token: Optional[SecretStr] = None
     access_token: Optional[SecretStr] = None
+    configuration_uuid: Optional[str] = None
 
     def _settings(self) -> dict:
         return {
             "url": self.url, "tenant_id": self.tenant_id, "client_id": self.client_id,
             "client_secret": self.client_secret, "refresh_token": self.refresh_token,
-            "access_token": self.access_token,
+            "access_token": self.access_token, "configuration_uuid": self.configuration_uuid,
         }
+
+    def _login_required(self, error: DataverseLoginRequired) -> ToolException:
+        """The sign-in signal that opens the Login popup (a schedule run waits for its owner).
+
+        A bad URL or tenant has no Entra endpoints to sign in at, so it stays a plain tool error.
+        """
+        signal = build_login_required(self._settings(), str(error))
+        if isinstance(signal, DataverseError):
+            return ToolException(str(signal))
+        signal.tool_name = None  # the runner names the leaf tool
+        return signal
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
         try:
             return dataverse_get(self._settings(), path, params)
+        except DataverseLoginRequired as e:
+            raise self._login_required(e) from None
         except DataverseError as e:
             raise ToolException(str(e)) from None
 
@@ -220,6 +236,8 @@ class DataverseApiWrapper(BaseToolApiWrapper):
     def _patch(self, path: str, fields: dict) -> Any:
         try:
             return dataverse_patch(self._settings(), path, fields)
+        except DataverseLoginRequired as e:
+            raise self._login_required(e) from None
         except DataverseError as e:
             raise ToolException(str(e)) from None
 
