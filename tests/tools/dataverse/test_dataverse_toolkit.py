@@ -125,9 +125,56 @@ def test_missing_refresh_token_requests_login_with_entra_endpoints(http):
     assert http.token_calls == []
 
 
-def test_tool_call_without_login_explains_how_to_log_in(http):
-    with pytest.raises(ToolException, match="Login button"):
-        tools({**SETTINGS, "refresh_token": None})["who_am_i"].run({})
+LOGGED_OUT = {**SETTINGS, "refresh_token": None, "configuration_uuid": "uuid-1"}
+
+
+def test_tool_call_without_login_asks_for_a_sign_in(http):
+    with pytest.raises(McpAuthorizationRequired, match="Login button") as exc:
+        tools(LOGGED_OUT)["who_am_i"].run({})
+    authority = f"https://login.microsoftonline.com/{SETTINGS['tenant_id']}"
+    assert exc.value.server_url == authority
+    assert exc.value.resource_metadata["oauth_authorization_server"]["token_endpoint"] == f"{authority}/oauth2/v2.0/token"
+    assert exc.value.resource_metadata["configuration_uuid"] == "uuid-1"
+    assert http.token_calls == [] and http.api_calls == []
+
+
+def test_sign_in_signal_of_a_tool_call_leaves_the_tool_name_to_the_runner(http):
+    with pytest.raises(McpAuthorizationRequired) as exc:
+        tools(LOGGED_OUT)["who_am_i"].run({})
+    assert exc.value.tool_name is None
+    assert exc.value.toolkit_type == "dataverse"
+
+
+@pytest.mark.parametrize("error", [
+    "AADSTS65001: The user or administrator has not consented",
+    "AADSTS700082: The refresh token has expired due to inactivity",
+])
+def test_tool_call_with_expired_login_asks_for_a_sign_in(http, error):
+    http.token_response = FakeResponse(400, {"error": "invalid_grant", "error_description": error})
+    with pytest.raises(McpAuthorizationRequired) as exc:
+        tools({**SETTINGS, "configuration_uuid": "uuid-1"})["who_am_i"].run({})
+    assert "refresh-1" not in str(exc.value.to_dict())
+
+
+def test_update_record_without_login_asks_for_a_sign_in(http):
+    with pytest.raises(McpAuthorizationRequired):
+        tools(LOGGED_OUT)["update_record"].run({"entity_set": "accounts", "record_id": RECORD_ID,
+                                                 "fields": {"name": "x"}})
+    assert http.api_calls == []
+
+
+def test_tool_call_with_wrong_client_secret_stays_a_plain_error(http):
+    http.token_response = FakeResponse(401, {"error": "invalid_client",
+                                             "error_description": "AADSTS7000215: Invalid client secret provided"})
+    with pytest.raises(ToolException, match="client secret is wrong") as exc:
+        tools(SETTINGS)["who_am_i"].run({})
+    assert not isinstance(exc.value, McpAuthorizationRequired)
+
+
+def test_tool_call_without_login_and_with_a_bad_tenant_stays_a_plain_error(http):
+    with pytest.raises(ToolException, match="tenant_id") as exc:
+        tools({**LOGGED_OUT, "tenant_id": "evil/../x"})["who_am_i"].run({})
+    assert not isinstance(exc.value, McpAuthorizationRequired)
 
 
 @pytest.mark.parametrize("url", [
