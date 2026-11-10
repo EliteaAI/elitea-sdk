@@ -6,7 +6,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from elitea_sdk.runtime.langchain.assistant import Assistant
 from elitea_sdk.runtime.middleware.strategies import LoggingStrategy
 from elitea_sdk.runtime.middleware.tool_exception_handler import ToolExceptionHandlerMiddleware
-from elitea_sdk.runtime.tool_outcome import run_error_flag
+from elitea_sdk.runtime.tool_outcome import RUN_FAILURE_NOTICE_KEY, run_error_flag
 
 
 class _Runtime:
@@ -99,4 +99,22 @@ def test_a_failure_of_one_tool_is_not_cleared_by_another_tool():
 
     holder, _ = _run(['broken', 'fine'], [_tool(broken, 'broken'), _tool(lambda item: 'ok', 'fine')])
 
+    assert holder['error']['tool'] == 'broken'
+
+
+def test_a_failed_tool_stays_in_the_messages_while_the_agent_still_answers():
+    def broken(item):
+        raise RuntimeError('still broken')
+
+    holder, result = _run(['broken'], [_tool(broken, 'broken')])
+
+    tool_messages = [m for m in result['messages'] if isinstance(m, ToolMessage)]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].status == 'error'
+    assert 'still broken' in tool_messages[0].content
+    final = result['messages'][-1]
+    assert isinstance(final, AIMessage)
+    assert final.content == 'FINAL'
+    assert RUN_FAILURE_NOTICE_KEY not in final.response_metadata
+    assert result['output'] == 'FINAL'
     assert holder['error']['tool'] == 'broken'

@@ -10,7 +10,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
-from elitea_sdk.runtime.tool_outcome import run_error_flag
+from elitea_sdk.runtime.tool_outcome import RUN_FAILURE_NOTICE_KEY, run_error_flag
 from elitea_sdk.runtime.tools.llm import LLMNode, _llm_error_message
 
 
@@ -37,7 +37,7 @@ def test_provider_400_sets_the_run_error_holder(llm_node):
     assert holder["error"]["toolkit"] == "LLM", holder
     assert holder["error"]["tool"] == "model call", holder
     assert "invalid request" in holder["error"]["reason"], holder
-    assert result["messages"][-1].response_metadata["llm_node_error"] is True
+    assert result["messages"][-1].response_metadata[RUN_FAILURE_NOTICE_KEY] is True
 
 
 def test_normal_answer_leaves_the_holder_empty(llm_node):
@@ -47,7 +47,7 @@ def test_normal_answer_leaves_the_holder_empty(llm_node):
         result = llm_node.invoke({"messages": []})
 
     assert holder == {}
-    assert "llm_node_error" not in result["messages"][-1].response_metadata
+    assert RUN_FAILURE_NOTICE_KEY not in result["messages"][-1].response_metadata
 
 
 def test_error_without_an_open_holder_still_returns_the_tagged_message(llm_node):
@@ -55,7 +55,7 @@ def test_error_without_an_open_holder_still_returns_the_tagged_message(llm_node)
         result = llm_node.invoke({"messages": []})
 
     last = result["messages"][-1]
-    assert last.response_metadata["llm_node_error"] is True
+    assert last.response_metadata[RUN_FAILURE_NOTICE_KEY] is True
     assert last.response_metadata["llm_node_exception_type"] == "FakeBadRequestError"
 
 
@@ -65,7 +65,7 @@ def test_error_message_helper_tags_the_message_and_the_holder():
         message = _llm_error_message("Failed to retry after truncation: x", FakeBadRequestError("x"), client)
 
     assert message.content == "Failed to retry after truncation: x"
-    assert message.response_metadata["llm_node_error"] is True
+    assert message.response_metadata[RUN_FAILURE_NOTICE_KEY] is True
     assert message.response_metadata["llm_node_exception_type"] == "FakeBadRequestError"
     assert holder["error"]["tool"] == "model call"
 
@@ -144,7 +144,7 @@ def test_model_error_in_the_tool_loop_sets_the_run_error_holder(error, reason_pa
     assert holder["error"]["tool"] == "model call", holder
     assert holder["error"]["toolkit"] == "LLM", holder
     assert reason_part in holder["error"]["reason"], holder
-    assert last.response_metadata["llm_node_error"] is True
+    assert last.response_metadata[RUN_FAILURE_NOTICE_KEY] is True
 
 
 def test_context_error_whose_retry_fails_again_sets_the_holder():
@@ -152,7 +152,7 @@ def test_context_error_whose_retry_fails_again_sets_the_holder():
 
     assert holder["error"]["tool"] == "model call", holder
     assert "maximum context length reached" in holder["error"]["reason"], holder
-    assert last.response_metadata["llm_node_error"] is True
+    assert last.response_metadata[RUN_FAILURE_NOTICE_KEY] is True
 
 
 def test_context_error_with_no_tool_message_sets_the_run_error_holder():
@@ -172,7 +172,7 @@ def test_context_error_with_no_tool_message_sets_the_run_error_holder():
 
     last = result["messages"][-1]
     assert last.content.startswith("Context window exceeded"), last.content
-    assert last.response_metadata["llm_node_error"] is True
+    assert last.response_metadata[RUN_FAILURE_NOTICE_KEY] is True
     assert holder["error"]["tool"] == "model call", holder
     assert "maximum context length reached" in holder["error"]["reason"], holder
 
@@ -214,7 +214,7 @@ def test_context_error_recovered_by_the_retry_leaves_the_holder_empty():
     assert client.calls == 3
     assert holder == {}
     assert last.content == "recovered answer"
-    assert "llm_node_error" not in last.response_metadata
+    assert RUN_FAILURE_NOTICE_KEY not in last.response_metadata
 
 
 def _context_error_without_tool_message():
@@ -230,21 +230,21 @@ def _context_error_without_tool_message():
 
 
 def test_nested_agent_raises_on_the_context_error_message():
-    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+    from elitea_sdk.runtime.tools.application import _raise_if_model_error
 
     result = _context_error_without_tool_message()
 
     with pytest.raises(RuntimeError, match="Nested agent LLM failed .*Context window exceeded"):
-        _raise_if_llm_node_error(result)
+        _raise_if_model_error(result)
 
 
 def test_nested_agent_raises_on_the_failed_retry_message():
-    from elitea_sdk.runtime.tools.application import _raise_if_llm_node_error
+    from elitea_sdk.runtime.tools.application import _raise_if_model_error
 
     _, last = _run_looped(FakeBadRequestError("maximum context length reached"))
 
     with pytest.raises(RuntimeError, match="Nested agent LLM failed .*Failed to retry after truncation"):
-        _raise_if_llm_node_error({"messages": [HumanMessage(content="go"), last]})
+        _raise_if_model_error({"messages": [HumanMessage(content="go"), last]})
 
 
 def test_model_error_stays_in_the_holder_after_a_later_good_call(llm_node):
@@ -258,3 +258,11 @@ def test_model_error_stays_in_the_holder_after_a_later_good_call(llm_node):
 
     assert result["messages"][-1].content == "all good"
     assert "first failure" in holder["error"]["reason"], holder
+
+
+def test_model_error_message_has_the_one_tag_and_no_old_tag():
+    message = _llm_error_message("Error: boom", FakeBadRequestError("boom"), MagicMock())
+
+    assert message.response_metadata[RUN_FAILURE_NOTICE_KEY] is True
+    assert message.response_metadata["llm_node_exception_type"] == "FakeBadRequestError"
+    assert "llm_node_error" not in message.response_metadata

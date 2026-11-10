@@ -47,7 +47,15 @@ from ..context_floor import (
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
 from ..utils.internal_run_auth import run_token_refusal
-from ..tool_outcome import ToolOutcome, ToolResultStatus, note_run_error, outcome_sink, record_outcome, resolve_run_error
+from ..tool_outcome import (
+    RUN_FAILURE_NOTICE_KEY,
+    ToolOutcome,
+    ToolResultStatus,
+    note_run_error,
+    outcome_sink,
+    record_outcome,
+    resolve_run_error,
+)
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 from ..utils.failure_signals import describe_llm_error
@@ -251,7 +259,7 @@ def _llm_error_message(content, exc, client):
     holder is written: the outcome sink belongs to tool calls and would mislabel one.
     """
     message = AIMessage(content=content)
-    message.response_metadata['llm_node_error'] = True
+    message.response_metadata[RUN_FAILURE_NOTICE_KEY] = True
     message.response_metadata['llm_node_exception_type'] = type(exc).__name__
     # The holder is never cleared by a later good call: a model error is final for its node,
     # and a recovered nested agent must not hide a node that failed.
@@ -5045,7 +5053,7 @@ class LLMNode(BaseTool):
             
             # Add warning message - CLI or calling code can detect this and prompt user
             warning_msg = f"Maximum tool execution iterations ({effective_limit}) reached. Stopping tool execution."
-            new_messages.append(AIMessage(content=warning_msg))
+            new_messages.append(AIMessage(content=warning_msg, response_metadata={RUN_FAILURE_NOTICE_KEY: True}))
         else:
             logger.info(f"Tool execution completed after {iteration} iterations")
 

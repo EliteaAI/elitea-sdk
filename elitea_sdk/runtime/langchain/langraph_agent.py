@@ -31,7 +31,7 @@ from .utils import (
     propagate_the_input_mapping,
     safe_format,
 )
-from ..tool_outcome import ToolOutcome, ToolResultStatus, record_outcome
+from ..tool_outcome import ToolOutcome, ToolResultStatus, record_outcome, run_failure_message
 from ..utils.constants import TOOLKIT_NAME_META
 from ..tools.function import (
     FunctionTool, LAST_TOOL_OUTCOME_KEY, PIPELINE_BLOCKED_KEY, TOOL_OUTCOMES_KEY,
@@ -1072,7 +1072,7 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
             toolkit_type=toolkit_name,
         ))
         result = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
             LAST_TOOL_OUTCOME_KEY: None,
         }

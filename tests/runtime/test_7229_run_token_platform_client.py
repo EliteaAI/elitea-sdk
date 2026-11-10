@@ -183,7 +183,7 @@ def test_other_model_errors_still_become_the_node_answer():
     node = LLMNode(name="llm_1", description="test", client=SimpleNamespace(model_name="m", _llm_type="fake"))
     with patch.object(LLMNode, "_invoke_llm_internal", side_effect=_Refused(403, "PROVIDER_DENIED")):
         result = node.invoke({"messages": []})
-    assert result["messages"][-1].response_metadata.get("llm_node_error") is True
+    assert result["messages"][-1].response_metadata.get("run_failure_notice") is True
 
 
 @pytest.mark.parametrize("status,code", [(403, "CONTEXT_NOT_LIVE"), (401, "INTERNAL_TOKEN_EXPIRED")])

@@ -4,7 +4,9 @@ from uuid import uuid4
 from ..langchain.constants import ELITEA_RS, PRINTER_NODE_RS
 from ..models.agent_response import AgentResponse
 from ..utils.utils import clean_string
+from ..tool_outcome import RUN_FAILURE_NOTICE_KEY, run_failure_message
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
+from .function import PIPELINE_BLOCKED_KEY
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -168,12 +170,14 @@ def extract_application_response_output(response: Any) -> str:
     return ''
 
 
-def _raise_if_llm_node_error(response: Any) -> None:
+def _raise_if_model_error(response: Any) -> None:
     """Raise RuntimeError if the final message of the current run is a tagged LLM error.
 
     LLMNode.invoke() catches provider exceptions (e.g. AuthenticationError 401) and converts
-    them to AIMessage(content="Error: ...") tagged with response_metadata['llm_node_error']=True
-    so that Application._run() can detect and re-raise them.
+    them to AIMessage(content="Error: ...") tagged with response_metadata['run_failure_notice']=True
+    and 'llm_node_exception_type', so that Application._run() can detect and re-raise them. A
+    tagged message without an exception type is another failure notice (a blocked tool, a step
+    limit) and does not raise here.
 
     The scan stops at the first HumanMessage encountered while walking backwards — that message
     is the input boundary of the current run. This prevents two false-raise scenarios:
@@ -189,12 +193,32 @@ def _raise_if_llm_node_error(response: Any) -> None:
         if isinstance(_msg, HumanMessage):
             return  # reached this run's input boundary; nothing from this run is a tagged error
         if isinstance(_msg, BaseMessage):
-            if getattr(_msg, 'response_metadata', {}).get('llm_node_error'):
-                _exc_type = _msg.response_metadata.get('llm_node_exception_type', 'LLMError')
+            _meta = getattr(_msg, 'response_metadata', None) or {}
+            _exc_type = _meta.get('llm_node_exception_type')
+            if _meta.get(RUN_FAILURE_NOTICE_KEY) and _exc_type:
                 raise RuntimeError(
                     f"Nested agent LLM failed ({_exc_type}): {_msg.content}"
                 )
             return  # final non-Human message is clean; no error
+
+
+def _child_failed(response: Any) -> bool:
+    """True when a nested agent or pipeline run ended in a failure the SDK reported.
+
+    A failure is a blocked pipeline, a reached step limit, or a last message of this run that
+    carries the failure tag. The scan stops at the first HumanMessage (the input boundary of
+    the current run), so a tag from an earlier turn of the same thread does not count.
+    """
+    if not isinstance(response, dict):
+        return False
+    if response.get(PIPELINE_BLOCKED_KEY) or response.get('tool_execution_limit_reached'):
+        return True
+    for _msg in reversed(response.get('messages') or []):
+        if isinstance(_msg, HumanMessage):
+            return False
+        meta = _msg.get('response_metadata') if isinstance(_msg, dict) else getattr(_msg, 'response_metadata', None)
+        return bool((meta or {}).get(RUN_FAILURE_NOTICE_KEY))
+    return False
 
 
 class Application(BaseTool):
@@ -883,14 +907,18 @@ class Application(BaseTool):
 
         # Detect swallowed LLM errors and re-raise so BaseTool.run() fires
         # on_tool_error and the UI Application chip shows an error state (#7041).
-        _raise_if_llm_node_error(response)
+        _raise_if_model_error(response)
 
         normalized_output = extract_application_response_output(response)
 
         # Build standardized AgentResponse
         agent_response = AgentResponse(
             output=normalized_output,
-            messages=[{"role": "assistant", "content": normalized_output}],
+            # The parent reads the tag, not the text, to tell a failed child from an answer
+            messages=[
+                run_failure_message(normalized_output) if _child_failed(response)
+                else {"role": "assistant", "content": normalized_output}
+            ],
             thread_id=response.get('thread_id') if isinstance(response, dict) else None,
             execution_finished=response.get('execution_finished', True) if isinstance(response, dict) else True,
         )
