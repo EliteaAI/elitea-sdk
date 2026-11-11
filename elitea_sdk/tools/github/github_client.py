@@ -66,6 +66,7 @@ from .schemas import (
     ApplyGitPatchFromArtifact,
     TriggerWorkflow,
     GetWorkflowStatus,
+    GetWorkflowRuns,
     GetWorkflowLogs,
     GenericGithubAPICall,
     GetMe,
@@ -2362,6 +2363,72 @@ class GitHubClient(BaseModel):
                 "message": f"An error occurred while getting workflow status: {str(e)}"
             }
 
+    @tool_group('read')
+    def get_workflow_runs(
+        self,
+        workflow_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        status: Optional[str] = None,
+        event: Optional[str] = None,
+        limit: int = 10,
+        repo_name: Optional[str] = None,
+    ) -> str:
+        """
+        Lists recent workflow runs, newest first. Use it to get the run_id for get_workflow_status/get_workflow_logs.
+
+        Parameters:
+            workflow_id (Optional[str]): Workflow ID or file name (e.g., 'build.yml'); None = all
+            branch (Optional[str]): Only this branch
+            status (Optional[str]): Status/conclusion filter (e.g., 'in_progress', 'failure')
+            event (Optional[str]): Trigger filter (e.g., 'push')
+            limit (int): Max runs (1-100, default 10)
+            repo_name (Optional[str]): 'owner/repo'
+        """
+        try:
+            limit = max(1, min(int(limit), 100))
+            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            filters = {k: v for k, v in (("branch", branch), ("status", status), ("event", event)) if v}
+
+            if workflow_id:
+                try:
+                    workflow = repo.get_workflow(workflow_id)
+                except Exception:
+                    workflow = next((wf for wf in repo.get_workflows() if str(wf.id) == str(workflow_id)), None)
+                    if workflow is None:
+                        return {
+                            "error": True,
+                            "message": f"Workflow with ID or filename '{workflow_id}' not found in repository {repo.full_name}",
+                        }
+                paginated = workflow.get_runs(**filters)
+            else:
+                paginated = repo.get_workflow_runs(**filters)
+
+            runs = []
+            for run in paginated:
+                if len(runs) >= limit:
+                    break
+                runs.append({
+                    "id": run.id,
+                    "name": run.name,
+                    "workflow_id": run.workflow_id,
+                    "run_number": run.run_number,
+                    "event": run.event,
+                    "status": run.status,
+                    "conclusion": run.conclusion,
+                    "created_at": run.created_at.isoformat() if run.created_at else None,
+                    "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+                    "head_branch": run.head_branch,
+                    "head_sha": run.head_sha,
+                    "url": run.html_url,
+                })
+
+            return {"repository": repo.full_name, "count": len(runs), "runs": runs}
+        except Exception as e:
+            return {
+                "error": True,
+                "message": f"An error occurred while getting workflow runs: {str(e)}"
+            }
+
     def _get_access_token(self) -> Optional[str]:
         """Get access token from auth_config for direct API calls."""
         if self.auth_config and self.auth_config.github_access_token:
@@ -3170,6 +3237,13 @@ class GitHubClient(BaseModel):
                 "mode": "get_workflow_status",
                 "description": self.get_workflow_status.__doc__,
                 "args_schema": GetWorkflowStatus,
+            },
+            {
+                "ref": self.get_workflow_runs,
+                "name": "get_workflow_runs",
+                "mode": "get_workflow_runs",
+                "description": self.get_workflow_runs.__doc__,
+                "args_schema": GetWorkflowRuns,
             },
             {
                 "ref": self.get_workflow_logs,
