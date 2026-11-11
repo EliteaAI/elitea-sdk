@@ -509,15 +509,15 @@ def test_loader_merges_fields_and_reports(monkeypatch, caplog):
     assert docs[0].metadata["document_id"] == "HB-001" and docs[0].metadata["updated_on"] == "2026-02-01T00:00:00Z"
     assert SECRET_VALUE not in caplog.text
     stats = w.get_indexing_stats()
-    assert stats.documents_without_metadata == {"Unlisted.pdf"}
+    assert stats.documents_without_metadata == {"/sites/handbook/Handbook Library/Unlisted.pdf"}
     assert stats.total_skipped == 0
     report = stats.build_report(IndexingStatus.OK, indexed_count=3, item_labels=("file", "files"), dependent_labels=("item", "items"))
     indexed = next(c for c in report["categories"] if c["kind"] == "indexed")
     assert indexed["count"] == 3
     assert indexed["groups"] == [{"reason": "no_metadata", "label": "Indexed with no metadata", "count": 1,
-                                  "items": ["Unlisted.pdf"], "counted": False}]
+                                  "items": ["/sites/handbook/Handbook Library/Unlisted.pdf"], "counted": False}]
     assert report["totals"]["total"] == 3
-    assert "Indexed with no metadata (1): Unlisted.pdf" in stats.get_summary()
+    assert "Indexed with no metadata (1): /sites/handbook/Handbook Library/Unlisted.pdf" in stats.get_summary()
 
 
 def test_loader_category_filter_counts_skipped(monkeypatch):
@@ -525,7 +525,7 @@ def test_loader_category_filter_counts_skipped(monkeypatch):
     w = _wrapper(monkeypatch, files, FakeGraph(standard_lists()), library_lists=[LIB], categories=["Travel"])
     docs = list(w._base_loader(limit_files=10))
     assert [d.metadata["file_name"] for d in docs] == ["Travel Rules.pdf"]
-    assert w.get_indexing_stats().documents_skipped_filtered == {"Leave Policy.pdf", "Remote Work.docx"}
+    assert w.get_indexing_stats().documents_skipped_filtered == {P2, P3}
 
 
 def test_loader_without_library_lists_is_unchanged(monkeypatch):
@@ -592,3 +592,93 @@ def test_toolkit_passes_library_settings(monkeypatch):
         "sharepoint_configuration": {"token": "t", "scopes": ["Sites.Read.All"]}, "site_url": SITE,
         "library_lists": [LIB], "metadata_fields": ["A=b"], "categories": ["C"], "selected_tools": []}})
     assert captured["library_lists"] == [LIB] and captured["metadata_fields"] == ["A=b"] and captured["categories"] == ["C"]
+
+
+# --------------------------------------------------------------------------- #
+#  Review follow-ups                                                           #
+# --------------------------------------------------------------------------- #
+
+def test_category_filter_is_applied_before_the_file_limit(monkeypatch):
+    files = [graph_file(f"/sites/handbook/Handbook Library/other{i}.pdf") for i in range(5)] + [graph_file(P2), graph_file(P3)]
+    w = _wrapper(monkeypatch, [], FakeGraph(standard_lists()), library_lists=[LIB], categories=["People"])
+    asked = {}
+
+    def listing(folder, limit, *a, **k):
+        asked["limit"] = limit
+        return files[:limit]
+
+    monkeypatch.setattr(w._backend, "get_files_list", listing)
+    docs = list(w._base_loader(limit_files=1))
+    assert asked["limit"] == lm.LIBRARY_LISTING_LIMIT
+    assert [d.metadata["document_id"] for d in docs] == ["HB-002"]      # limit_files counts kept files
+
+
+def test_same_named_files_are_reported_separately(monkeypatch):
+    lists = {LIB_ID: [item(1, "/sites/handbook/Handbook Library/a/Same.pdf", DocCategory="X"),
+                      item(2, "/sites/handbook/Handbook Library/b/Same.pdf", DocCategory="Y")]}
+    files = [graph_file("/sites/handbook/Elsewhere/one/Same.pdf"), graph_file("/sites/handbook/Elsewhere/two/Same.pdf")]
+    w = _wrapper(monkeypatch, files, FakeGraph(lists), library_lists=[LIB])
+    list(w._base_loader(limit_files=10))
+    assert w.get_indexing_stats().documents_metadata_ambiguous == {
+        "/sites/handbook/Elsewhere/one/Same.pdf", "/sites/handbook/Elsewhere/two/Same.pdf"}
+
+
+def test_body_read_errors_are_retried_then_typed():
+    import requests
+
+    class Broken(FakeResponse):
+        def iter_content(self, chunk_size=1):
+            raise requests.exceptions.ChunkedEncodingError("reset")
+            yield b""
+
+    graph = FakeGraph({})
+    graph.scripted.append(Broken(200))
+    assert client(graph).site_id() == "site,1,2"
+    graph = FakeGraph({})
+    graph.scripted += [Broken(200) for _ in range(lm.MAX_RETRIES + 1)]
+    with pytest.raises(lm.LibraryMetadataError, match="did not answer"):
+        client(graph).site_id()
+
+
+@pytest.mark.parametrize("status", [302, 401, 403, 404, 500])
+def test_every_refused_response_is_closed(status):
+    closed = []
+
+    class Tracked(FakeResponse):
+        def close(self):
+            closed.append(self.status_code)
+
+    graph = FakeGraph({})
+    graph.scripted.append(Tracked(status))
+    with pytest.raises(lm.LibraryMetadataError):
+        client(graph).site_id()
+    assert closed == [status]
+
+
+def test_field_cap_keeps_readable_names():
+    names = [f"AField{i:03d}" for i in range(lm.MAX_FIELDS_PER_ITEM + 5)] + ["ZDocCategory"]
+    plan = lm.FieldMapper(settings()).plan(names)
+    assert len(plan) == lm.MAX_FIELDS_PER_ITEM and plan["ZDocCategory"] == "category"
+
+
+def test_small_graph_pages_do_not_trip_the_page_bound():
+    assert lm.MAX_PAGES_PER_LIST * 20 >= lm.MAX_ITEMS_PER_LIST
+    rows = _rows(30)
+    assert len(lm.build_index(client(FakeGraph({LIB_ID: rows}, page_size=1)), settings()).entries) == 30
+
+
+def test_rest_app_token_is_reissued_once_on_401(monkeypatch):
+    from elitea_sdk.tools.sharepoint.rest_wrapper import SharepointRestWrapper
+    backend = SharepointRestWrapper(client=None, site_url=SITE, client_id="app", client_secret="s")
+    tokens = iter(["old", "new"])
+
+    class Helper:
+        def generate_token_and_site_id(self, site_url):
+            return next(tokens), "ignored"
+
+    monkeypatch.setattr(backend, "_graph_helper", lambda: Helper())
+    graph = FakeGraph({})
+    graph.scripted.append(FakeResponse(401))
+    monkeypatch.setattr(lm.requests, "get", graph.get)
+    assert backend.library_list_client().site_id() == "site,1,2"
+    assert [c["headers"]["Authorization"] for c in graph.calls] == ["Bearer old", "Bearer new"]

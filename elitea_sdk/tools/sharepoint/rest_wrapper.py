@@ -91,7 +91,10 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         "the secret and that the app has the Graph Sites.Read.All application permission.")
             return token_holder['token']
 
-        return GraphListClient(self.site_url, get_token=get_token)
+        def refresh() -> bool:   # app-only tokens are re-issued, not refreshed: drop the cached one once
+            return token_holder.pop('token', None) is not None
+
+        return GraphListClient(self.site_url, get_token=get_token, refresh=refresh)
 
     def _rest_bfs_files(self, root_folder_url: str, limit_files: int) -> list:
         """Enumerate files using parallel BFS with non-recursive per-folder REST calls."""

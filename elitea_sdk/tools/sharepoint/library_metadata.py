@@ -33,6 +33,8 @@ from urllib.parse import quote, unquote, urlsplit
 import requests
 from langchain_core.tools import ToolException
 
+from .graph_wrapper import _is_graph_url as is_graph_url
+
 logger = logging.getLogger(__name__)
 
 GRAPH_HOST = "graph.microsoft.com"
@@ -48,7 +50,9 @@ MAX_METADATA_FIELD_SETTINGS = 100
 PAGE_SIZE = 200
 MAX_ITEMS_PER_LIST = 20_000
 MAX_TOTAL_ITEMS = 50_000
-MAX_PAGES_PER_LIST = MAX_ITEMS_PER_LIST // PAGE_SIZE + 1
+# Graph may return fewer items per page than $top; the page bound only stops a list that pages
+# forever, so it allows pages as small as 20 items before refusing.
+MAX_PAGES_PER_LIST = MAX_ITEMS_PER_LIST // 20
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_FIELDS_PER_ITEM = 100
 MAX_FIELD_NAME_CHARS = 64
@@ -60,6 +64,7 @@ MAX_RETRIES = 4
 BACKOFF_BASE_SECONDS = 1.0
 MAX_RETRY_AFTER_SECONDS = 60.0
 RETRYABLE_STATUS = frozenset({429, 503, 504})
+_TRANSIENT_ERRORS = (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError)
 
 # Status values written to every file's metadata in library mode.
 STATUS_OK = "ok"
@@ -172,6 +177,9 @@ def _is_system_field(name: str) -> bool:
     return name.lower() in _SYSTEM_FIELDS
 
 
+_CANONICAL_NAMES = frozenset({"document_id", "owner", "approver", "approval_date", "area", "country", "category"})
+
+
 def _alias_for(snake: str) -> Optional[str]:
     """The readable name the issue asks for (document_id, owner, approver, approval_date, area,
     country, category) that a field name points at; used only when exactly one field matches."""
@@ -249,7 +257,8 @@ class FieldMapper:
     def _dedupe(plan: Dict[str, str]) -> Dict[str, str]:
         result: Dict[str, str] = {}
         used: set = set()
-        for source in sorted(plan):
+        # Readable names first, so the field cap never drops category, owner, ...
+        for source in sorted(plan, key=lambda src: (plan[src] not in _CANONICAL_NAMES, src)):
             target = plan[source]
             if target in RESERVED_KEYS:
                 target = f"list_{target}"
@@ -329,46 +338,58 @@ class GraphListClient:
                 resp = self._session.get(
                     url, params=params, timeout=REQUEST_TIMEOUT, allow_redirects=False, stream=True,
                     headers={"Authorization": f"Bearer {self._get_token()}", "Accept": "application/json"})
-            except (requests.Timeout, requests.ConnectionError) as exc:
+            except _TRANSIENT_ERRORS as exc:
                 if attempt >= MAX_RETRIES:
                     raise LibraryMetadataError(
                         f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
                 self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
                 attempt += 1
                 continue
-            status = resp.status_code
-            if status == 401 and not refreshed and self._refresh and self._refresh():
-                refreshed = True
-                resp.close()
-                continue
-            if status in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                delay = _retry_after_seconds(resp, attempt)
-                resp.close()
-                logger.info("[SP-library] Graph answered %s; retrying in %.1fs (attempt %d)", status, delay, attempt + 1)
-                self._sleep(delay)
-                attempt += 1
-                continue
-            if 300 <= status < 400:
-                resp.close()
-                raise LibraryMetadataError("SharePoint answered with a redirect; library mode does not follow redirects.")
-            if status == 401:
-                if self._on_unauthorized:
-                    self._on_unauthorized(resp)
-                raise LibraryMetadataError("SharePoint refused the credential (HTTP 401). Sign in again.")
-            if status == 403:
-                raise LibraryMetadataError(
-                    "SharePoint refused access to the library list (HTTP 403). The credential needs read "
-                    "access to the site's lists (Graph Sites.Read.All).")
-            if status == 404:
-                raise LibraryMetadataError("SharePoint could not find the site or library list (HTTP 404).")
-            if status >= 400:
-                raise LibraryMetadataError(f"SharePoint answered HTTP {status} while reading a library list.")
             try:
-                return json.loads(self._read_body(resp) or b"{}")
-            except ValueError:
-                raise LibraryMetadataError("SharePoint returned a response that is not JSON.")
+                status = resp.status_code
+                if status == 401 and not refreshed and self._refresh and self._refresh():
+                    refreshed = True
+                    continue
+                if status in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                    delay = _retry_after_seconds(resp, attempt)
+                    logger.info("[SP-library] Graph answered %s; retrying in %.1fs (attempt %d)",
+                                status, delay, attempt + 1)
+                    self._sleep(delay)
+                    attempt += 1
+                    continue
+                self._raise_for_status(resp)
+                try:
+                    body = self._read_body(resp)
+                except _TRANSIENT_ERRORS as exc:
+                    if attempt >= MAX_RETRIES:
+                        raise LibraryMetadataError(
+                            f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
+                    self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
+                    attempt += 1
+                    continue
+                try:
+                    return json.loads(body or b"{}")
+                except ValueError:
+                    raise LibraryMetadataError("SharePoint returned a response that is not JSON.")
             finally:
                 resp.close()
+
+    def _raise_for_status(self, resp: requests.Response) -> None:
+        status = resp.status_code
+        if 300 <= status < 400:
+            raise LibraryMetadataError("SharePoint answered with a redirect; library mode does not follow redirects.")
+        if status == 401:
+            if self._on_unauthorized:
+                self._on_unauthorized(resp)
+            raise LibraryMetadataError("SharePoint refused the credential (HTTP 401). Sign in again.")
+        if status == 403:
+            raise LibraryMetadataError(
+                "SharePoint refused access to the library list (HTTP 403). The credential needs read "
+                "access to the site's lists (Graph Sites.Read.All).")
+        if status == 404:
+            raise LibraryMetadataError("SharePoint could not find the site or library list (HTTP 404).")
+        if status >= 400:
+            raise LibraryMetadataError(f"SharePoint answered HTTP {status} while reading a library list.")
 
     # -- resources ---------------------------------------------------------- #
     def site_id(self) -> str:
@@ -436,14 +457,6 @@ class GraphListClient:
                 raise LibraryMetadataError(f"A library list holds more than {MAX_ITEMS_PER_LIST} items.")
             url = _checked_next_link(data.get("@odata.nextLink"), prefix)
         return items
-
-
-def is_graph_url(url: Any) -> bool:
-    try:
-        parts = urlsplit(str(url))
-        return parts.scheme == "https" and parts.hostname == GRAPH_HOST and parts.port in (None, 443)
-    except ValueError:
-        return False
 
 
 def _checked_next_link(link: Any, expected_path: str) -> Optional[str]:
@@ -606,3 +619,18 @@ def category_values(index: LibraryIndex) -> List[Dict[str, Any]]:
             counter[key] = (label, count + 1)
     ordered = sorted(counter.values(), key=lambda pair: (-pair[1], pair[0].casefold()))
     return [{"value": label, "items": count} for label, count in ordered[:MAX_CATEGORIES]]
+
+
+# Files listed at most when the categories filter is on (it drops files after listing).
+LIBRARY_LISTING_LIMIT = MAX_TOTAL_ITEMS
+
+
+def report_label(file_meta: Dict[str, Any]) -> str:
+    """The file's server-relative path for the indexing report (two files may share a name)."""
+    for key in ("Link", "Path"):
+        value = file_meta.get(key)
+        if isinstance(value, str) and value:
+            path = unquote(urlsplit(value).path if "://" in value else value)
+            if path.startswith("/") and not path.startswith("/drives/"):
+                return path
+    return str(file_meta.get("Name") or file_meta.get("Path") or "")

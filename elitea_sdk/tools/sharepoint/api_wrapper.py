@@ -22,8 +22,8 @@ from .graph_wrapper import SharepointGraphWrapper
 from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
 from .library_metadata import (
-    STATUS_AMBIGUOUS, STATUS_OK, JoinCounts, LibraryIndex, LibrarySettings, apply_library_metadata,
-    build_index, category_values,
+    LIBRARY_LISTING_LIMIT, STATUS_AMBIGUOUS, STATUS_OK, JoinCounts, LibraryIndex, LibrarySettings,
+    apply_library_metadata, build_index, category_values, report_label,
 )
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.file_metadata import bound_read_result, describe_requested_range
@@ -1135,11 +1135,17 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         form_name = kwargs.get('form_name') or None
 
         if limit_files > 0:
+            library = self._library_join_context()
+            # The categories filter drops files after listing: list up to the library bound and keep
+            # limit_files of the files that pass, so selected files beyond the first limit_files listed
+            # are not lost.
+            list_limit = (max(limit_files, LIBRARY_LISTING_LIMIT)
+                          if library is not None and library[0].categories else limit_files)
             self._log_tool_event(
                 message="Starting SharePoint files extraction", tool_name="loader")
             try:
                 all_files = self.get_files_list(
-                    kwargs.get('path'), limit_files,
+                    kwargs.get('path'), list_limit,
                     form_name=form_name,
                     include_extensions=include_extensions,
                     skip_extensions=skip_extensions,
@@ -1149,17 +1155,22 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             except Exception as e:
                 raise ToolException(f"Unable to extract files: {e}")
 
-            library = self._library_join_context()
+            kept = 0
             for file in all_files:
-
+                if kept >= limit_files:
+                    break
                 metadata = {
                     ("updated_on" if k == "Modified" else k): str(v)
                     for k, v in file.items()
                 }
                 if library is not None and not self._apply_library_metadata(metadata, *library):
                     continue
+                kept += 1
                 yield Document(page_content="", metadata=metadata)
             if library is not None:
+                if list_limit > limit_files and len(all_files) >= list_limit:
+                    logging.warning("[SP-library] listing reached %d files; later files were not considered",
+                                    list_limit)
                 logging.info("[SP-library] join: %s", library[2].as_dict())
 
         # ── OneNote pages ─────────────────────────────────────────────
@@ -1189,7 +1200,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
 
     def _apply_library_metadata(self, metadata: dict, settings: LibrarySettings,
                                 index: LibraryIndex, counts: JoinCounts) -> bool:
-        name = metadata.get('Name') or metadata.get('Path') or ''
+        name = report_label(metadata)
         if not apply_library_metadata(metadata, index, settings, counts):
             self._track_skipped_document(name, reason="filtered")
             return False
