@@ -299,7 +299,9 @@ class TestBuildWithoutRepository:
     """Validated construction, unlike model_construct above, which skips the field types."""
 
     @pytest.mark.parametrize('repository', [None, '', 'null'])
-    def test_wrapper_builds_without_a_repository(self, repository):
+    def test_wrapper_builds_without_a_repository(self, repository, monkeypatch):
+        # GitHub Actions sets GITHUB_REPOSITORY, which the wrapper reads as a fallback
+        monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
         values = {'access_token': 'x'}
         if repository is not None:
             values['github_repository'] = repository
