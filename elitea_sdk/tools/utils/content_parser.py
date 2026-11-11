@@ -435,6 +435,10 @@ def process_content_by_type(content, filename: str, llm=None, chunking_config=No
                 # Determine which loader configuration keys are allowed to be overridden by user input.
                 # If 'allowed_to_override' is specified in the loader configuration, use it; otherwise, allow all keys in loader_kwargs.
                 allowed_to_override = loader_config.get('allowed_to_override', loader_kwargs)
+                # The allowed_to_override values are the chunking defaults the indexing form shows,
+                # so they win over read-path kwargs (e.g. Excel max_tokens 512 vs -1, EL-7251);
+                # otherwise a user value equal to the shown default would be dropped below.
+                loader_kwargs.update({key: allowed_to_override[key] for key in loader_kwargs.keys() & allowed_to_override.keys()})
                 # If a chunking_config is provided and contains custom configuration for the current file extension,
                 # update loader_kwargs with user-supplied values, but only for keys explicitly permitted in allowed_to_override and if value differs from default.
                 # This ensures that only safe and intended parameters can be customized, preventing accidental or unauthorized changes
