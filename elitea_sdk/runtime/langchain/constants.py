@@ -763,8 +763,10 @@ LOAD_SKILL_LISTED_TOOL_DESCRIPTION = (
     "matches the user's request — if you are unsure whether a skill matches, load "
     "it — but only once per skill. After the instructions are returned you MUST "
     "follow them exactly for the applicable part of your response. Never apply a "
-    "skill you have not loaded. Only skills listed in <available_skills> can be "
-    "loaded."
+    "skill you have not loaded. Skills outside <available_skills> cannot be loaded "
+    "on your own; if the user asks for a skill by a name that is not listed, call "
+    "load_skill with that name once: the answer tells you whether the skill exists "
+    "and whether only the user can start it."
 )
 
 LOAD_SKILL_UNKNOWN_LISTED = (
@@ -772,7 +774,7 @@ LOAD_SKILL_UNKNOWN_LISTED = (
     "Call load_skill with one of these exact names, or proceed without a skill if none apply."
 )
 
-SKILL_SEARCH_PROMPT = """Skills with specialised instructions are available on demand. They are not listed here. Skills whose description matches the current request are suggested in a <suggested_skills> block at the end of your instructions for that request; call `load_skill` with the exact name of each suggested skill that applies BEFORE writing your answer. When nothing is suggested but the request might still benefit from a skill, call `search_skills` with a short description of what the user needs, then `load_skill` for each result that applies. Never imitate a skill you have not loaded. Follow each loaded skill's instructions exactly, within its own scope. If no skill applies, answer normally. Do not mention skills, `search_skills` or `load_skill` in your reply."""
+SKILL_SEARCH_PROMPT = """Skills with specialised instructions are available on demand. They are not listed here. Skills whose description matches the current request are suggested in a <suggested_skills> block at the end of your instructions for that request; call `load_skill` with the exact name of each suggested skill that applies BEFORE writing your answer. When nothing is suggested but the request might still benefit from a skill, call `search_skills` with a short description of what the user needs, then `load_skill` for each result that applies. If the user asks for a skill by name and `search_skills` does not return it, call `load_skill` with that exact name once: the answer tells you whether the skill exists and whether only the user can start it. Never imitate a skill you have not loaded. Follow each loaded skill's instructions exactly, within its own scope. If no skill applies, answer normally. Do not mention skills, `search_skills` or `load_skill` in your reply."""
 
 SKILL_SUGGESTIONS_HEADER = (
     "<suggested_skills>\nThese skills match the current request by description. Call load_skill "
@@ -864,6 +866,13 @@ LOAD_SKILL_UNAVAILABLE = (
 )
 LOAD_SKILL_UNAVAILABLE_DENIED = "it is no longer accessible"
 LOAD_SKILL_UNAVAILABLE_TRANSIENT = "its instructions could not be fetched right now"
+
+LOAD_SKILL_USER_ONLY = (
+    "Skill \"{name}\" can only be started by the user, by typing ~{name} in their message. "
+    "Do not load it, and do not reproduce its steps another way. If the user wants it, "
+    "including to continue it, ask them to send ~{name}. You may name this skill to the "
+    "user for this purpose only."
+)
 
 SKILL_ROOT_URI = "skill://{name}"
 
