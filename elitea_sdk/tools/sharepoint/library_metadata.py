@@ -76,7 +76,11 @@ RESERVED_KEYS = frozenset({
     "id", "updated_on", "created_on", "name", "path", "created", "modified", "link", "source",
     "metadata_status", "metadata_match", "library_list", "library_item_id", "web_url", "file_name",
     "chunk_id", "chunk_type", "method_name", "collection", "type", "page", "page_number",
+    # keys the indexer itself reads from document metadata (grouping, deletion, content routing)
+    "parent_id", "dependent_docs", "loader_content", "loader_content_type", "filename", "file_path",
+    "index_meta", "content", "page_content",
 })
+_RESERVED_PREFIXES = ("indexer_", "loader_", "elitea_", "chunk_")
 
 # System columns every library carries; never copied by default (they say nothing about the
 # document and some, like the editor ids, identify people).
@@ -260,7 +264,7 @@ class FieldMapper:
         # Readable names first, so the field cap never drops category, owner, ...
         for source in sorted(plan, key=lambda src: (plan[src] not in _CANONICAL_NAMES, src)):
             target = plan[source]
-            if target in RESERVED_KEYS:
+            if target in RESERVED_KEYS or target.startswith(_RESERVED_PREFIXES):
                 target = f"list_{target}"
             candidate, n = target, 2
             while candidate in used:
@@ -492,6 +496,7 @@ class LibraryEntry:
     path: Optional[str]
     name: Optional[str]
     metadata: Dict[str, Any]
+    root: Optional[str] = None      # server-relative path of the list the item belongs to
 
 
 @dataclass
@@ -521,14 +526,21 @@ class LibraryIndex:
             self.by_name.setdefault(entry.name, []).append(entry)
 
     def match(self, file_meta: Dict[str, Any]) -> Tuple[Optional[LibraryEntry], str]:
-        """(entry, how) with how in {'path', 'name', 'ambiguous', 'none'}."""
+        """(entry, how) with how in {'path', 'name', 'ambiguous', 'none'}.
+
+        The name fallback never lends a list item to a file that lives outside that item's own
+        library: a same-named file elsewhere on the site is 'none', not a match."""
+        file_path = None
         for key in ("Link", "Path", "web_url"):
             path = _server_relative_path(file_meta.get(key))
+            file_path = file_path or path
             hits = self.by_path.get(path) if path else None
             if hits:
                 return (hits[0], "path") if len(hits) == 1 else (None, "ambiguous")
         name = file_meta.get("Name") or file_meta.get("file_name")
         hits = self.by_name.get(name.casefold()) if isinstance(name, str) and name else None
+        if hits and file_path:
+            hits = [h for h in hits if not h.root or file_path.startswith(h.root + "/")]
         if not hits:
             return None, "none"
         return (hits[0], "name") if len(hits) == 1 else (None, "ambiguous")
@@ -541,6 +553,7 @@ def build_index(client: GraphListClient, settings: LibrarySettings) -> LibraryIn
     resolved = client.resolve_lists(settings.lists)
     for position, (name, catalogue_entry) in enumerate(resolved, start=1):
         items = client.list_items(catalogue_entry.get("id"), MAX_TOTAL_ITEMS - total)
+        root = _server_relative_path(catalogue_entry.get("webUrl"))
         total += len(items)
         plan = mapper.plan(n for item in items for n in (item.get("fields") or {}))
         for item in items:
@@ -557,7 +570,8 @@ def build_index(client: GraphListClient, settings: LibrarySettings) -> LibraryIn
                 leaf = path.rsplit("/", 1)[-1] if path else None
             index.add(LibraryEntry(
                 list_name=name, item_id=str(item.get("id") or ""), path=path,
-                name=leaf.casefold() if isinstance(leaf, str) and leaf else None, metadata=metadata))
+                name=leaf.casefold() if isinstance(leaf, str) and leaf else None, metadata=metadata,
+                root=root))
         logger.info("[SP-library] list %d of %d: %d items, %d fields copied",
                     position, len(resolved), len(items), len(plan))
     return index

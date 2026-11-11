@@ -66,7 +66,8 @@ class FakeGraph:
         self.lists = lists
         self.page_size = page_size
         self.catalogue = catalogue if catalogue is not None else [
-            {"id": list_id, "displayName": name, "name": name.replace(" ", "")}
+            {"id": list_id, "displayName": name, "name": name.replace(" ", ""),
+             "webUrl": f"https://{HOST}/sites/handbook/{name.replace(' ', '%20')}"}
             for name, list_id in ((LIB, LIB_ID), ("Archive Library", "list-0002")) if list_id in lists]
         self.calls: List[dict] = []
         self.scripted: List[FakeResponse] = []   # returned before routing, one per call
@@ -172,11 +173,32 @@ def test_join_by_rest_server_relative_path_without_link():
 
 
 def test_join_falls_back_to_file_name():
-    moved = graph_file("/sites/handbook/Other Library/travel rules.PDF")
+    moved = graph_file("/sites/handbook/Handbook Library/archive/travel rules.PDF")
     kept, counts, _ = join([moved])
     assert kept[0]["metadata_match"] == "name"
     assert kept[0]["document_id"] == "HB-001"
     assert counts.by_name == 1 and counts.by_path == 0
+
+
+def test_name_fallback_never_crosses_into_another_library():
+    elsewhere = graph_file("/sites/handbook/Team Uploads/Travel Rules.pdf")
+    kept, counts, _ = join([elsewhere])
+    assert kept[0]["metadata_status"] == "no metadata" and "document_id" not in kept[0]
+    assert counts.no_metadata == 1
+    kept, _, _ = join([elsewhere], categories=["Travel"])
+    assert kept == []        # nor does it pass the categories filter
+
+
+def test_name_fallback_without_a_file_path():
+    kept, counts, _ = join([{"Name": "Travel Rules.pdf", "Path": "", "Link": ""}])
+    assert kept[0]["document_id"] == "HB-001" and counts.by_name == 1
+
+
+@pytest.mark.parametrize("column", ["ParentID", "Dependent_Docs", "Loader_Content_Type", "FileName",
+                                     "IndexerDependentDoc", "ChunkId", "EliteaRunId"])
+def test_list_fields_never_take_indexer_keys(column):
+    target = lm.FieldMapper(settings()).plan([column])[column]
+    assert target.startswith("list_")
 
 
 def test_file_without_list_item_is_kept_with_no_metadata():
@@ -189,7 +211,7 @@ def test_file_without_list_item_is_kept_with_no_metadata():
 def test_ambiguous_file_name_is_reported_not_guessed():
     lists = {LIB_ID: [item(1, "/sites/handbook/Handbook Library/a/Same.pdf", **doc_fields("HB-1", "X")),
                       item(2, "/sites/handbook/Handbook Library/b/Same.pdf", **doc_fields("HB-2", "Y"))]}
-    kept, counts, _ = join([graph_file("/sites/handbook/Elsewhere/Same.pdf")], graph=FakeGraph(lists))
+    kept, counts, _ = join([graph_file("/sites/handbook/Handbook Library/c/Same.pdf")], graph=FakeGraph(lists))
     assert kept[0]["metadata_status"] == "ambiguous"
     assert "document_id" not in kept[0]
     assert counts.ambiguous == 1
@@ -616,11 +638,12 @@ def test_category_filter_is_applied_before_the_file_limit(monkeypatch):
 def test_same_named_files_are_reported_separately(monkeypatch):
     lists = {LIB_ID: [item(1, "/sites/handbook/Handbook Library/a/Same.pdf", DocCategory="X"),
                       item(2, "/sites/handbook/Handbook Library/b/Same.pdf", DocCategory="Y")]}
-    files = [graph_file("/sites/handbook/Elsewhere/one/Same.pdf"), graph_file("/sites/handbook/Elsewhere/two/Same.pdf")]
+    files = [graph_file("/sites/handbook/Handbook Library/one/Same.pdf"),
+             graph_file("/sites/handbook/Handbook Library/two/Same.pdf")]
     w = _wrapper(monkeypatch, files, FakeGraph(lists), library_lists=[LIB])
     list(w._base_loader(limit_files=10))
     assert w.get_indexing_stats().documents_metadata_ambiguous == {
-        "/sites/handbook/Elsewhere/one/Same.pdf", "/sites/handbook/Elsewhere/two/Same.pdf"}
+        "/sites/handbook/Handbook Library/one/Same.pdf", "/sites/handbook/Handbook Library/two/Same.pdf"}
 
 
 def test_body_read_errors_are_retried_then_typed():
