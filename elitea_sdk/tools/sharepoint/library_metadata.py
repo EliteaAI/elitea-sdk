@@ -234,16 +234,36 @@ class FieldMapper:
         self._explicit = settings.field_map
 
     def plan(self, field_names: Iterable[str]) -> Dict[str, str]:
+        """{source field: metadata key}.
+
+        Without settings: every simple field under its readable name. With settings, an entry
+        names a field by its SharePoint internal name, its snake_case name or the readable name
+        ``list_library_categories`` shows; ``Field=name`` stores it under ``name``; ``*`` keeps
+        every other field under its default name too."""
         names = sorted({n for n in field_names if isinstance(n, str) and n})
-        if self._explicit:
-            by_lower = {n.lower(): n for n in names}
-            by_snake = {normalize_field_name(n): n for n in names}
-            plan: Dict[str, str] = {}
-            for source, target in self._explicit:
-                actual = by_lower.get(source.lower()) or by_snake.get(normalize_field_name(source))
-                if actual:
-                    plan[actual] = target or normalize_field_name(actual)
-            return self._dedupe(plan)
+        defaults = self._default_plan(names)
+        if not self._explicit:
+            return self._dedupe(defaults)
+        by_lower = {n.lower(): n for n in names}
+        by_snake = {normalize_field_name(n): n for n in names}
+        by_readable = {target: source for source, target in defaults.items()}
+        plan: Dict[str, str] = {}
+        explicit: Dict[str, str] = {}
+        for source, target in self._explicit:
+            if source == "*":
+                plan.update(defaults)
+                continue
+            snake = normalize_field_name(source)
+            actual = by_lower.get(source.lower()) or by_readable.get(snake) or by_snake.get(snake)
+            if actual:
+                explicit[actual] = target or defaults.get(actual) or normalize_field_name(actual)
+        taken = set(explicit.values())
+        plan = {src: tgt for src, tgt in plan.items() if src not in explicit and tgt not in taken}
+        plan.update(explicit)
+        return self._dedupe(plan)
+
+    @staticmethod
+    def _default_plan(names: List[str]) -> Dict[str, str]:
         snakes = {n: normalize_field_name(n) for n in names if not _is_system_field(n)}
         snakes = {n: s for n, s in snakes.items() if s}
         aliases: Dict[str, List[str]] = {}
@@ -255,7 +275,7 @@ class FieldMapper:
         for alias, sources in aliases.items():
             if len(sources) == 1:          # a rename only when the rule is unambiguous
                 plan[sources[0]] = alias
-        return self._dedupe(plan)
+        return plan
 
     @staticmethod
     def _dedupe(plan: Dict[str, str]) -> Dict[str, str]:

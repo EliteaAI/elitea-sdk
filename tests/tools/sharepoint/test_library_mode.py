@@ -319,7 +319,7 @@ def test_ambiguous_alias_keeps_snake_case_names():
 def test_explicit_mapping_selects_and_renames():
     s = settings(metadata_fields=["LastApproverName=approver", "TopicArea", "Missing=whatever", "DocCategory=id"])
     plan = lm.FieldMapper(s).plan(doc_fields("x", "y"))
-    assert plan == {"LastApproverName": "approver", "TopicArea": "topic_area", "DocCategory": "list_id"}
+    assert plan == {"LastApproverName": "approver", "TopicArea": "area", "DocCategory": "list_id"}
 
 
 def test_list_fields_never_overwrite_file_metadata():
@@ -705,3 +705,25 @@ def test_rest_app_token_is_reissued_once_on_401(monkeypatch):
     monkeypatch.setattr(lm.requests, "get", graph.get)
     assert backend.library_list_client().site_id() == "site,1,2"
     assert [c["headers"]["Authorization"] for c in graph.calls] == ["Bearer old", "Bearer new"]
+
+
+def test_mapping_accepts_the_readable_names_the_helper_shows():
+    s = settings(metadata_fields=["*", "area=category", "document_id"])
+    plan = lm.FieldMapper(s).plan(["TopicArea", "HBDocumentID_x0020_", "RegionCountry", "DocCategory", "Title"])
+    assert plan["TopicArea"] == "category"
+    assert plan["HBDocumentID_x0020_"] == "document_id"
+    assert plan["RegionCountry"] == "country" and plan["Title"] == "title"
+    # the field that held the default `category` name gives it up to the explicit mapping
+    assert "DocCategory" not in plan
+
+
+def test_mapping_without_star_copies_only_named_fields():
+    plan = lm.FieldMapper(settings(metadata_fields=["country", "topic_area=region"])).plan(
+        ["TopicArea", "RegionCountry", "DocCategory"])
+    assert plan == {"RegionCountry": "country", "TopicArea": "region"}
+
+
+def test_category_filter_works_on_a_mapped_field():
+    kept, counts, _ = join([graph_file(P1), graph_file(P2)], metadata_fields=["*", "area=category"],
+                           categories=["operations"])
+    assert len(kept) == 2 and kept[0]["category"] == "Operations" and counts.category_skipped == 0
