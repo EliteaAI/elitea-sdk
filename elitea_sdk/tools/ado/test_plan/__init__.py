@@ -11,6 +11,7 @@ from ....configurations.pgvector import PgVectorConfiguration
 from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from .test_plan_wrapper import TestPlanApiWrapper
 from ...base.tool import BaseAction
+from ..utils import check_organization_access
 from ...utils import clean_string, get_max_toolkit_length, check_connection_response, normalize_base_url
 from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
@@ -22,7 +23,7 @@ def get_toolkit(tool):
     return AzureDevOpsPlansToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         ado_configuration=tool['settings']['ado_configuration'],
-        project=tool['settings']['project'],
+        project=tool['settings'].get('project'),
         limit=tool['settings'].get('limit', 5),
         toolkit_name=tool.get('toolkit_name', ''),
         elitea=tool['settings'].get('elitea', None),
@@ -45,7 +46,7 @@ class AzureDevOpsPlansToolkit(BaseToolkit):
         m = create_model(
             name_alias,
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), json_schema_extra={'configuration_types': ['ado']})),
-            project=(str, Field(description="ADO project name")),
+            project=(Optional[str], Field(default=None, description="Default ADO project; leave empty to let each tool call name the project")),
             limit=(Optional[int], Field(description="ADO plans limit used for limitation of the list with results", default=5, gt=0)),
             # indexer settings
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(default=None,
@@ -88,9 +89,9 @@ class AzureDevOpsPlansToolkit(BaseToolkit):
             if not ado_config:
                 raise ValueError("ADO configuration is required")
             project = self.project
-            if not project:
-                raise ValueError("ADO project is required")
             token = ado_config.token.get_secret_value() if ado_config.token else ""
+            if not project:
+                return check_organization_access(normalize_base_url(ado_config.organization_url), token)
             response = requests.get(
                 f'{normalize_base_url(ado_config.organization_url)}/{project}/_apis/testplan/plans?api-version=7.0',
                 headers={'Authorization': f'Bearer {token}'},

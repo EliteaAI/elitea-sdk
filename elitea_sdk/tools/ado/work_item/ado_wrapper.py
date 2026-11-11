@@ -25,10 +25,13 @@ from pydantic.fields import Field
 
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import (
+    AdoProjectScope,
     AdoSearchPaging,
     SearchIndexHints,
     create_search_client,
     describe_search_info_code,
+    in_caller_context,
+    with_project_argument,
 )
 from ...utils import get_file_bytes_from_artifact, detect_mime_type, normalize_base_url
 from ...utils.content_parser import parse_file_content
@@ -239,11 +242,12 @@ ADOAttachFileToWorkItem = create_model(
     comment=(Optional[str], Field(description="Optional 'comment' attribute stored on the AttachedFile relation itself (a short caption/description of the attachment).", default=None)),
 )
 
-class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
+class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
     index_item_labels = ('work item', 'work items')
     # TODO use ado_configuration instead of organization_url, project and token
     organization_url: str
-    project: str
+    # Default project; each tool call may target another one
+    project: Optional[str] = None
     token: SecretStr
     limit: Optional[int] = 5
     _client: Optional[WorkItemTrackingClient] = PrivateAttr()
@@ -319,7 +323,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                       "System.ChangedDate"]
         for item in work_items:
             # Fetch full details of the work item, including the requested fields
-            full_item = self._client.get_work_item(id=item.id, project=self.project, fields=fields)
+            full_item = self._client.get_work_item(id=item.id, project=self._project(), fields=fields)
             fields_data = full_item.fields
 
             # Parse the fields dynamically
@@ -367,7 +371,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             # Use the transformed patch_document to create the work item
             work_item = self._client.create_work_item(
                 document=patch_document,
-                project=self.project,
+                project=self._project(),
                 type=wi_type
             )
             return {
@@ -387,7 +391,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         try:
             patch_document = self._transform_work_item(work_item_json)
-            work_item = self._client.update_work_item(id=id, document=patch_document, project=self.project)
+            work_item = self._client.update_work_item(id=id, document=patch_document, project=self._project())
         except Exception as e:
             raise ToolException(f"Issues during attempt to parse work_item_json: {str(e)}")
         return f"Work item ({work_item.id}) was updated."
@@ -396,7 +400,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     def delete_work_item(self, id: int):
         """Delete a work item from Azure DevOps by ID."""
         try:
-            self._client.delete_work_item(id=id, project=self.project)
+            self._client.delete_work_item(id=id, project=self._project())
             return f"Work item {id} was successfully deleted."
         except Exception as e:
             logger.error(f"Error deleting work item {id}: {e}")
@@ -426,7 +430,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """
         try:
             # Use the WorkItemTrackingClient to get work item type fields
-            work_item_type_obj = self._client.get_work_item_type(self.project, work_item_type)
+            work_item_type_obj = self._client.get_work_item_type(self._project(), work_item_type)
 
             # Get fields for this work item type
             fields = work_item_type_obj.fields
@@ -462,7 +466,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         if not field_definitions:
             return f"Unable to retrieve field definitions for work item type '{work_item_type}'. Please check your Azure DevOps connection and permissions."
 
-        output = [f"Available Fields for Work Item Type '{work_item_type}' in Project '{self.project}':\n"]
+        output = [f"Available Fields for Work Item Type '{work_item_type}' in Project '{self._project()}':\n"]
         output.append("=" * 80)
 
         # Separate required and optional fields
@@ -531,7 +535,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         Returns:
             Formatted string with field names, types, and requirements
         """
-        cache_key = work_item_type
+        cache_key = (self._project(), work_item_type)
 
         if force_refresh or cache_key not in self._work_item_type_fields_cache:
             self._work_item_type_fields_cache[cache_key] = self._get_work_item_type_fields(work_item_type)
@@ -589,7 +593,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             # Execute the WIQL query
             if not limit:
                 limit = self.limit
-            query_result = self._client.query_by_wiql(wiql, top=None if limit < 0 else limit, team_context=TeamContext(project=self.project))
+            query_result = self._client.query_by_wiql(wiql, top=None if limit < 0 else limit, team_context=TeamContext(project=self._project()))
             work_items = query_result.work_items
 
             if not work_items:
@@ -647,7 +651,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         skip = max(0, min(skip or 0, PAGING.max_skip))
         include_highlights = bool(include_highlights)
 
-        filters = {"System.TeamProject": [self.project]}
+        filters = {"System.TeamProject": [self._project()]}
         for field_reference_name, requested_values in (
             ("System.WorkItemType", work_item_type),
             ("System.State", state),
@@ -667,7 +671,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     top=top,
                     skip=skip,
                 ),
-                project=self.project,
+                project=self._project(),
             )
         except Exception as e:
             msg = f"Unable to search work items for query '{query}': {str(e)}"
@@ -691,7 +695,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 "title": fields_by_lowercased_name.get("system.title"),
                 "type": fields_by_lowercased_name.get("system.workitemtype"),
                 "state": fields_by_lowercased_name.get("system.state"),
-                "project": result.project.name if result.project else self.project,
+                "project": result.project.name if result.project else self._project(),
                 "url": f"{self.organization_url}/_workitems/edit/{work_item_id}" if work_item_id else result.url,
             }
             assignee = fields_by_lowercased_name.get("system.assignedto")
@@ -870,7 +874,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 results = [describe(url) for url in fetch_urls]
             else:
                 with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ado-img") as executor:
-                    results = list(executor.map(describe, fetch_urls))
+                    results = list(executor.map(in_caller_context(describe), fetch_urls))
 
         descriptions.update(zip(fetch_urls, results))
         return descriptions
@@ -935,7 +939,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 raise ToolException("Azure DevOps client not initialized.")
 
             # Fetch the work item
-            work_item = self._client.get_work_item(id=id, project=self.project, fields=fields, as_of=as_of, expand=expand)
+            work_item = self._client.get_work_item(id=id, project=self._project(), fields=fields, as_of=as_of, expand=expand)
 
             # Parse the fields dynamically
             fields_data = work_item.fields
@@ -1020,7 +1024,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 effective_expand = "renderedText"
 
             # Fetch the work item comments
-            comments_portion = self._client.get_comments(project=self.project, work_item_id=work_item_id, top=limit_portion, include_deleted=include_deleted, expand=effective_expand, order=order)
+            comments_portion = self._client.get_comments(project=self._project(), work_item_id=work_item_id, top=limit_portion, include_deleted=include_deleted, expand=effective_expand, order=order)
             comments_all = []
 
             while True:
@@ -1030,7 +1034,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     comments_all = comments_all[:limit_all]
                     break
                 else:
-                    comments_portion = self._client.get_comments(continuation_token=comments_portion.continuation_token, project=self.project, work_item_id=int(work_item_id), top=3, include_deleted=include_deleted, expand=effective_expand, order=order)
+                    comments_portion = self._client.get_comments(continuation_token=comments_portion.continuation_token, project=self._project(), work_item_id=int(work_item_id), top=3, include_deleted=include_deleted, expand=effective_expand, order=order)
 
             if not process_images:
                 return comments_all
@@ -1108,21 +1112,21 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             raise ToolException("Core client not initialized.")
 
         # 1. Get Project ID
-        project_details = self._core_client.get_project(self.project)
+        project_details = self._core_client.get_project(self._project())
         if not project_details or not project_details.id:
-            raise ToolException(f"Could not retrieve project details or ID for project '{self.project}'.")
+            raise ToolException(f"Could not retrieve project details or ID for project '{self._project()}'.")
         project_id = project_details.id
         # logger.info(f"Found project ID: {project_id}")
 
         # 2. Get Wiki ID
-        wiki_details = self._wiki_client.get_wiki(project=self.project, wiki_identifier=wiki_identified)
+        wiki_details = self._wiki_client.get_wiki(project=self._project(), wiki_identifier=wiki_identified)
         if not wiki_details or not wiki_details.id:
             raise ToolException(f"Could not retrieve wiki details or ID for wiki '{wiki_identified}'.")
         wiki_id = wiki_details.id
         # logger.info(f"Found wiki ID: {wiki_id}")
 
         # 3. Get Wiki Page
-        wiki_page = self._wiki_client.get_page(project=self.project, wiki_identifier=wiki_identified, path=page_name)
+        wiki_page = self._wiki_client.get_page(project=self._project(), wiki_identifier=wiki_identified, path=page_name)
 
         # 4. Construct the Artifact URI
         url = f"{project_id}/{wiki_id}{wiki_page.page.path}"
@@ -1166,7 +1170,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     self._client.update_work_item(
                         document=patch_document,
                         id=work_item_id,
-                        project=self.project # Assuming work items are in the same project
+                        project=self._project() # Assuming work items are in the same project
                     )
                     successful_links.append(str(work_item_id))
                     # logger.info(f"Successfully linked work item {work_item_id} to wiki page '{page_name}'.")
@@ -1208,7 +1212,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             for work_item_id in work_item_ids:
                 try:
                     # Get the work item with its relations
-                    work_item = self._client.get_work_item(id=work_item_id, project=self.project, expand='Relations')
+                    work_item = self._client.get_work_item(id=work_item_id, project=self._project(), expand='Relations')
                     if not work_item or not work_item.relations:
                         no_link_found.append(str(work_item_id))
                         logger.info(f"Work item {work_item_id} has no relations. Skipping unlink.")
@@ -1238,7 +1242,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     self._client.update_work_item(
                         document=patch_document,
                         id=work_item_id,
-                        project=self.project
+                        project=self._project()
                     )
                     successful_unlinks.append(str(work_item_id))
                     logger.info(f"Successfully unlinked work item {work_item_id} from wiki page '{page_name}'.")
@@ -1301,7 +1305,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         try:
             attachment_ref = self._client.create_attachment(
                 upload_stream=BytesIO(file_bytes),
-                project=self.project,
+                project=self._project(),
                 file_name=resolved_filename,
                 upload_type="Simple",
             )
@@ -1322,7 +1326,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         if inline_field:
             try:
-                work_item = self._client.get_work_item(id=work_item_id, project=self.project, fields=[inline_field])
+                work_item = self._client.get_work_item(id=work_item_id, project=self._project(), fields=[inline_field])
                 current_value = (work_item.fields or {}).get(inline_field, "") or ""
             except Exception as e:
                 logger.warning(f"Could not read field '{inline_field}' on WI {work_item_id}: {e}")
@@ -1331,7 +1335,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             patch_document.append({"op": "add", "path": f"/fields/{inline_field}", "value": new_value})
 
         try:
-            self._client.update_work_item(document=patch_document, id=work_item_id, project=self.project)
+            self._client.update_work_item(document=patch_document, id=work_item_id, project=self._project())
         except Exception as e:
             logger.error(f"Error attaching file to work item {work_item_id}: {e}")
             raise ToolException(f"Error attaching file to work item {work_item_id}: {e}")
@@ -1341,7 +1345,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 comment_html = self._build_inline_markup(attachment_url, resolved_filename, is_image)
                 self._client.add_comment(
                     request=CommentCreate(text=comment_html),
-                    project=self.project,
+                    project=self._project(),
                     work_item_id=work_item_id,
                 )
             except Exception as e:
@@ -1371,7 +1375,11 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     # LLM rate limits, and pgvector pool exhaustion.
     _MAX_WORKERS = 10
 
-    def _base_loader(
+    def _base_loader(self, *args, project=None, **kwargs) -> Generator[Document, None, None]:
+        # run() already put the call's project in scope; it only rides along to be recorded
+        return self._load_in_project(lambda: self._load_work_items(*args, **kwargs))
+
+    def _load_work_items(
         self,
         wiql: str,
         workers: Optional[int] = None,
@@ -1446,12 +1454,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             next_yield_idx = 0
             ready: Dict[int, Document] = {}
 
+            fetch = in_caller_context(self._fetch_work_item_document)
+
             def _submit_next() -> bool:
                 try:
                     idx, wi_id = next(id_iter)
                 except StopIteration:
                     return False
-                pending[executor.submit(self._fetch_work_item_document, wi_id)] = idx
+                pending[executor.submit(fetch, wi_id)] = idx
                 return True
 
             for _ in range(max_workers):
@@ -1495,7 +1505,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         sanitize = getattr(self, "_index_sanitize", True)
         chunking_tool = getattr(self, "_index_chunking_tool", None)
 
-        wi = self._client.get_work_item(id=wi_id, project=self.project, expand='all')
+        wi = self._client.get_work_item(id=wi_id, project=self._project(), expand='all')
         raw_fields = dict(wi.fields or {})
 
         # Describe embedded images before HTML gets sanitized so the image
@@ -1659,6 +1669,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
+        return self._in_document_project(document, lambda: self._process_work_item(document))
+
+    def _process_work_item(self, document: Document) -> Generator[Document, None, None]:
         if not getattr(self, '_index_include_attachments', False):
             return
         raw_attachment_ids = document.metadata.get('attachment_ids', {})
@@ -1816,8 +1829,10 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     "parses the JSON expecting the original schema."
                 ),
             )),
+            **self._project_field(),
         }
 
+    @with_project_argument
     @with_tool_groups
     def get_available_tools(self):
         """Return a list of available tools."""

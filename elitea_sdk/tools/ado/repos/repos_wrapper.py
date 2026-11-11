@@ -31,12 +31,17 @@ from pydantic import Field, PrivateAttr, create_model, model_validator, SecretSt
 
 from ...elitea_base import BaseCodeToolApiWrapper
 from ..utils import (
+    AdoProjectScope,
+    with_project_argument,
     AdoSearchPaging,
     SearchIndexHints,
     create_search_client,
     describe_search_info_code,
     generate_diff,
+    in_caller_context,
     get_content_from_generator,
+    normalize_project,
+    record_index_project,
 )
 from ...base_indexer_toolkit import IndexTools
 from ...code_indexer_toolkit import CodeIndexerToolkit
@@ -160,8 +165,12 @@ def _resolve_repository(
         )
         active_branch = base_branch
 
+    owner = getattr(repository, "project", None)
     return {
         "searchable_name": getattr(repository, "name", None) or repository_id,
+        "repository_ids": {value for value in (repository_id, getattr(repository, "id", None),
+                                               getattr(repository, "name", None)) if value},
+        "project_name": getattr(owner, "name", None),
         "base_branch": base_branch,
         "active_branch": active_branch,
     }
@@ -489,13 +498,13 @@ class ArgsSchema(Enum):
     )
 
 
-class ReposApiWrapper(CodeIndexerToolkit):
+class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
     # ADO Configuration fields (from AdoConfiguration)
     organization_url: Optional[str] = None
     project: Optional[str] = None
     token: Optional[SecretStr] = None
 
-    # Repositories configured on the toolkit; empty means any repository in the project
+    # Repositories of the configured project the toolkit may use; empty means any of them
     repositories: List[str] = []
 
     # Repository currently bound to the call in flight, plus its resolved branches
@@ -518,8 +527,8 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
     _search_client_instance: Optional[Any] = PrivateAttr(default=None)
 
-    # Per-repository resolved state: {searchable_name, base_branch, active_branch}
-    _repo_state: Dict[str, Dict[str, Optional[str]]] = PrivateAttr(default_factory=dict)
+    # Per (project, repository) resolved state: {searchable_name, base_branch, active_branch}
+    _repo_state: Dict[tuple, Dict[str, Optional[str]]] = PrivateAttr(default_factory=dict)
     # Branches as configured on the toolkit, before any per-repository fallback
     _configured_base_branch: Optional[str] = PrivateAttr(default=None)
     _configured_active_branch: Optional[str] = PrivateAttr(default=None)
@@ -546,7 +555,8 @@ class ReposApiWrapper(CodeIndexerToolkit):
         organization_url = normalize_base_url(
             get_from_dict_or_env(values, ["organization_url"], "ADO_ORGANIZATION_URL", default=None)
         )
-        project = get_from_dict_or_env(values, ["project"], "ADO_PROJECT", default=None)
+        # Optional: get_from_dict_or_env() raises when neither source holds a value
+        project = normalize_project(values.get("project") or environ.get("ADO_PROJECT"))
         token = get_from_dict_or_env(values, ["token"], "ADO_TOKEN", default=None)
 
         # Get repository-specific values
@@ -560,9 +570,14 @@ class ReposApiWrapper(CodeIndexerToolkit):
         base_branch = get_from_dict_or_env(values, ["base_branch"], "ADO_BASE_BRANCH", default="main")
         active_branch = get_from_dict_or_env(values, ["active_branch"], "ADO_ACTIVE_BRANCH", default="main")
 
-        if not organization_url or not project:
+        if not organization_url:
+            raise ToolException("Parameter organization_url is required.")
+        # The repositories are an allowlist of the configured project; without one they would
+        # silently restrict nothing
+        if repositories and not project:
             raise ToolException(
-                "Parameters: organization_url and project are required."
+                "Repositories can only be configured together with a project: set the project "
+                "they belong to, or clear the repositories."
             )
 
         credentials = BasicAuthentication("", token)
@@ -570,7 +585,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         # A single configured repository is bound and validated up front so that
         # misconfiguration surfaces at toolkit creation. With several (or zero)
         # repositories the target is only known per call, so validation is deferred.
-        repository_id = repositories[0] if len(repositories) == 1 else None
+        repository_id = repositories[0] if len(repositories) == 1 and project else None
 
         try:
             # Initialize ADO Git client
@@ -608,8 +623,10 @@ class ReposApiWrapper(CodeIndexerToolkit):
             self._configured_base_branch = self.base_branch
         if self._configured_active_branch is None:
             self._configured_active_branch = self.active_branch
-        if self.repository_id and self.repository_id not in self._repo_state:
-            self._repo_state[self.repository_id] = {
+        # A repository is only bound up front together with the configured project
+        state_key = (self.project, self.repository_id)
+        if self.repository_id and state_key not in self._repo_state:
+            self._repo_state[state_key] = {
                 "searchable_name": self.searchable_repository_name or self.repository_id,
                 "base_branch": self.base_branch,
                 "active_branch": self.active_branch,
@@ -618,13 +635,15 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
     def _ensure_repo_state(self, repository_id: str) -> Dict[str, Optional[str]]:
         """Resolve (and cache) the searchable name and usable branches of a repository."""
-        state = self._repo_state.get(repository_id)
+        project = self._project()
+        state_key = (project, repository_id)
+        state = self._repo_state.get(state_key)
         if state is not None:
             return state
         try:
             state = _resolve_repository(
                 self._client,
-                self.project,
+                project,
                 repository_id,
                 self._configured_base_branch,
                 self._configured_active_branch,
@@ -633,20 +652,26 @@ class ReposApiWrapper(CodeIndexerToolkit):
             raise
         except Exception as e:
             raise ToolException(f"Failed to access repository '{repository_id}': {e}")
-        self._repo_state[repository_id] = state
+        self._repo_state[state_key] = state
         return state
 
     def _bind_repository(self, repository_id: Optional[str]) -> None:
         """Point the wrapper at the repository a single tool call targets."""
-        configured = self.repositories or []
+        # The configured repositories belong to the configured project; another project
+        # has no allowlist and no default repository.
+        configured = (self.repositories or []) if self._targets_configured_project() else []
         if not repository_id:
             if configured:
                 repository_id = configured[0]
             else:
+                scope = (
+                    "this toolkit is not configured with any repository"
+                    if self._targets_configured_project()
+                    else f"the configured repositories do not belong to project '{self._project()}'"
+                )
                 raise ToolException(
-                    "Parameter 'repository_id' is required: this toolkit is not configured with "
-                    "any repository. Use 'list_repositories' to discover the repositories of "
-                    f"project '{self.project}'."
+                    f"Parameter 'repository_id' is required: {scope}. Use 'list_repositories' "
+                    f"to discover the repositories of project '{self._project()}'."
                 )
         elif configured and repository_id not in configured:
             raise ToolException(
@@ -655,32 +680,53 @@ class ReposApiWrapper(CodeIndexerToolkit):
             )
 
         state = self._ensure_repo_state(repository_id)
+        # The call may name the configured project by its ID, which only the repository reveals
+        if self.repositories and not configured and self._owned_by_configured_project(state) \
+                and not state.get("repository_ids", set()) & set(self.repositories):
+            raise ToolException(
+                f"Repository '{repository_id}' is not available in this toolkit. "
+                f"Configured repositories: {', '.join(self.repositories)}."
+            )
         self.repository_id = repository_id
         self.searchable_repository_name = state["searchable_name"]
         self.base_branch = state["base_branch"]
         self.active_branch = state["active_branch"]
 
-    def run(self, mode: str, *args: Any, **kwargs: Any):
-        repository_id = kwargs.pop("repository_id", None)
-        if mode in self._repo_agnostic_tools:
-            return super().run(mode, *args, **kwargs)
+    def _owned_by_configured_project(self, state: Dict[str, Any]) -> bool:
+        owner, configured = state.get("project_name"), normalize_project(self.project)
+        return bool(owner and configured) and owner.casefold() == configured.casefold()
 
-        previous = (
-            self.repository_id,
-            self.searchable_repository_name,
-            self.base_branch,
-            self.active_branch,
-        )
-        self._bind_repository(repository_id)
-        try:
-            return super().run(mode, *args, **kwargs)
-        finally:
-            (
+    def run(self, mode: str, *args: Any, **kwargs: Any):
+        # index_data keeps its target arguments, so the index records what it was built from
+        project = record_index_project(self, mode, kwargs)
+        if mode == IndexTools.INDEX_DATA.value:
+            repository_id = kwargs.get("repository_id")
+        else:
+            repository_id = kwargs.pop("repository_id", None)
+        with self._project_scope(project):
+            if mode in self._repo_agnostic_tools:
+                return super().run(mode, *args, **kwargs)
+
+            previous = (
                 self.repository_id,
                 self.searchable_repository_name,
                 self.base_branch,
                 self.active_branch,
-            ) = previous
+            )
+            self._bind_repository(repository_id)
+            try:
+                return super().run(mode, *args, **kwargs)
+            finally:
+                (
+                    self.repository_id,
+                    self.searchable_repository_name,
+                    self.base_branch,
+                    self.active_branch,
+                ) = previous
+
+    def _base_loader(self, *args, project=None, repository_id=None, **kwargs):
+        # run() already resolved both; they only ride along to be recorded with the index
+        return self._load_in_project(lambda: super(ReposApiWrapper, self)._base_loader(*args, **kwargs))
 
     def _repo_arg(self) -> Dict[str, tuple]:
         """The per-call repository argument, required only when no repository is configured."""
@@ -692,10 +738,13 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 else f"defaults to '{configured[0]}', so name a repository explicitly to work "
                      f"on any of the others ({', '.join(configured[1:])})"
             )
+            # A plain string rather than an enum of the configured repositories: those only
+            # bind the configured project, and _bind_repository enforces them there.
             return {
                 "repository_id": (
-                    Optional[Literal[tuple(configured)]],
-                    Field(default=None, description=f"Target repository. Optional - {default_hint}."),
+                    Optional[str],
+                    Field(default=None, description=f"Target repository. Optional - {default_hint}. "
+                                                    "Required when the call targets another project."),
                 )
             }
         if not self.project:
@@ -716,9 +765,9 @@ class ReposApiWrapper(CodeIndexerToolkit):
             "repository_id": (
                 str,
                 Field(
-                    description=f"Target repository ID or name in project '{self.project}'. "
-                                "Required because this toolkit has no configured repositories - "
-                                "use 'list_repositories' to discover them.",
+                    description="Target repository ID or name. Required because this toolkit "
+                                "has no configured repositories - use 'list_repositories' to "
+                                "discover them.",
                 ),
             )
         }
@@ -728,7 +777,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         return create_model(args_schema.__name__, __base__=args_schema, **self._repo_arg())
 
     def _index_tool_params(self):
-        return {**super()._index_tool_params(), **self._repo_arg()}
+        return {**super()._index_tool_params(), **self._repo_arg(), **self._project_field()}
 
     # Expose ADO Git client via property
     @property
@@ -747,7 +796,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             str: JSON array of repositories (name, id, default_branch).
         """
         try:
-            repositories = self._client.get_repositories(project=self.project)
+            repositories = self._client.get_repositories(project=self._project())
         except Exception as e:
             msg = f"Error during attempt to fetch the list of repositories: {str(e)}"
             logger.error(msg)
@@ -785,7 +834,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             )
             commits = self._client.get_commits(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 search_criteria=GitQueryCommitsCriteria(item_path=file_path,
                                                        item_version=version_descriptor, top=top if top else 100),
             )
@@ -845,7 +894,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             )
             items = self._client.get_items(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 scope_path=path,
                 recursion_level=recursion_level,
                 version_descriptor=version_descriptor,
@@ -876,13 +925,13 @@ class ReposApiWrapper(CodeIndexerToolkit):
         current_branches = [
             branch.name
             for branch in self._client.get_branches(
-                repository_id=self.repository_id, project=self.project
+                repository_id=self.repository_id, project=self._project()
             )
         ]
         if branch_name in current_branches:
             self.active_branch = branch_name
             # Survive the per-call rebinding of the active repository
-            self._repo_state[self.repository_id]["active_branch"] = branch_name
+            self._repo_state[(self._project(), self.repository_id)]["active_branch"] = branch_name
             return f"Switched to branch `{branch_name}`"
         else:
             msg = (
@@ -903,7 +952,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             branches = [
                 branch.name
                 for branch in self._client.get_branches(
-                    repository_id=self.repository_id, project=self.project
+                    repository_id=self.repository_id, project=self._project()
                 )
             ]
             if branches:
@@ -981,7 +1030,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 search_criteria=GitPullRequestSearchCriteria(
                     repository_id=self.repository_id, status="active"
                 ),
-                project=self.project,
+                project=self._project(),
             )
         except Exception as e:
             msg = f"Error during attempt to get active pull request: {str(e)}"
@@ -1000,7 +1049,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         """
         try:
             pull_request = self._client.get_pull_request_by_id(
-                project=self.project, pull_request_id=pull_request_id
+                project=self._project(), pull_request_id=pull_request_id
             )
         except Exception as e:
             msg = f"Failed to find pull request with '{pull_request_id}' ID. Error: {e}"
@@ -1033,13 +1082,13 @@ class ReposApiWrapper(CodeIndexerToolkit):
                     self._client.get_threads(
                         repository_id=self.repository_id,
                         pull_request_id=pull_request.pull_request_id,
-                        project=self.project,
+                        project=self._project(),
                     )
                 )
 
                 commits: List[GitCommitRef] = self._client.get_pull_request_commits(
                     repository_id=self.repository_id,
-                    project=self.project,
+                    project=self._project(),
                     pull_request_id=pull_request.pull_request_id,
                 )
 
@@ -1084,14 +1133,14 @@ class ReposApiWrapper(CodeIndexerToolkit):
         try:
             pr_iterations = self._client.get_pull_request_iterations(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 pull_request_id=pull_request_id,
             )
             last_iteration_id = pr_iterations[-1].id
 
             changes = self._client.get_pull_request_iteration_changes(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 pull_request_id=pull_request_id,
                 iteration_id=last_iteration_id,
             )
@@ -1141,13 +1190,13 @@ class ReposApiWrapper(CodeIndexerToolkit):
         return b"".join(self._client.get_item_content(
             self.repository_id,
             path=path,
-            project=self.project,
+            project=self._project(),
             download=True,
             version_descriptor=version_descriptor
         ))
 
     def _file_cache_key(self, file_path: str, version: str) -> tuple:
-        return (self.repository_id, file_path, version)
+        return (self._project(), self.repository_id, file_path, version)
 
     def get_file_content(self, commit_id, path):
         cache_key = self._file_cache_key(path, commit_id)
@@ -1161,7 +1210,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         try:
             content_generator = self._client.get_item_text(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 path=path,
                 version_descriptor=version_descriptor,
             )
@@ -1202,7 +1251,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             existing_branch = self._client.get_branch(
                 repository_id=self.repository_id,
                 name=new_branch_name,
-                project=self.project,
+                project=self._project(),
             )
         except Exception:
             # expected exception
@@ -1216,7 +1265,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         base_branch = self._client.get_branch(
             repository_id=self.repository_id,
             name=self.active_branch,
-            project=self.project,
+            project=self._project(),
         )
 
         try:
@@ -1229,7 +1278,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             self._client.update_refs(
                 ref_updates=ref_update_list,
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
             )
             self.active_branch = new_branch_name
             return f"Branch '{new_branch_name}' created successfully, and set as current active branch."
@@ -1262,7 +1311,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             try:
                 self._client.get_item(
                     repository_id=self.repository_id,
-                    project=self.project,
+                    project=self._project(),
                     path=file_path,
                     version_descriptor=GitVersionDescriptor(
                         version=self.active_branch, version_type="branch"
@@ -1280,7 +1329,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             # Get the latest commit ID of the active branch to use as oldObjectId
             branch = self._client.get_branch(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 name=self.active_branch,
             )
             if (
@@ -1302,7 +1351,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             new_commit = GitCommit(comment=f"Create {file_path}", changes=[change])
             push = GitPush(commits=[new_commit], ref_updates=[ref_update])
             self._client.create_push(
-                push=push, repository_id=self.repository_id, project=self.project
+                push=push, repository_id=self.repository_id, project=self._project()
             )
             # Invalidate cached content for this file on this branch
             self._file_content_cache.pop(self._file_cache_key(file_path, self.active_branch), None)
@@ -1352,7 +1401,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                 )
                 file_content = self._client.get_item_text(
                     repository_id=self.repository_id,
-                    project=self.project,
+                    project=self._project(),
                     path=file_path,
                     version_descriptor=version_descriptor,
                 )
@@ -1428,7 +1477,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             # Get the latest commit ID of the target branch
             branch_obj = self._client.get_branch(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 name=branch,
             )
             if branch_obj is None or not hasattr(branch_obj, 'commit') or not hasattr(branch_obj.commit, 'commit_id'):
@@ -1443,7 +1492,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             new_commit = GitCommit(comment=commit_message or ("Update " + file_path), changes=[change])
             push = GitPush(commits=[new_commit], ref_updates=[ref_update])
 
-            self._client.create_push(push=push, repository_id=self.repository_id, project=self.project)
+            self._client.create_push(push=push, repository_id=self.repository_id, project=self._project())
             # Invalidate cached content for this file on this branch
             self._file_content_cache.pop(self._file_cache_key(file_path, branch), None)
             return f"Updated file {file_path}"
@@ -1505,7 +1554,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         """
         try:
             branch = self._client.get_branch(
-                repository_id=self.repository_id, project=self.project, name=branch_name
+                repository_id=self.repository_id, project=self._project(), name=branch_name
             )
             if not branch:
                 return "Branch not found."
@@ -1522,7 +1571,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             )
             push = GitPush(commits=[new_commit], ref_updates=[ref_update])
             self._client.create_push(
-                push=push, repository_id=self.repository_id, project=self.project
+                push=push, repository_id=self.repository_id, project=self._project()
             )
             # Invalidate cached content for this file on this branch
             self._file_content_cache.pop(self._file_cache_key(file_path, branch_name), None)
@@ -1546,7 +1595,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             work_items = self._client.get_pull_request_work_item_refs(
                 repository_id=self.repository_id,
                 pull_request_id=pull_request_id,
-                project=self.project,
+                project=self._project(),
             )
 
             work_item_ids = [work_item_ref.id for work_item_ref in work_items[:10]]
@@ -1630,7 +1679,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                         comment_thread=comment_thread,
                         repository_id=self.repository_id,
                         pull_request_id=pull_request_id,
-                        project=self.project,
+                        project=self._project(),
                     )
 
                     result_message = f"Comment added to file '{file_path}'"
@@ -1660,7 +1709,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                     comment_thread,
                     repository_id=self.repository_id,
                     pull_request_id=pull_request_id,
-                    project=self.project,
+                    project=self._project(),
                 )
                 return f"Commented on pull request {pull_request_id}"
             else:
@@ -1706,7 +1755,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             response = self._client.create_pull_request(
                 git_pull_request_to_create=pull_request,
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
             )
 
             return f"Successfully created PR with ID {response.pull_request_id}"
@@ -1749,7 +1798,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
             commits = self._client.get_commits(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 search_criteria=search_criteria)
 
             commit_list = [
@@ -1781,7 +1830,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         try:
             chunks = self._client.get_item_text(
                 repository_id=self.repository_id,
-                project=self.project,
+                project=self._project(),
                 path=path,
                 version_descriptor=GitVersionDescriptor(version=commit_id, version_type="commit"),
             )
@@ -1856,8 +1905,9 @@ class ReposApiWrapper(CodeIndexerToolkit):
             max_workers=min(SNIPPET_FETCH_WORKERS, len(results_and_hits)),
             thread_name_prefix="ado-snippet",
         ) as executor:
+            fetch = in_caller_context(self._fetch_file_and_build_snippets)
             return list(executor.map(
-                lambda result_and_hits: self._fetch_file_and_build_snippets(*result_and_hits),
+                lambda result_and_hits: fetch(*result_and_hits),
                 results_and_hits,
             ))
 
@@ -1896,7 +1946,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
         skip = max(0, min(skip or 0, PAGING.max_skip))
 
         filters = {
-            "Project": [self.project],
+            "Project": [self._project()],
             "Repository": [self.searchable_repository_name or self.repository_id],
         }
         if branch:
@@ -1917,7 +1967,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
                     skip=skip,
                     include_snippet=include_snippets,
                 ),
-                project=self.project,
+                project=self._project(),
             )
         except Exception as e:
             msg = f"Unable to search code for query '{search_text}': {str(e)}"
@@ -1936,7 +1986,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
             matches = result.matches or {}
             content_hits = matches.get("content") or []
             entry = {
-                "project": result.project.name if result.project else self.project,
+                "project": result.project.name if result.project else self._project(),
                 "repository": result.repository.name if result.repository else self.searchable_repository_name,
                 "path": result.path,
                 "file_name": result.file_name,
@@ -2016,6 +2066,7 @@ class ReposApiWrapper(CodeIndexerToolkit):
 
         return dumps(payload)
 
+    @with_project_argument
     @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):

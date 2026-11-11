@@ -54,7 +54,7 @@ class TestToolkitSchemaHasProject:
 
         if expected_project:
             assert 'project' in properties, f"{toolkit_class.__name__} should have project field"
-            assert properties['project']['type'] == 'string'
+            assert {'type': 'string'} in properties['project']['anyOf']
 
 
 class TestAdoConfigurationCheckConnection:
@@ -218,37 +218,37 @@ class TestToolkitCheckConnection:
         assert '_apis/testplan/plans' in call_url
 
 
-class TestToolkitProjectRequired:
-    """Test that project is required at toolkit level."""
+class TestToolkitProjectOptional:
+    """The configured project is a default; a toolkit without one names the project per call."""
 
-    def test_work_items_toolkit_requires_project(self):
-        """ADO boards toolkit should require project field."""
-        schema_model = AzureDevOpsWorkItemsToolkit.toolkit_config_schema()
-        schema = schema_model.model_json_schema()
-        required = schema.get('required', [])
+    @pytest.mark.parametrize("toolkit_class", [
+        AzureDevOpsWorkItemsToolkit,
+        AzureDevOpsReposToolkit,
+        AzureDevOpsWikiToolkit,
+        AzureDevOpsPlansToolkit,
+    ])
+    def test_toolkit_does_not_require_project(self, toolkit_class):
+        schema = toolkit_class.toolkit_config_schema().model_json_schema()
 
-        assert 'project' in required
+        assert 'project' not in schema.get('required', [])
 
-    def test_repos_toolkit_requires_project(self):
-        """ADO repos toolkit should require project field."""
-        schema_model = AzureDevOpsReposToolkit.toolkit_config_schema()
-        schema = schema_model.model_json_schema()
-        required = schema.get('required', [])
+    @pytest.mark.parametrize("toolkit_class", [
+        AzureDevOpsWorkItemsToolkit,
+        AzureDevOpsReposToolkit,
+        AzureDevOpsWikiToolkit,
+        AzureDevOpsPlansToolkit,
+    ])
+    @patch('requests.get')
+    def test_check_connection_without_project_checks_organization_access(self, mock_get, toolkit_class):
+        mock_get.return_value = MagicMock(status_code=200)
+        instance = toolkit_class.toolkit_config_schema()(
+            ado_configuration=AdoConfiguration(
+                organization_url="https://dev.azure.com/myorg/",
+                token=SecretStr("test-token")
+            ),
+            selected_tools=[]
+        )
 
-        assert 'project' in required
+        instance.check_connection()
 
-    def test_wiki_toolkit_requires_project(self):
-        """ADO wiki toolkit should require project field."""
-        schema_model = AzureDevOpsWikiToolkit.toolkit_config_schema()
-        schema = schema_model.model_json_schema()
-        required = schema.get('required', [])
-
-        assert 'project' in required
-
-    def test_plans_toolkit_requires_project(self):
-        """ADO plans toolkit should require project field."""
-        schema_model = AzureDevOpsPlansToolkit.toolkit_config_schema()
-        schema = schema_model.model_json_schema()
-        required = schema.get('required', [])
-
-        assert 'project' in required
+        assert mock_get.call_args[0][0].startswith("https://dev.azure.com/myorg/_apis/projects?")

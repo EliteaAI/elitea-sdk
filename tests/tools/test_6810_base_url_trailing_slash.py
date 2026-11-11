@@ -152,7 +152,7 @@ class TestAzureDevOps:
 
         with patch.object(module, 'Connection') as connection_cls:
             try:
-                wrapper_cls(organization_url='https://dev.azure.com/my-org/', project='p', token='t')
+                wrapper_cls(organization_url='https://dev.azure.com/my-org/', project='p', token='t', llm=None)
             except Exception:
                 # Downstream init on mocked clients is out of scope; only the URL matters
                 pass
