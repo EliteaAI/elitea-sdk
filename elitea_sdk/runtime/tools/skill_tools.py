@@ -39,6 +39,7 @@ from ..langchain.constants import (
     LOAD_SKILL_UNAVAILABLE,
     LOAD_SKILL_UNAVAILABLE_DENIED,
     LOAD_SKILL_UNAVAILABLE_TRANSIENT,
+    LOAD_SKILL_USER_ONLY,
     LOAD_SKILL_UNKNOWN,
     LOAD_SKILL_UNKNOWN_LISTED,
     LOADED_SKILL_PREFIX_RE,
@@ -275,9 +276,20 @@ def _rank_by_source(skill: dict, default: str) -> int:
     return SOURCE_RANK.get(skill.get('origin') or default, SOURCE_RANK[default])
 
 
+def _is_model_invocable(skill: dict) -> bool:
+    return not skill.get('disable_model_invocation')
+
+
+def _disclosable_names(skills) -> list:
+    return sorted({s.get('name') for s in skills if s.get('name') and _is_model_invocable(s)})
+
+
 class SkillRegistry:
+    """Every skill the turn knows by name; only the model-invocable ones are disclosed, searched or suggested."""
+
     def __init__(self, entries: list, ranker=None):
         self._entries = list(entries)
+        self._disclosable = [skill for skill in self._entries if _is_model_invocable(skill)]
         self._by_name = {_normalize_skill_name(skill): skill for skill in self._entries}
         self._ranker = ranker or BM25Ranker()
 
@@ -304,6 +316,10 @@ class SkillRegistry:
     def entries(self) -> list:
         return list(self._entries)
 
+    @property
+    def disclosable(self) -> list:
+        return list(self._disclosable)
+
     def resolve(self, name: str) -> Optional[dict]:
         return self._by_name.get((name or '').strip().lower())
 
@@ -311,7 +327,7 @@ class SkillRegistry:
         return [skill for _score, skill in self.search_scored(query, limit)]
 
     def search_scored(self, query: str, limit: int = SEARCH_SKILLS_RESULT_LIMIT) -> list:
-        return self._ranker.rank_scored(query, self._entries, limit)
+        return self._ranker.rank_scored(query, self._disclosable, limit)
 
 
 class BM25Ranker:
@@ -404,7 +420,7 @@ class LoadSkillTool(BaseTool):
         if not matched:
             logger.info("[Skills] load_skill unknown name %r; %d skills available", skill, len(self.registry))
             if self.listed:
-                available = sorted(s.get('name') for s in self.registry.entries if s.get('name'))
+                available = _disclosable_names(self.registry.entries)
                 return LOAD_SKILL_UNKNOWN_LISTED.format(name=skill, available=', '.join(available) or '(none)')
             return LOAD_SKILL_UNKNOWN.format(name=skill)
         name = matched.get('name')
@@ -412,6 +428,9 @@ class LoadSkillTool(BaseTool):
         if self._is_invoked(matched):
             logger.info("[Skills] load_skill %r already active via ~name", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
+        if not _is_model_invocable(matched):
+            logger.info("[Skills] load_skill %r refused: user-only", name)
+            return LOAD_SKILL_USER_ONLY.format(name=name)
         if normalized_name in self._already_loaded:
             logger.info("[Skills] load_skill %r already loaded in this conversation", name)
             return LOAD_SKILL_ALREADY_ACTIVE.format(name=name)
@@ -497,14 +516,16 @@ class SkillFileTool(BaseTool):
         invoked = {_normalize_skill_name(s): s for s in self.invoked_skills if isinstance(s, dict)}
         matched = self.registry.resolve(skill) or invoked.get(normalized)
         if not matched:
-            available = sorted({
-                s.get('name') for s in self.registry.entries + list(invoked.values()) if select_skill_files(s.get('files'))
-            })
+            with_files = [s for s in self.registry.disclosable + list(invoked.values()) if select_skill_files(s.get('files'))]
+            available = sorted({s.get('name') for s in with_files if s.get('name')})
             return None, [], SKILL_FILE_UNKNOWN_SKILL.format(name=skill, available=', '.join(available) or '(none)'), ''
         name = matched.get('name')
         files = select_skill_files(matched.get('files'))
         if not files:
             return None, [], SKILL_FILE_SKILL_WITHOUT_FILES.format(name=name), ''
+        if normalized not in invoked and not _is_model_invocable(matched):
+            logger.info("[Skills] %s refused for %r: user-only", self.name, name)
+            return None, [], LOAD_SKILL_USER_ONLY.format(name=name), ''
         if normalized in self._already_loaded or normalized in invoked:
             return matched, files, None, ''
         if self.loader is None:
@@ -1007,10 +1028,11 @@ def build_load_skill_tools(
 def render_skill_registry_index(attached_skills, project_skills=None, project_skill_summary=None) -> str:
     if project_skills:
         return SKILL_SEARCH_PROMPT
-    if not attached_skills:
+    listed = [s for s in attached_skills or [] if _is_model_invocable(s)]
+    if not listed:
         return ""
     ordered = sorted(
-        attached_skills, key=lambda s: (s.get('skill_id') or 0, s.get('name') or '')
+        listed, key=lambda s: (s.get('skill_id') or 0, s.get('name') or '')
     )
     descriptions = [' '.join(str(s.get('description') or '').split()) for s in ordered]
     max_chars = _registry_description_max_chars([len(d) for d in descriptions])
