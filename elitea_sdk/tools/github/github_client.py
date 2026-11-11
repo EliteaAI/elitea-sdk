@@ -3,6 +3,7 @@ import logging
 import json
 import re
 import fnmatch
+import threading
 import zipfile
 from io import BytesIO
 from datetime import datetime
@@ -13,7 +14,7 @@ import tiktoken
 
 logger = logging.getLogger(__name__)
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, create_model, model_validator
 
 from github import Auth, Github, GithubIntegration, GithubRetry, Repository
 from github.GithubException import RateLimitExceededException
@@ -24,7 +25,13 @@ from langchain_core.tools import ToolException
 
 from ...runtime.tool_outcome import quota_exhausted
 
-from ..elitea_base import extend_with_file_operations, BaseCodeToolApiWrapper
+from ..elitea_base import (
+    extend_with_file_operations,
+    BaseCodeToolApiWrapper,
+    EditFileInput,
+    GrepFileInput,
+    ReadMultipleFilesInput,
+)
 from ..utils.tool_groups import tool_group, with_tool_groups
 from ..utils import normalize_pem_key
 from ..utils.text_operations import apply_line_slice
@@ -34,7 +41,7 @@ from ...runtime.utils.trace_limits import estimate_chars, resolve_tool_result_li
 from .schemas import (
     GitHubAuthConfig,
     GitHubRepoConfig,
-    NoInput,
+    RepoOnlyInput,
     ListBranchesInput,
     ListPullRequestsInput,
     BranchName,
@@ -59,10 +66,12 @@ from .schemas import (
     ApplyGitPatchFromArtifact,
     TriggerWorkflow,
     GetWorkflowStatus,
+    GetWorkflowRuns,
     GetWorkflowLogs,
     GenericGithubAPICall,
     GetMe,
     SearchCode,
+    REPO_NAME_DESCRIPTION,
 )
 
 # Import prompts for tools
@@ -108,6 +117,14 @@ GITHUB_DEFAULT_PAGE_SIZE = 30
 GITHUB_ISSUE_COMMENTS_LIMIT = GITHUB_DEFAULT_PAGE_SIZE
 GITHUB_TOOLKIT_TYPE = 'github'
 GITHUB_ISSUE_COMMENTS_NOTE_RESERVE = 512
+
+_ACTIVE_BRANCHES_LOCK = threading.Lock()
+FOREIGN_REPO_CACHE_SIZE = 32
+_EMPTY_REPO_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined", "n/a"})
+NO_REPOSITORY_MESSAGE = (
+    "No repository specified: pass repo_name='owner/repo', "
+    "or configure a repository on the toolkit."
+)
 
 
 class BoundedGithubRetry(GithubRetry):
@@ -204,7 +221,7 @@ class GitHubClient(BaseModel):
         arbitrary_types_allowed = True
 
     # Public attributes that can be serialized/deserialized
-    github_repository: str = Field(default="")
+    github_repository: Optional[str] = Field(default=None)
     active_branch: str = Field(default="")
     github_base_branch: str = Field(default="main")
     github_base_url: str = Field(default=DEFAULT_BASE_URL)
@@ -344,6 +361,102 @@ class GitHubClient(BaseModel):
             raise ToolException("Repository field should be in '<owner>/<repo>' format.")
         return match.group(1)
 
+    @staticmethod
+    def _normalize_repo_name(repo_name: Optional[str]) -> Optional[str]:
+        """An explicit repository, or None when the caller means "the toolkit's".
+
+        Pipeline nodes make every argument required, so the model fills an unused
+        repo_name with an empty string, quotes or a placeholder word.
+        """
+        if repo_name is None:
+            return None
+        value = str(repo_name).strip().strip("'\"").strip()
+        if not value or value.lower() in _EMPTY_REPO_PLACEHOLDERS:
+            return None
+        return value
+
+    def _foreign_repo_key(self, repo_name: Optional[str]) -> Optional[str]:
+        """The repository a call targets when it is not the configured one, else None.
+
+        Only the configured repository owns the configured branches; any other
+        repository falls back to its own default branch.
+        """
+        explicit = self._normalize_repo_name(repo_name)
+        if not explicit:
+            return None
+        name = self.clean_repository_name(explicit)
+        configured = getattr(self, "github_repository", None) or ""
+        if configured and name.lower() == configured.lower():
+            return None
+        return name
+
+    def _resolve_repo_name(self, repo_name: Optional[str] = None) -> str:
+        """Runtime repo_name, then the configured repository, then an actionable error."""
+        explicit = self._normalize_repo_name(repo_name)
+        if explicit:
+            return self.clean_repository_name(explicit)
+        if getattr(self, "github_repository", None):
+            return self.github_repository
+        raise ToolException(NO_REPOSITORY_MESSAGE)
+
+    def _get_repo(self, repo_name: Optional[str] = None) -> Repository.Repository:
+        """The repository object a call targets. Never stored on the client for foreign repos."""
+        foreign = self._foreign_repo_key(repo_name)
+        if foreign:
+            if not self.github_api:
+                raise ToolException("GitHub client is not initialized.")
+            # Cached per repository: an index run reads every file of it, and refetching
+            # the repository for each read would double the request count.
+            key = foreign.lower()
+            with _ACTIVE_BRANCHES_LOCK:
+                cache = getattr(self, "_foreign_repos", None)
+                if cache is None:
+                    cache = {}
+                    self._foreign_repos = cache
+                repo = cache.get(key)
+            if repo is None:
+                repo = self.github_api.get_repo(foreign)
+                with _ACTIVE_BRANCHES_LOCK:
+                    if len(cache) >= FOREIGN_REPO_CACHE_SIZE:
+                        cache.pop(next(iter(cache)))
+                    cache[key] = repo
+            return repo
+        repo = self.github_repo_instance
+        if repo is None:
+            raise ToolException(NO_REPOSITORY_MESSAGE)
+        return repo
+
+    def _foreign_active_branches(self) -> Dict[str, str]:
+        with _ACTIVE_BRANCHES_LOCK:
+            branches = getattr(self, "_active_branches_by_repo", None)
+            if branches is None:
+                branches = {}
+                self._active_branches_by_repo = branches
+            return branches
+
+    def _active_branch_for(self, repo_name: Optional[str] = None, repo=None) -> str:
+        """The working branch of the targeted repository."""
+        foreign = self._foreign_repo_key(repo_name)
+        if not foreign:
+            return self.active_branch or self.github_base_branch
+        recorded = self._foreign_active_branches().get(foreign.lower())
+        if recorded:
+            return recorded
+        return (repo or self._get_repo(repo_name)).default_branch
+
+    def _base_branch_for(self, repo_name: Optional[str] = None, repo=None) -> str:
+        """The protected base branch of the targeted repository."""
+        if not self._foreign_repo_key(repo_name):
+            return self.github_base_branch
+        return (repo or self._get_repo(repo_name)).default_branch
+
+    def _record_active_branch(self, branch_name: str, repo_name: Optional[str] = None) -> None:
+        foreign = self._foreign_repo_key(repo_name)
+        if foreign:
+            self._foreign_active_branches()[foreign.lower()] = branch_name
+        else:
+            self.active_branch = branch_name
+
     def _get_files(self, directory_path: str, ref: str, repo_name: Optional[str] = None) -> List[str]:
         """
         Get all files in a directory recursively using Git Trees API.
@@ -379,7 +492,7 @@ class GitHubClient(BaseModel):
         from github import GithubException
 
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
 
             # Get the commit SHA for the ref (branch/tag name)
             try:
@@ -443,7 +556,11 @@ class GitHubClient(BaseModel):
         Returns:
             str: List of file paths, or an error message.
         """
-        return self._get_files(directory_path, self.active_branch, repo_name)
+        try:
+            branch = self._active_branch_for(repo_name)
+        except ToolException as e:
+            return f"Error: {e}"
+        return self._get_files(directory_path, branch, repo_name)
 
     @tool_group('read')
     def get_issue(self, issue_number: int, comments_offset: Optional[int] = 0,
@@ -467,7 +584,7 @@ class GitHubClient(BaseModel):
                 Returns an error string on failure.
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             issue = repo.get_issue(int(issue_number))
             issue_data = {
                 "number": issue.number,
@@ -605,7 +722,11 @@ class GitHubClient(BaseModel):
         Returns:
             str: A plaintext report containing the paths and names of the files.
         """
-        return self._get_files("", self.github_base_branch, repo_name)
+        try:
+            branch = self._base_branch_for(repo_name)
+        except ToolException as e:
+            return f"Error: {e}"
+        return self._get_files("", branch, repo_name)
 
     @tool_group('read')
     def list_files_in_bot_branch(self, repo_name: Optional[str] = None) -> str:
@@ -618,7 +739,11 @@ class GitHubClient(BaseModel):
         Returns:
             str: A plaintext report containing the paths and names of the files.
         """
-        return self._get_files("", self.active_branch, repo_name)
+        try:
+            branch = self._active_branch_for(repo_name)
+        except ToolException as e:
+            return f"Error: {e}"
+        return self._get_files("", branch, repo_name)
 
     @tool_group('read')
     def get_commits(
@@ -659,7 +784,7 @@ class GitHubClient(BaseModel):
             params = {key: value for key, value in params.items() if value}
 
             # Call the GitHub API to get commits
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             commits = repo.get_commits(**params)
 
             # Convert the commits to a list of dictionaries for easier processing
@@ -698,7 +823,7 @@ class GitHubClient(BaseModel):
         """
         try:
             # Get the repository
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             
             # Get the specific commit
             commit = repo.get_commit(sha)
@@ -771,7 +896,7 @@ class GitHubClient(BaseModel):
 
         try:
             # Get the repository
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
 
             # Get the comparison between the two commits
             comparison = repo.compare(base_sha, head_sha)
@@ -901,12 +1026,13 @@ class GitHubClient(BaseModel):
         import re
         
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
+            base_branch = self._base_branch_for(repo_name, repo)
 
-            if branch == self.github_base_branch:
+            if branch == base_branch:
                 return {
                     "error": "Cannot apply patch",
-                    "message": f"You're attempting to commit directly to the {self.github_base_branch} branch, which is protected. Please create a new branch and try again."
+                    "message": f"You're attempting to commit directly to the {base_branch} branch, which is protected. Please create a new branch and try again."
                 }
 
             # Parse the patch content to extract file changes
@@ -1284,7 +1410,7 @@ class GitHubClient(BaseModel):
         """
         max_tokens = 2000
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             pull = repo.get_pull(number=int(pr_number))
             total_tokens = 0
 
@@ -1356,7 +1482,7 @@ class GitHubClient(BaseModel):
         """
         try:
             # Grab PR
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             pr = repo.get_pull(int(pr_number))
             files = pr.get_files()
             data = []
@@ -1397,13 +1523,11 @@ class GitHubClient(BaseModel):
         from github import GithubException
 
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             i = 0
             new_branch_name = proposed_branch_name
 
-            # Get base branch - if repo_name is specified, use github_base_branch
-            base_branch_name = self.github_base_branch if repo_name else (self.active_branch if self.active_branch else self.github_base_branch)
-            base_branch = repo.get_branch(base_branch_name)
+            base_branch = repo.get_branch(self._active_branch_for(repo_name, repo))
 
             for i in range(1000):
                 try:
@@ -1411,13 +1535,11 @@ class GitHubClient(BaseModel):
                         ref=f"refs/heads/{new_branch_name}", sha=base_branch.commit.sha
                     )
 
-                    # Only set active branch if using the default repository
-                    if not repo_name:
-                        self.active_branch = new_branch_name
+                    self._record_active_branch(new_branch_name, repo_name)
 
                     return (
-                        f"Branch '{new_branch_name}' created successfully" +
-                        ("" if repo_name else ", and set as current active branch.")
+                        f"Branch '{new_branch_name}' created successfully, "
+                        f"and set as current active branch of {repo.full_name}."
                     )
                 except GithubException as e:
                     if (e.status == 422 and "Reference already exists" in e.data["message"]):
@@ -1437,7 +1559,7 @@ class GitHubClient(BaseModel):
             return f"Failed to create branch: {str(e)}"
 
     @tool_group('delete')
-    def delete_branch(self, branch_name: str, force: bool = False) -> str:
+    def delete_branch(self, branch_name: str, force: bool = False, repo_name: Optional[str] = None) -> str:
         """
         Delete a branch from the GitHub repository.
 
@@ -1449,6 +1571,7 @@ class GitHubClient(BaseModel):
         Parameters:
             branch_name (str): Name of the branch to delete
             force (bool): If True, allows deletion of the current active branch
+            repo_name (Optional[str]): Name of the repository in format 'owner/repo'
 
         Returns:
             str: A success or error message.
@@ -1456,12 +1579,16 @@ class GitHubClient(BaseModel):
         from github import GithubException
 
         try:
+            repo = self._get_repo(repo_name)
+            base_branch = self._base_branch_for(repo_name, repo)
+            active_branch = self._active_branch_for(repo_name, repo)
+
             # Protected branch names that should never be deleted
             protected_branches = {'main', 'master'}
 
             # Add base branch to protected list
-            if self.github_base_branch:
-                protected_branches.add(self.github_base_branch)
+            if base_branch:
+                protected_branches.add(base_branch)
 
             # Check if trying to delete a protected branch
             if branch_name.lower() in {b.lower() for b in protected_branches}:
@@ -1472,7 +1599,7 @@ class GitHubClient(BaseModel):
                 )
 
             # Check if trying to delete the active branch without force
-            if branch_name == self.active_branch and not force:
+            if branch_name == active_branch and not force:
                 return (
                     f"Cannot delete branch '{branch_name}': "
                     f"It is currently the active branch. "
@@ -1480,16 +1607,15 @@ class GitHubClient(BaseModel):
                 )
 
             # Delete the branch
-            repo = self.github_repo_instance
             ref = repo.get_git_ref(f"heads/{branch_name}")
             ref.delete()
 
             # If we deleted the active branch, reset to base branch
-            if branch_name == self.active_branch:
-                self.active_branch = self.github_base_branch
+            if branch_name == active_branch:
+                self._record_active_branch(base_branch, repo_name)
                 return (
                     f"Branch '{branch_name}' deleted successfully. "
-                    f"Active branch has been reset to '{self.github_base_branch}'."
+                    f"Active branch has been reset to '{base_branch}'."
                 )
 
             return f"Branch '{branch_name}' deleted successfully."
@@ -1535,11 +1661,12 @@ class GitHubClient(BaseModel):
             )
         
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
+            base_branch = self._base_branch_for(repo_name, repo)
 
-            if branch == self.github_base_branch:
+            if branch == base_branch:
                 return (
-                    f"You're attempting to commit directly to the {self.github_base_branch} branch, "
+                    f"You're attempting to commit directly to the {base_branch} branch, "
                     "which is protected. Please create a new branch and try again."
                 )
 
@@ -1589,16 +1716,16 @@ class GitHubClient(BaseModel):
                 NEW <<<<
                 Hello Mars!
                 >>>> NEW
-            repo_name (Optional[str]): Name of the repository in format 'owner/repo'. Currently
-                not used by edit_file and must refer to the initialized repository.
+            repo_name (Optional[str]): Name of the repository in format 'owner/repo'
 
         Returns:
             A success or failure message
         """
         try:
-            if branch == self.github_base_branch:
+            base_branch = self._base_branch_for(repo_name)
+            if branch == base_branch:
                 return (
-                    f"You're attempting to commit directly to the {self.github_base_branch} branch, "
+                    f"You're attempting to commit directly to the {base_branch} branch, "
                     "which is protected. Please create a new branch and try again."
                 )
 
@@ -1620,18 +1747,13 @@ class GitHubClient(BaseModel):
             # Keep all lines after file_path line (preserving empty lines)
             edit_content = "\n".join(lines[first_non_empty_idx + 1:])
 
-            # Set temporary repo override for internal helpers
-            self._tmp_repo_for_edit = repo_name
-            try:
-                return self.edit_file(
-                    file_path=file_path,
-                    file_query=edit_content,
-                    branch=branch,
-                    commit_message=commit_message or f"Update {file_path}",
-                )
-            finally:
-                if hasattr(self, "_tmp_repo_for_edit"):
-                    delattr(self, "_tmp_repo_for_edit")
+            return self.edit_file(
+                file_path=file_path,
+                file_query=edit_content,
+                branch=branch,
+                commit_message=commit_message or f"Update {file_path}",
+                repo_name=repo_name,
+            )
         except Exception as e:
             return f"Unable to update file due to error:\n{str(e)}"
 
@@ -1648,11 +1770,12 @@ class GitHubClient(BaseModel):
             str: A success or failure message
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
+            base_branch = self._base_branch_for(repo_name, repo)
 
-            if branch == self.github_base_branch:
+            if branch == base_branch:
                 return (
-                    f"You're attempting to commit directly to the {self.github_base_branch} branch, "
+                    f"You're attempting to commit directly to the {base_branch} branch, "
                     "which is protected. Please create a new branch and try again."
                 )
 
@@ -1704,7 +1827,8 @@ class GitHubClient(BaseModel):
 
         Parameters:
             search_query (str): Keywords or query for searching issues and PRs in Github (supports GitHub search syntax).
-            repo_name (Optional[str]): Name of the repository to search issues in. If None, use the initialized repository.
+            repo_name (Optional[str]): Name of the repository to search issues in. If None, use the
+                toolkit's repository; without one, the query itself must carry its scope.
             max_count (int): Default is 30. This determines max size of returned list with issues
 
         Returns:
@@ -1724,9 +1848,16 @@ class GitHubClient(BaseModel):
             if not self.validate_search_query(search_query):
                 return "Invalid search query. Please ensure it matches expected GitHub search syntax."
 
-            target_repo = self.github_repo_instance.full_name if repo_name is None else repo_name
+            # With no repository at all the query runs unscoped, so an org:/user: qualifier
+            # in it still works; GitHub search is an account-level operation.
+            try:
+                target_repo = self._resolve_repo_name(repo_name)
+            except ToolException:
+                if self._normalize_repo_name(repo_name):
+                    raise
+                target_repo = None
 
-            query = f"repo:{target_repo} {search_query}"
+            query = f"repo:{target_repo} {search_query}" if target_repo else search_query
             search_result = self.github_api.search_issues(query)
 
             if not search_result.totalCount:
@@ -1767,7 +1898,7 @@ class GitHubClient(BaseModel):
             str: A success or failure message along with the URL to the newly created issue.
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
 
             if not repo:
                 return "GitHub repository instance is not found or not initialized."
@@ -1806,7 +1937,7 @@ class GitHubClient(BaseModel):
         if not issue_id:
             return "Issue ID is required."
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             issue = repo.get_issue(number=issue_id)
 
             if not issue:
@@ -1851,7 +1982,7 @@ class GitHubClient(BaseModel):
             str: The commit hash of the file, or an error message if not found
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             file = repo.get_contents(file_path, ref=branch)
             return file.sha
         except Exception as e:
@@ -1875,14 +2006,12 @@ class GitHubClient(BaseModel):
         """
         import time
         
-        branch = branch.strip() if branch and branch.strip() else self.active_branch
+        repo = self._get_repo(repo_name)
+        branch = branch.strip() if branch and branch.strip() else self._active_branch_for(repo_name, repo)
         last_exception = None
         
         for attempt in range(max_retries):
             try:
-                # Prefer temporary repo set by update_file, then explicit repo_name
-                effective_repo = getattr(self, "_tmp_repo_for_edit", None) or repo_name
-                repo = self.github_api.get_repo(effective_repo) if effective_repo else self.github_repo_instance
                 file = repo.get_contents(file_path, ref=branch)
                 file_content = file.decoded_content.decode("utf-8")
                 
@@ -1926,7 +2055,7 @@ class GitHubClient(BaseModel):
             The file contents as a string, or a structured content_too_large
             guidance object (dict) if it exceeds the size limit.
         """
-        full_content = self._read_file(file_path, branch if branch else self.active_branch, repo_name)
+        full_content = self._read_file(file_path, branch, repo_name)
 
         content = full_content
         if start_line is not None or end_line is not None:
@@ -1948,6 +2077,7 @@ class GitHubClient(BaseModel):
         branch: str = None,
         offset: Optional[int] = None,
         limit: Optional[int] = None,
+        repo_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Read multiple files in batch, capped both per-file and cumulatively.
@@ -1966,7 +2096,10 @@ class GitHubClient(BaseModel):
         """
         # Route through the shared capped batch reader so the cumulative-cap
         # loop lives in one place, not one copy per toolkit.
-        return capped_read_multiple_files(self.read_file, file_paths, branch=branch, offset=offset, limit=limit)
+        def read_file(file_path, **kwargs):
+            return self.read_file(file_path, repo_name=repo_name, **kwargs)
+
+        return capped_read_multiple_files(read_file, file_paths, branch=branch, offset=offset, limit=limit)
 
     def _write_file(
         self,
@@ -1990,14 +2123,13 @@ class GitHubClient(BaseModel):
             Success message
         """
         try:
-            # Prefer temporary repo set by update_file, then explicit repo_name
-            effective_repo = getattr(self, "_tmp_repo_for_edit", None) or repo_name
-            repo = self.github_api.get_repo(effective_repo) if effective_repo else self.github_repo_instance
-            branch = branch or self.active_branch
-            
-            if branch == self.github_base_branch:
+            repo = self._get_repo(repo_name)
+            branch = branch or self._active_branch_for(repo_name, repo)
+            base_branch = self._base_branch_for(repo_name, repo)
+
+            if branch == base_branch:
                 raise ToolException(
-                    f"Cannot commit directly to the {self.github_base_branch} branch. "
+                    f"Cannot commit directly to the {base_branch} branch. "
                     "Please create a new branch and try again."
                 )
             
@@ -2050,7 +2182,8 @@ class GitHubClient(BaseModel):
             - Whitelist and blacklist use Unix shell-style wildcards.
             - Files must match the whitelist and not the blacklist to be included.
         """
-        _files = self._get_files("", branch or self.active_branch, repo_name)
+        branch = branch or self._active_branch_for(repo_name)
+        _files = self._get_files("", branch, repo_name)
 
         def is_whitelisted(file_path: str) -> bool:
             if whitelist:
@@ -2066,7 +2199,7 @@ class GitHubClient(BaseModel):
             for file in _files:
                 if is_whitelisted(file) and not is_blacklisted(file):
                     yield {"file_name": file,
-                           "file_content": self._read_file(file, branch=branch or self.active_branch, repo_name=repo_name)}
+                           "file_content": self._read_file(file, branch=branch, repo_name=repo_name)}
 
         try:
             from ..chunkers.code.codeparser import parse_code_files_for_db
@@ -2087,7 +2220,7 @@ class GitHubClient(BaseModel):
             str: JSON string containing a list of branches
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             branches = repo.get_branches()
             
             # Limit the number of branches based on max_count
@@ -2116,21 +2249,14 @@ class GitHubClient(BaseModel):
             str: Success message or error
         """
         try:
-            # If repo_name is provided, we can't change the active branch for other repositories
-            if repo_name:
-                return (
-                    "Cannot set active branch for external repository. "
-                    "The active branch setting only applies to the default repository."
-                )
-
-            # Check if the branch exists
-            repo = self.github_repo_instance
+            repo = self._get_repo(repo_name)
             try:
                 repo.get_branch(branch_name)
-                self.active_branch = branch_name
-                return f"Active branch set to '{branch_name}'"
             except Exception:
-                return f"Branch '{branch_name}' not found in repository"
+                return f"Branch '{branch_name}' not found in repository {repo.full_name}"
+            # Recorded per repository, so switching one repository leaves the others alone.
+            self._record_active_branch(branch_name, repo_name)
+            return f"Active branch of {repo.full_name} set to '{branch_name}'"
         except Exception as e:
             return f"Failed to set active branch: {str(e)}"
 
@@ -2149,7 +2275,7 @@ class GitHubClient(BaseModel):
             str: A JSON string containing the workflow run details, including the run ID
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
 
             # First try to get the workflow by its filename
             try:
@@ -2193,7 +2319,7 @@ class GitHubClient(BaseModel):
             str: A JSON string containing details about the workflow run status
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
 
             # Get the workflow run
             run = repo.get_workflow_run(int(run_id))
@@ -2237,6 +2363,72 @@ class GitHubClient(BaseModel):
                 "message": f"An error occurred while getting workflow status: {str(e)}"
             }
 
+    @tool_group('read')
+    def get_workflow_runs(
+        self,
+        workflow_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        status: Optional[str] = None,
+        event: Optional[str] = None,
+        limit: int = 10,
+        repo_name: Optional[str] = None,
+    ) -> str:
+        """
+        Lists recent workflow runs, newest first. Use it to get the run_id for get_workflow_status/get_workflow_logs.
+
+        Parameters:
+            workflow_id (Optional[str]): Workflow ID or file name (e.g., 'build.yml'); None = all
+            branch (Optional[str]): Only this branch
+            status (Optional[str]): Status/conclusion filter (e.g., 'in_progress', 'failure')
+            event (Optional[str]): Trigger filter (e.g., 'push')
+            limit (int): Max runs (1-100, default 10)
+            repo_name (Optional[str]): 'owner/repo'
+        """
+        try:
+            limit = max(1, min(int(limit), 100))
+            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            filters = {k: v for k, v in (("branch", branch), ("status", status), ("event", event)) if v}
+
+            if workflow_id:
+                try:
+                    workflow = repo.get_workflow(workflow_id)
+                except Exception:
+                    workflow = next((wf for wf in repo.get_workflows() if str(wf.id) == str(workflow_id)), None)
+                    if workflow is None:
+                        return {
+                            "error": True,
+                            "message": f"Workflow with ID or filename '{workflow_id}' not found in repository {repo.full_name}",
+                        }
+                paginated = workflow.get_runs(**filters)
+            else:
+                paginated = repo.get_workflow_runs(**filters)
+
+            runs = []
+            for run in paginated:
+                if len(runs) >= limit:
+                    break
+                runs.append({
+                    "id": run.id,
+                    "name": run.name,
+                    "workflow_id": run.workflow_id,
+                    "run_number": run.run_number,
+                    "event": run.event,
+                    "status": run.status,
+                    "conclusion": run.conclusion,
+                    "created_at": run.created_at.isoformat() if run.created_at else None,
+                    "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+                    "head_branch": run.head_branch,
+                    "head_sha": run.head_sha,
+                    "url": run.html_url,
+                })
+
+            return {"repository": repo.full_name, "count": len(runs), "runs": runs}
+        except Exception as e:
+            return {
+                "error": True,
+                "message": f"An error occurred while getting workflow runs: {str(e)}"
+            }
+
     def _get_access_token(self) -> Optional[str]:
         """Get access token from auth_config for direct API calls."""
         if self.auth_config and self.auth_config.github_access_token:
@@ -2274,7 +2466,7 @@ class GitHubClient(BaseModel):
                 With include_logs=False: includes only job metadata in 'jobs' list.
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
 
             # Get the workflow run
             run = repo.get_workflow_run(int(run_id))
@@ -2464,7 +2656,7 @@ class GitHubClient(BaseModel):
             str: Success message with URL to the comment
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             issue = repo.get_issue(int(issue_number))
             new_comment = issue.create_comment(comment)
 
@@ -2482,15 +2674,15 @@ class GitHubClient(BaseModel):
             title (str): Title of the PR
             body (str): Description of the PR
             head (str): The current active branch containing the changes
-            base (Optional[str]): The target branch (defaults to github_base_branch)
+            base (Optional[str]): The target branch (defaults to the repository's base branch)
             repo_name (Optional[str]): Name of the repository in format 'owner/repo'
 
         Returns:
             str: Success message with PR URL and number
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
-            base_branch = base if base else self.github_base_branch
+            repo = self._get_repo(repo_name)
+            base_branch = base if base else self._base_branch_for(repo_name, repo)
 
             pr = repo.create_pull(
                 title=title,
@@ -2517,7 +2709,7 @@ class GitHubClient(BaseModel):
             labels and assignees.
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             issues = repo.get_issues(state=state)
 
             issue_list = [
@@ -2551,7 +2743,7 @@ class GitHubClient(BaseModel):
             str: A JSON string containing a list of open pull requests and their details
         """
         try:
-            repo = self.github_api.get_repo(repo_name) if repo_name else self.github_repo_instance
+            repo = self._get_repo(repo_name)
             open_prs = repo.get_pulls(state='open')
 
             # Limit the number of pull requests based on max_count
@@ -2579,7 +2771,8 @@ class GitHubClient(BaseModel):
             return f"Failed to list open pull requests: {str(e)}"
 
     @tool_group('execute')
-    def generic_github_api_call(self, method: str, method_kwargs: Optional[Dict[str, Any]] = None) -> str:
+    def generic_github_api_call(self, method: str, method_kwargs: Optional[Dict[str, Any]] = None,
+                                repo_name: Optional[str] = None) -> str:
         """
         Generic method to make API calls to GitHub.
         method will be the name of the method to call on the GitHub API (python library).
@@ -2588,6 +2781,7 @@ class GitHubClient(BaseModel):
         Parameters:
             method (str): The API method to call (e.g., 'get_repo', 'get_user', etc.).
             method_kwargs (Optional[Dict[str, Any]]): Keyword arguments for the API method.
+            repo_name (Optional[str]): Repository that repository-level methods run on, in format 'owner/repo'
 
         Returns:
             JSON string with the response from the API call or an appropriate error message.
@@ -2597,14 +2791,13 @@ class GitHubClient(BaseModel):
             method_kwargs = method_kwargs or {}
 
             if method == "get_repo" and "full_name_or_id" not in method_kwargs:
-                # You can customize the value based on your requirements
-                method_kwargs["full_name_or_id"] = self.github_repository
+                method_kwargs["full_name_or_id"] = self._resolve_repo_name(repo_name)
 
-            # Ensure `method` exists on the GitHub API or repository instance
+            # Account-level methods need no repository; only a repository-level one resolves it.
             if hasattr(self.github_api, method):
                 _method = getattr(self.github_api, method)
-            elif self.github_repo_instance and hasattr(self.github_repo_instance, method):
-                _method = getattr(self.github_repo_instance, method)
+            elif hasattr(Repository.Repository, method):
+                _method = getattr(self._get_repo(repo_name), method)
             else:
                 return f"API method '{method}' not found on GitHub API or repository instance."
 
@@ -2686,13 +2879,14 @@ class GitHubClient(BaseModel):
         sort: Optional[str] = None,
         order: Optional[str] = None,
         per_page: Optional[int] = 30,
-        page: Optional[int] = 1
+        page: Optional[int] = 1,
+        repo_name: Optional[str] = None
     ) -> str:
         """
-        Search for code in the configured repository using GitHub's code search.
+        Search for code in a repository using GitHub's code search.
 
-        NOTE: Searches are automatically scoped to this toolkit's repository.
-        You don't need to add repo: filter - it's added automatically.
+        NOTE: Searches are automatically scoped to repo_name, or to this toolkit's
+        repository when repo_name is empty. You don't need to add a repo: filter.
 
         Use this for finding:
         - Exact symbols, functions, or class names
@@ -2717,6 +2911,7 @@ class GitHubClient(BaseModel):
             order: Sort order - 'asc' or 'desc' (default: 'desc')
             per_page: Results per page (1-100, default: 30)
             page: Page number for pagination (default: 1)
+            repo_name: Repository to search in format 'owner/repo' (default: the toolkit's repository)
 
         Returns:
             str: JSON with total_count and items (file info, repo, matched content)
@@ -2728,23 +2923,24 @@ class GitHubClient(BaseModel):
                 "Examples: 'class MyClass language:python', 'def authenticate repo:owner/repo'"
             )
 
-        # Debug: log repository config
-        logger.info(f"[search_code] self.github_repository='{self.github_repository}', query='{query}'")
+        explicit_repo = self._normalize_repo_name(repo_name)
+        target_repo = (self.clean_repository_name(explicit_repo) if explicit_repo
+                       else (self.github_repository or "").strip())
+        logger.info(f"[search_code] target repository='{target_repo}', query='{query}'")
 
-        # Auto-scope to configured repository if not already specified
+        # Auto-scope to the target repository if not already specified
         query_lower = query.lower()
         has_scope = any(s in query_lower for s in ['repo:', 'org:', 'user:'])
-        has_repo = bool(self.github_repository and self.github_repository.strip())
 
-        if has_repo and not has_scope:
-            query = f"{query} repo:{self.github_repository}"
+        if target_repo and not has_scope:
+            query = f"{query} repo:{target_repo}"
             logger.info(f"[search_code] Auto-added repo filter, final query: '{query}'")
-        elif not has_repo and not has_scope:
+        elif not target_repo and not has_scope:
             # GitHub code search requires a scope qualifier
             raise ToolException(
-                f"GitHub code search requires a scope. This toolkit's repository='{self.github_repository}'. "
-                "Add repo:owner/repo, org:orgname, or user:username to your query. "
-                f"Example: '{query} repo:owner/repo'"
+                "GitHub code search requires a scope, and this toolkit has no repository configured. "
+                "Pass repo_name='owner/repo', or add repo:owner/repo, org:orgname, or user:username "
+                f"to your query. Example: '{query} repo:owner/repo'"
             )
 
         try:
@@ -2823,6 +3019,18 @@ class GitHubClient(BaseModel):
         except Exception as e:
             raise ToolException(f"Failed to search code: {str(e)}")
 
+    def _get_file_operation_schemas(self):
+        # The injected file operations take the same per-call repository as every other tool.
+        repo_field = (Optional[str], Field(default=None, description=REPO_NAME_DESCRIPTION))
+        return {
+            name: create_model(f"GitHub{schema.__name__}", __base__=schema, repo_name=repo_field)
+            for name, schema in (
+                ("read_multiple_files", ReadMultipleFilesInput),
+                ("grep_file", GrepFileInput),
+                ("edit_file", EditFileInput),
+            )
+        }
+
     @with_tool_groups
     @extend_with_file_operations
     def get_available_tools(self) -> List[Dict[str, Any]]:
@@ -2832,7 +3040,7 @@ class GitHubClient(BaseModel):
                 "name": "get_issues",
                 "mode": "get_issues",
                 "description": GET_ISSUES_PROMPT,
-                "args_schema": NoInput,
+                "args_schema": RepoOnlyInput,
             },
             {
                 "ref": self.get_issue,
@@ -2909,14 +3117,14 @@ class GitHubClient(BaseModel):
                 "name": "list_files_in_main_branch",
                 "mode": "list_files_in_main_branch",
                 "description": OVERVIEW_EXISTING_FILES_IN_MAIN,
-                "args_schema": NoInput,
+                "args_schema": RepoOnlyInput,
             },
             {
                 "ref": self.list_files_in_bot_branch,
                 "name": "list_files_in_bot_branch",
                 "mode": "list_files_in_bot_branch",
                 "description": "Lists files in the bot's currently active working branch.",
-                "args_schema": NoInput,
+                "args_schema": RepoOnlyInput,
             },
             {
                 "ref": self.list_branches_in_repo,
@@ -3029,6 +3237,13 @@ class GitHubClient(BaseModel):
                 "mode": "get_workflow_status",
                 "description": self.get_workflow_status.__doc__,
                 "args_schema": GetWorkflowStatus,
+            },
+            {
+                "ref": self.get_workflow_runs,
+                "name": "get_workflow_runs",
+                "mode": "get_workflow_runs",
+                "description": self.get_workflow_runs.__doc__,
+                "args_schema": GetWorkflowRuns,
             },
             {
                 "ref": self.get_workflow_logs,

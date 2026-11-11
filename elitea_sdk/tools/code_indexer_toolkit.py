@@ -91,6 +91,22 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             if row_content_hash == content_hash and row_identity != identity:
                 run.identity_backfill[str(row_id)] = identity
 
+    def _index_target(self, index_kwargs: dict) -> Dict[str, str]:
+        """Keyword arguments naming the repository an index run reads.
+
+        Passed explicitly to the listing and read calls, never stored on the wrapper,
+        because the loader runs on a prefetch thread alongside tool calls.
+        """
+        return {}
+
+    def _index_target_metadata(self, target: Dict[str, str]) -> Dict[str, str]:
+        """Document metadata recording which repository a file came from."""
+        return {}
+
+    def _index_branch(self, branch: Optional[str], target: Dict[str, str]) -> Optional[str]:
+        """The branch an index run reads when none is given."""
+        return self.__get_branch(branch)
+
     def _base_loader(
             self,
             branch: Optional[str] = None,
@@ -109,6 +125,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             skip_unsupported_extensions=skip_unsupported_extensions,
             index_name=kwargs.get("index_name") if getattr(run, "unchanged_skip_enabled", False) else None,
             preskipped_keys=getattr(run, "preskipped_keys", None),
+            target=self._index_target(kwargs),
         )
 
     def _extend_data(self, documents: Generator[Document, None, None]):
@@ -139,7 +156,8 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                chunking_config: Optional[dict] = None,
                skip_unsupported_extensions: bool = True,
                index_name: Optional[str] = None,
-               preskipped_keys: Optional[Set[str]] = None) -> Generator[Document, None, None]:
+               preskipped_keys: Optional[Set[str]] = None,
+               target: Optional[Dict[str, str]] = None) -> Generator[Document, None, None]:
         """
         Generates Documents from files in a branch, respecting whitelist and blacklist patterns.
 
@@ -152,6 +170,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         - chunking_config (Optional[dict]): Chunking configuration by file extension
         - skip_unsupported_extensions (bool): If True (default), skip files with unsupported extensions
                                               and report them. If False, process them with text chunker.
+        - target (Optional[dict]): Repository selection passed to the listing and read calls.
 
         Returns:
         - generator: Yields Documents from files matching the whitelist but not the blacklist.
@@ -189,10 +208,13 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
         self._init_indexing_stats()
 
-        listing = self.__list_files("", self.__get_branch(branch))
+        target = target or {}
+        target_metadata = self._index_target_metadata(target)
+        branch = self._index_branch(branch, target)
+        listing = self.__list_files("", branch, target)
         file_identities = listing if isinstance(listing, dict) else None
         _files = list(file_identities) if file_identities is not None \
-            else self.__handle_get_files("", self.__get_branch(branch), listing)
+            else self.__handle_get_files("", branch, listing, target)
 
         identity_skip_is_armed = bool(chunked and index_name and file_identities
                                       and preskipped_keys is not None)
@@ -295,7 +317,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
                 downloaded += 1
                 try:
-                    file_content = self._read_file(file, self.__get_branch(branch))
+                    file_content = self._read_file(file, branch, **target)
                 except Exception as e:
                     if quota_exhausted(e):
                         # Every remaining file would fail the same way. Skipping each in
@@ -327,6 +349,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                     'filename': file,
                     'source': file,
                     'commit_hash': file_hash,
+                    **target_metadata,
                 }
                 blob_sha = identity_confirmed_by(file, file_content)
                 if blob_sha:
@@ -373,8 +396,8 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
 
         return chunked_document_generator()
 
-    def __list_files(self, path: str, branch: str):
-        listing = self._get_files_with_identity(path=path, branch=branch)
+    def __list_files(self, path: str, branch: str, target: Dict[str, str]):
+        listing = self._get_files_with_identity(path=path, branch=branch, **target)
         if not isinstance(listing, dict):
             return listing
         if not all(isinstance(file_path, str) for file_path in listing):
@@ -384,12 +407,12 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
             for file_path, identity in listing.items()
         }
 
-    def __handle_get_files(self, path: str, branch: str, prefetched=None):
+    def __handle_get_files(self, path: str, branch: str, prefetched=None, target: Optional[Dict[str, str]] = None):
         """
         Handles the retrieval of files from a specific path and branch.
         This method should be implemented in subclasses to provide the actual file retrieval logic.
         """
-        _files = prefetched if prefetched is not None else self._get_files(path=path, branch=branch)
+        _files = prefetched if prefetched is not None else self._get_files(path=path, branch=branch, **(target or {}))
         if isinstance(_files, str):
             try:
                 # Attempt to convert the string to a list using ast.literal_eval

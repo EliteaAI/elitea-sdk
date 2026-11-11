@@ -5,6 +5,7 @@
 ```
 tests/tools/bitbucket/
 ├── __init__.py
+├── test_bitbucket_api_wrapper_runtime_target.py  # per-call project/repository target tests
 ├── test_bitbucket_delete_file.py     # delete_file tool tests (wrapper + Cloud/Server backends)
 ├── test_bitbucket_rate_limit.py      # Rate limit handling & retry logic tests
 ├── test_bitbucket_read_file_cap.py   # read_file/read_multiple_files output-cap tests
@@ -14,6 +15,20 @@ tests/tools/bitbucket/
 ---
 
 ## Coverage Matrix
+
+### `test_bitbucket_api_wrapper_runtime_target.py`
+
+**Scope:** The configured project/repository are optional defaults that each call may override.
+
+| Class | Covers |
+|-------|--------|
+| `TestResolution` | Runtime pair, then configured, then an actionable error; placeholders; path-segment validation of runtime targets; bounded client cache |
+| `TestToolkitsDoNotShareState` | Two wrappers keep their own client and branch; wrapper builds without a repository |
+| `TestBranchStateIsPerRepository` | Active branch per repository; default-branch lookup errors are actionable and not cached |
+| `TestCallsTargetTheNamedRepository` | Read, list, write and pull-request tools use the named repository |
+| `TestSchemas` | Every tool schema offers the target; optional toolkit fields; account-level connection check; Cloud detection |
+| `TestCloudClient` | A mistyped Cloud workspace raises an actionable `ToolException` |
+| `TestIndexTarget` | Index params carry the target; the loader records it in metadata |
 
 ### `test_bitbucket_delete_file.py`
 

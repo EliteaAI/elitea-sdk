@@ -80,9 +80,10 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
             github_base_url=github_base_url
         )
 
-        # Rest of initialization code remains the same
-        github_repository = get_from_dict_or_env(values, "github_repository", "GITHUB_REPOSITORY")
-        github_repository = GitHubClient.clean_repository_name(github_repository)
+        # The repository is only a default: tools and index runs can name another one per call.
+        github_repository = GitHubClient._normalize_repo_name(
+            get_from_dict_or_env(values, "github_repository", "GITHUB_REPOSITORY", default=""))
+        github_repository = GitHubClient.clean_repository_name(github_repository) if github_repository else None
 
         repo_config = GitHubRepoConfig(
             github_repository=github_repository,
@@ -136,7 +137,35 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
         
         return github_tools + graphql_tools
 
-    def _get_files(self, path: str = "", branch: str = None):
+    def _index_tool_params(self):
+        return {
+            **super()._index_tool_params(),
+            "repo_name": (Optional[str], Field(
+                default=None,
+                description="Repository to index in format 'owner/repo'. Leave empty to use the toolkit's "
+                            "repository; required only when the toolkit has no repository configured.")),
+        }
+
+    def _index_target(self, index_kwargs: dict) -> Dict[str, str]:
+        if not self.github_client_instance:
+            raise ValueError("GitHub client not initialized")
+        # Resolved before any listing, so an index without a repository fails with the actionable message.
+        return {"repo_name": self.github_client_instance._resolve_repo_name(index_kwargs.get("repo_name"))}
+
+    def _index_target_metadata(self, target: Dict[str, str]) -> Dict[str, str]:
+        return {"repository": target["repo_name"]} if target.get("repo_name") else {}
+
+    def _index_branch(self, branch: Optional[str], target: Dict[str, str]) -> Optional[str]:
+        # The toolkit's branches belong to its own repository; another one is read on its default branch.
+        repo_name = target.get("repo_name")
+        if branch or not self.github_client_instance or not self.github_client_instance._foreign_repo_key(repo_name):
+            return super()._index_branch(branch, target)
+        return self.github_client_instance._active_branch_for(repo_name)
+
+    def _branch_for(self, branch: Optional[str], repo_name: Optional[str]) -> str:
+        return branch or self.github_client_instance._active_branch_for(repo_name)
+
+    def _get_files(self, path: str = "", branch: str = None, repo_name: Optional[str] = None):
         """Get list of files from GitHub repository."""
         if not self.github_client_instance:
             raise ValueError("GitHub client not initialized")
@@ -144,30 +173,31 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
         # Deliberately not the client's _get_files, which stringifies failures for agents:
         # the indexer needs the exception so the provider's type and status survive.
         return list(self.github_client_instance._get_files_with_identity(
-            path, branch or self.active_branch))
+            path, self._branch_for(branch, repo_name), repo_name=repo_name))
 
-    def _get_files_with_identity(self, path: str = "", branch: str = None):
+    def _get_files_with_identity(self, path: str = "", branch: str = None, repo_name: Optional[str] = None):
         if not self.github_client_instance:
             raise ValueError("GitHub client not initialized")
 
         return self.github_client_instance._get_files_with_identity(
-            path, branch or self.active_branch)
+            path, self._branch_for(branch, repo_name), repo_name=repo_name)
 
-    def _file_commit_hash(self, file_path: str, branch: str):
+    def _file_commit_hash(self, file_path: str, branch: str, repo_name: Optional[str] = None):
         """Get the commit hash of a file in the GitHub repository."""
         if not self.github_client_instance:
             raise ValueError("GitHub client not initialized")
 
         # Use the GitHub client's method to get commit hash
-        return self.github_client_instance._file_commit_hash(file_path, branch or self.active_branch)
+        return self.github_client_instance._file_commit_hash(
+            file_path, self._branch_for(branch, repo_name), repo_name=repo_name)
 
-    def _read_file(self, file_path: str, branch: str):
+    def _read_file(self, file_path: str, branch: str, repo_name: Optional[str] = None):
         """Read file content from GitHub repository."""
         if not self.github_client_instance:
             raise ValueError("GitHub client not initialized")
         
         # Use the GitHub client's method to read file
-        return self.github_client_instance._read_file(file_path, branch)
+        return self.github_client_instance._read_file(file_path, branch, repo_name=repo_name)
 
     def run(self, name: str, *args: Any, **kwargs: Any):
         for tool in self.get_available_tools():

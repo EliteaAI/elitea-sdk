@@ -869,7 +869,7 @@ class TestRegistration:
     def test_get_image_by_url_registered(self):
         tools = _make_wrapper().get_available_tools()
         entry = next(tool for tool in tools if tool["name"] == "get_image_by_url")
-        assert entry["args_schema"] is ADOGetImageByUrl
+        assert issubclass(entry["args_schema"], ADOGetImageByUrl)
 
     def test_get_comments_schema_defaults(self):
         assert ADOGetComments.model_fields["process_images"].default is False

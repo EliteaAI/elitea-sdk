@@ -23,6 +23,7 @@ from pydantic.fields import Field
 
 import elitea_sdk.tools.ado.work_item
 from ..repos import ReposApiWrapper
+from ..utils import AdoProjectScope, in_caller_context, with_project_argument
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils import normalize_base_url
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
@@ -257,11 +258,12 @@ def _format_wiki_response(wiki_response):
         return {"error": f"Unable to format wiki response: {str(e)}"}
 
 
-class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
+class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
     index_item_labels = ('page', 'pages')
     # TODO use ado_configuration instead of organization_url, project and token
     organization_url: str
-    project: str
+    # Default project; each tool call may target another one
+    project: Optional[str] = None
     token: SecretStr
     default_wiki_identifier: Optional[str] = None
     _client: Optional[WikiClient] = PrivateAttr()  # Private attribute for the wiki client
@@ -340,7 +342,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Extract ADO wiki information."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            wiki_response = self._client.get_wiki(project=self.project, wiki_identifier=wiki_id)
+            wiki_response = self._client.get_wiki(project=self._project(), wiki_identifier=wiki_id)
             return _format_wiki_response(wiki_response)
         except Exception as e:
             logger.error(f"Error during the attempt to extract wiki: {str(e)}")
@@ -351,7 +353,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Extract ADO wiki page content."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            content = self._client.get_page(project=self.project, wiki_identifier=wiki_id, path=page_name,
+            content = self._client.get_page(project=self._project(), wiki_identifier=wiki_id, path=page_name,
                                             include_content=True).page.content
             if process_images:
                 return self._process_images(content, image_description_prompt=image_description_prompt, wiki_identified=wiki_id)
@@ -365,7 +367,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Extract ADO wiki page content."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_id, id=page_id,
+            content = self._client.get_page_by_id(project=self._project(), wiki_identifier=wiki_id, id=page_id,
                                                    include_content=True).page.content
             if process_images:
                 return self._process_images(content, image_description_prompt=image_description_prompt, wiki_identified=wiki_id)
@@ -416,7 +418,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             if page_id:
                 logger.info(f"Fetching wiki page by ID: {page_id} from wiki: {wiki_id}")
                 wiki_page_response = self._client.get_page_by_id(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     id=page_id,
                     include_content=include_content,
@@ -425,7 +427,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             else:
                 logger.info(f"Fetching wiki page by path: {page_path} from wiki: {wiki_id}")
                 wiki_page_response = self._client.get_page(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     path=page_path,
                     include_content=include_content,
@@ -520,19 +522,20 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     def _get_repos_wrapper(self, wiki_identified: str) -> Optional["ReposApiWrapper"]:
         """Return a ReposApiWrapper bound to the wikiMaster branch of the given wiki.
 
-        Cached per wiki identifier on the instance so index-time processing of many
+        Cached per (project, wiki identifier) on the instance so index-time processing of many
         pages doesn't rebuild the wrapper (and its azure-devops Connection) per page.
         Returns None when the wiki cannot be resolved — callers must handle that.
         """
         cache = self.__dict__.setdefault("_repos_wrapper_cache", {})
-        cached = cache.get(wiki_identified)
+        cache_key = (self._project(), wiki_identified)
+        cached = cache.get(cache_key)
         if cached is not None:
             return cached
         try:
-            wiki = self._client.get_wiki(project=self.project, wiki_identifier=wiki_identified)
+            wiki = self._client.get_wiki(project=self._project(), wiki_identifier=wiki_identified)
             repos_wrapper = ReposApiWrapper(
                 organization_url=self.organization_url,
-                project=self.project,
+                project=self._project(),
                 token=self.token.get_secret_value(),
                 repository_id=wiki.repository_id,
                 base_branch="wikiMaster",
@@ -542,7 +545,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             logger.error(f"Failed to initialize repos wrapper for wiki '{wiki_identified}': {str(e)}")
             return None
-        cache[wiki_identified] = repos_wrapper
+        cache[cache_key] = repos_wrapper
         return repos_wrapper
 
     def _process_images(self, page_content: str, wiki_identified: str, image_description_prompt=None):
@@ -656,7 +659,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 max_workers=max_workers,
                 thread_name_prefix="ado-wiki-img",
             ) as executor:
-                results = list(executor.map(_describe_image, items))
+                results = list(executor.map(in_caller_context(_describe_image), items))
 
         for image_name, image_url, description in results:
             if description is None:
@@ -681,7 +684,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Delete ADO wiki page by path."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            self._client.delete_page(project=self.project, wiki_identifier=wiki_id, path=page_name)
+            self._client.delete_page(project=self._project(), wiki_identifier=wiki_id, path=page_name)
             return f"Page '{page_name}' in wiki '{wiki_id}' has been deleted"
         except Exception as e:
             logger.error(f"Unable to delete wiki page: {str(e)}")
@@ -692,7 +695,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Delete ADO wiki page by ID."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            self._client.delete_page_by_id(project=self.project, wiki_identifier=wiki_id, id=page_id)
+            self._client.delete_page_by_id(project=self._project(), wiki_identifier=wiki_id, id=page_id)
             return f"Page with id '{page_id}' in wiki '{wiki_id}' has been deleted"
         except Exception as e:
             logger.error(f"Unable to delete wiki page: {str(e)}")
@@ -715,7 +718,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
             try:
                 return self._client.create_page_move(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     comment=f"Page rename from '{old_page_name}' to '{new_page_name}'",
                     page_move_parameters=WikiPageMoveParameters(new_path=new_page_name, path=old_page_name),
@@ -725,7 +728,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 if "The version '{0}' either is invalid or does not exist." in str(e):
                     # Retry the request without version_descriptor
                     return self._client.create_page_move(
-                        project=self.project,
+                        project=self._project(),
                         wiki_identifier=wiki_id,
                         comment=f"Page rename from '{old_page_name}' to '{new_page_name}'",
                         page_move_parameters=WikiPageMoveParameters(new_path=new_page_name, path=old_page_name),
@@ -741,7 +744,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Create or Update ADO wiki page content."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            all_wikis = [wiki.name for wiki in self._client.get_all_wikis(project=self.project)]
+            all_wikis = [wiki.name for wiki in self._client.get_all_wikis(project=self._project())]
             if wiki_id not in all_wikis:
                 logger.info(f"wiki name '{wiki_id}' doesn't exist. New wiki will be created.")
                 try:
@@ -749,17 +752,17 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     projects = self._core_client.get_projects()
 
                     for project in projects:
-                        if project.name == self.project:
+                        if project.name == self._project():
                             project_id = project.id
                             break
                     if project_id:
-                        self._client.create_wiki(project=self.project, wiki_create_params=WikiCreateParametersV2(name=wiki_id, project_id=project_id))
+                        self._client.create_wiki(project=self._project(), wiki_create_params=WikiCreateParametersV2(name=wiki_id, project_id=project_id))
                     else:
                         return "Project ID has not been found."
                 except Exception as create_wiki_e:
                     raise ToolException(f"Unable to create new wiki due to error: {create_wiki_e}")
             try:
-                page = self._client.get_page(project=self.project, wiki_identifier=wiki_id, path=page_name)
+                page = self._client.get_page(project=self._project(), wiki_identifier=wiki_id, path=page_name)
                 version = page.eTag
             except Exception as get_page_e:
                 if "Ensure that the path of the page is correct and the page exists" in str(get_page_e):
@@ -770,7 +773,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
             try:
                 return _format_wiki_page_response(self._client.create_or_update_page(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     path=page_name,
                     parameters=WikiPageCreateOrUpdateParameters(content=page_content),
@@ -781,7 +784,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 if "The version '{0}' either is invalid or does not exist." in str(e):
                     # Retry the request without version_descriptor
                     return _format_wiki_page_response(wiki_page_response=self._client.create_or_update_page(
-                        project=self.project,
+                        project=self._project(),
                         wiki_identifier=wiki_id,
                         path=page_name,
                         parameters=WikiPageCreateOrUpdateParameters(content=page_content),
@@ -802,7 +805,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         the same call via the underlying Client._send so we can read the header.
         """
         route_values = {
-            'project': self._client._serialize.url('project', self.project, 'str'),
+            'project': self._client._serialize.url('project', self._project(), 'str'),
             'wikiIdentifier': self._client._serialize.url('wiki_identifier', wiki_identifier, 'str'),
         }
         continuation_token: Optional[str] = None
@@ -849,7 +852,11 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     # LLM rate limits, and pgvector pool exhaustion.
     _MAX_WORKERS = 10
 
-    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None,
+    def _base_loader(self, *args, project=None, **kwargs) -> Generator[Document, None, None]:
+        # run() already put the call's project in scope; it only rides along to be recorded
+        return self._load_in_project(lambda: self._load_pages(*args, **kwargs))
+
+    def _load_pages(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None,
                      path_contains: Optional[str] = None,
                      process_images: bool = False,
                      image_description_prompt: Optional[str] = None,
@@ -889,13 +896,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             Returns (page, raw_content). Any exception propagates via Future.result().
             """
             resp = self._client.get_page_by_id(
-                project=self.project,
+                project=self._project(),
                 wiki_identifier=wiki_identifier,
                 id=page.id,
                 include_content=True,
             )
             return page, resp.page.content
 
+        fetch_page_content = in_caller_context(_fetch_page_content)
         executor = ThreadPoolExecutor(
             max_workers=self._index_workers,
             thread_name_prefix="ado-wiki-fetch",
@@ -919,7 +927,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     self._track_skipped_document(page.path, reason="filtered")
                     # Re-submit so we still fill the pool with a real fetch.
                     return _submit_next()
-                fut = executor.submit(_fetch_page_content, page)
+                fut = executor.submit(fetch_page_content, page)
                 futures_queue.append((page_idx, page.path, page.id, fut))
                 return True
 
@@ -1119,6 +1127,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
+        return self._in_document_project(document, lambda: self._process_page(document))
+
+    def _process_page(self, document: Document) -> Generator[Document, None, None]:
         """Emit each referenced /.attachments/ file as a dependent Document, and
         optionally rewrite the parent page's inline images with LLM descriptions.
 
@@ -1202,7 +1213,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 max_workers=max_workers,
                 thread_name_prefix="ado-wiki-att",
             )
-            results_iter = executor.map(_fetch, eligible)
+            results_iter = executor.map(in_caller_context(_fetch), eligible)
 
         try:
             for item, attachment_bytes, err in results_iter:
@@ -1327,8 +1338,10 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     "and the pgvector connection pool. Values above 10 are clamped."
                 ),
             )),
+            **self._project_field(),
         }
 
+    @with_project_argument
     @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):

@@ -26,8 +26,10 @@ UNRESOLVED_BUDGET = 42
 
 def _model_fields(call, tree, path, seen, bindings=None):
     """Field names of a create_model call, following __base__ into its parents."""
-    if not isinstance(call, ast.Call) or getattr(call.func, 'id', '') != 'create_model':
+    if not isinstance(call, ast.Call):
         return None
+    if getattr(call.func, 'id', '') != 'create_model':
+        return _factory_fields(call, tree, path, seen, bindings)
     fields = set()
     for keyword in call.keywords:
         if keyword.arg == '__base__':
@@ -40,6 +42,26 @@ def _model_fields(call, tree, path, seen, bindings=None):
         else:
             fields.add(keyword.arg)
     return fields
+
+
+def _factory_fields(call, tree, path, seen, bindings):
+    """Fields of `factory(name, **fields)`, a module function returning create_model.
+
+    qtest builds every schema through one: the call's own keywords are the tool's
+    fields, and the factory's create_model adds the ones it appends to all of them.
+    """
+    if not isinstance(call.func, ast.Name):
+        return None
+    factory = _module_methods(tree).get(call.func.id)
+    if factory is None or factory.args.kwarg is None:
+        return None
+    for inner in ast.walk(factory):
+        if isinstance(inner, ast.Return) and isinstance(inner.value, ast.Call) \
+                and getattr(inner.value.func, 'id', '') == 'create_model':
+            added = {keyword.arg for keyword in inner.value.keywords if keyword.arg}
+            own = {keyword.arg for keyword in call.keywords if keyword.arg}
+            return own | added
+    return None
 
 
 def _module_methods(tree):

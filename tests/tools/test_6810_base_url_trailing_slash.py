@@ -80,6 +80,7 @@ class TestGitHub:
                 patch.object(gh_module.CodeIndexerToolkit, "validate_toolkit",
                              side_effect=lambda values: values, create=True):
             client_cls.clean_repository_name.side_effect = lambda name: name
+            client_cls._normalize_repo_name.side_effect = lambda name: name
             try:
                 gh_module.EliteAGitHubAPIWrapper(
                     base_url=base_url, access_token='t', github_repository='org/repo',
@@ -152,7 +153,7 @@ class TestAzureDevOps:
 
         with patch.object(module, 'Connection') as connection_cls:
             try:
-                wrapper_cls(organization_url='https://dev.azure.com/my-org/', project='p', token='t')
+                wrapper_cls(organization_url='https://dev.azure.com/my-org/', project='p', token='t', llm=None)
             except Exception:
                 # Downstream init on mocked clients is out of scope; only the URL matters
                 pass
@@ -185,7 +186,7 @@ class TestBitbucket:
             try:
                 bb_module.BitbucketAPIWrapper(
                     url='https://bitbucket.example.com/', username='u', password='p',
-                    project='PRJ', repository='repo', cloud=cloud,
+                    project='PRJ', repository='repo', cloud=cloud, llm=None,
                 )
             except Exception:
                 pass

@@ -257,8 +257,11 @@ The client acts as its caller: the user who owns the `API_KEY` token.
 It has the same rights as that user has in the UI.
 
 - A regular user sees only their own schedules. Another user's schedule answers 404.
-- A project admin sees every schedule of the project. An admin may edit, pause, resume and delete any of them, and change the owner.
-- Only the owner may run a schedule. An admin who runs another user's schedule gets 403.
+- A user with the `schedules.admin` permission (a project admin) sees every schedule of the project. They may edit, pause, resume and delete any of them, change the owner, and run them now.
+- The owner and any user with the `schedules.admin` permission may run a schedule now (Test). They also need the `schedules.run` permission. A user who is neither the owner nor a `schedules.admin` user gets 404, because the schedule is outside their scope.
+- Only the schedule owner may approve or reject a run in status `waiting_for_approval`, or answer its sign-in request (Authorize or Skip). This holds for every run tied to a schedule or webhook: a cron run, a webhook run, and Run now, also when a project admin started it. Any other caller gets 403, a project admin included. A member who is neither the owner nor an admin gets 404 on the REST routes, because the schedule is hidden from them.
+- An admin's Run now acts with the admin's credentials. This includes Run now on an index schedule of another owner: it is allowed and runs as the admin. Run without asking does not apply to it, so it always pauses before a sensitive action, and the schedule owner decides. A draft Test run has no schedule row and stays with the user who started it.
+- A project admin may pause, resume, change the owner, delete, Run now, and start a Test run as themselves. After Change owner, a waiting run stays with the owner it had when it started: the old owner keeps it and the new owner gets 403 on it. New runs go to the new owner.
 - Each schedule has `allowed_actions`: the actions the caller may take on it.
 
 ## Errors
@@ -279,8 +282,8 @@ Every refusal of the Schedules API has the same `body`:
 | Status | Meaning |
 |---|---|
 | 400 | A field is not valid: `code` is `invalid_input` and `field` names the field, for example a bad `cron` or a `run_mode` rule. |
-| 403 | The caller lacks the right for this action, for example a user without schedule rights. An admin who runs another user's schedule gets `code` `not_owner`. |
-| 404 | The schedule does not exist, or it belongs to another user and the caller is not an admin: `code` is `not_found` (`run_not_found` for a run). |
+| 403 | The caller lacks the right for this action, for example a user without the `schedules.run` permission. A caller who is not the schedule owner of the run and approves, rejects or answers a sign-in (Authorize or Skip) also gets 403, a project admin included. After Change owner, the new owner gets 403 on a run that started under the old owner. The REST decision route answers with `code` `not_owner`. The chat answer has `error` and `status`, but no `code`. |
+| 404 | The schedule does not exist, or it belongs to another user and the caller does not have the `schedules.admin` permission: `code` is `not_found` (`run_not_found` for a run). This includes Run now, approve and reject. |
 | 409 | Run now: a run of this schedule is still active. `code` is `run_active`, and `body["active_run_id"]` is the id of the active run. It is null when that run belongs to another user or is an index run that has no run row. Resume: the project has its maximum number of active schedules. |
 
 `update_schedule` with `enabled` raises `ValueError` before any request.
