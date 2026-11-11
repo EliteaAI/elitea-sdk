@@ -144,7 +144,8 @@ class SharepointToolkit(BaseToolkit):
                 description=(
                     "List fields to copy into document metadata. Empty: all simple fields, stored under readable "
                     "snake_case names. Name a field as list_library_categories shows it; Field=name chooses the "
-                    "metadata name and * keeps all other fields, for example: *, area=category."
+                    "metadata name and * keeps all other fields, for example: *, area=category. A field whose "
+                    "default name is taken by a mapping keeps its value as <name>_original."
                 ),
             )),
             categories=(List[str], Field(

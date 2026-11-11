@@ -265,7 +265,8 @@ def test_category_filter_keeps_only_selected_categories():
     files = [graph_file(P1), graph_file(P2), graph_file(P3), graph_file("/sites/handbook/Handbook Library/Unlisted.pdf")]
     kept, counts, _ = join(files, categories=["people"])
     assert [k["document_id"] for k in kept] == ["HB-002", "HB-003"]
-    assert counts.category_skipped == 2   # the travel file and the file without a list item
+    assert counts.category_skipped == 1    # the travel file
+    assert counts.unmatched_skipped == 1   # the file without a list item is counted apart
 
 
 def test_categories_need_library_lists():
@@ -713,8 +714,8 @@ def test_mapping_accepts_the_readable_names_the_helper_shows():
     assert plan["TopicArea"] == "category"
     assert plan["HBDocumentID_x0020_"] == "document_id"
     assert plan["RegionCountry"] == "country" and plan["Title"] == "title"
-    # the field that held the default `category` name gives it up to the explicit mapping
-    assert "DocCategory" not in plan
+    # the field that held the default `category` name gives it up and keeps its value under another name
+    assert plan["DocCategory"] == "category_original"
 
 
 def test_mapping_without_star_copies_only_named_fields():
@@ -735,3 +736,63 @@ def test_toolkit_form_gets_plain_array_settings():
     props = SharepointToolkit.toolkit_config_schema().model_json_schema()["properties"]
     for key in ("library_lists", "metadata_fields", "categories"):
         assert props[key]["type"] == "array" and props[key]["default"] == []
+
+
+# --------------------------------------------------------------------------- #
+#  Delta review follow-ups                                                     #
+# --------------------------------------------------------------------------- #
+
+def test_categories_without_a_category_field_fail_loudly(monkeypatch):
+    lists = {LIB_ID: [item(1, P1, TopicArea="Travel")]}
+    w = _wrapper(monkeypatch, [graph_file(P1)], FakeGraph(lists), library_lists=[LIB], categories=["Travel"])
+    with pytest.raises(lm.LibraryMetadataError, match="needs a list field stored as `category`"):
+        list(w._base_loader(limit_files=10))
+
+
+def test_a_mistyped_category_mapping_fails_loudly_too(monkeypatch):
+    lists = {LIB_ID: [item(1, P1, TopicArea="Travel")]}
+    w = _wrapper(monkeypatch, [graph_file(P1)], FakeGraph(lists), library_lists=[LIB],
+                 metadata_fields=["*", "Aera=category"], categories=["Travel"])
+    with pytest.raises(lm.LibraryMetadataError, match="area=category"):
+        list(w._base_loader(limit_files=10))
+
+
+def test_unmatched_files_under_the_filter_are_counted_and_logged(monkeypatch, caplog):
+    files = [graph_file(P1), graph_file("/sites/handbook/Handbook Library/Unlisted.pdf")]
+    w = _wrapper(monkeypatch, files, FakeGraph(standard_lists()), library_lists=[LIB], categories=["People"])
+    with caplog.at_level(logging.INFO):
+        assert list(w._base_loader(limit_files=10)) == []
+    assert "'category_skipped': 1" in caplog.text and "'unmatched_skipped': 1" in caplog.text
+
+
+def test_a_mapping_never_drops_the_field_whose_name_it_takes():
+    plan = lm.FieldMapper(settings(metadata_fields=["*", "Area=category"])).plan(["Area", "Category", "DocumentOwner"])
+    assert plan == {"Area": "category", "Category": "category_original", "DocumentOwner": "owner"}
+
+
+def test_unresolved_field_settings_are_reported(monkeypatch, caplog):
+    w = _wrapper(monkeypatch, [], FakeGraph(standard_lists()), library_lists=[LIB],
+                 metadata_fields=["*", "Aera=category", "Nope"])
+    result = w.list_library_categories()
+    assert result["unresolved_metadata_fields"] == ["Aera", "Nope"]
+    with caplog.at_level(logging.WARNING):
+        list(w._base_loader(limit_files=10))
+    assert "2 metadata field setting(s) match no field" in caplog.text
+
+
+def test_listing_limit_under_the_filter_is_a_typed_failure(monkeypatch):
+    monkeypatch.setattr("elitea_sdk.tools.sharepoint.api_wrapper.LIBRARY_LISTING_LIMIT", 3)
+    files = [graph_file(f"/sites/handbook/Handbook Library/f{i}.pdf") for i in range(3)]
+    w = _wrapper(monkeypatch, files, FakeGraph(standard_lists()), library_lists=[LIB], categories=["People"])
+    with pytest.raises(lm.LibraryMetadataError, match="at most 3 files"):
+        list(w._base_loader(limit_files=1))
+    w = _wrapper(monkeypatch, files[:2], FakeGraph(standard_lists()), library_lists=[LIB], categories=["People"])
+    assert list(w._base_loader(limit_files=1)) == []      # under the limit: a normal run
+
+
+def test_paging_link_compares_path_segments():
+    expected = "/v1.0/sites/site,1,2/lists/L1/items"
+    with pytest.raises(lm.LibraryMetadataError, match="paging link"):
+        lm._checked_next_link(f"https://{lm.GRAPH_HOST}/v1.0/sites/site,1,2/lists/L1%2Fitems?skip=1", expected)
+    ok = f"https://{lm.GRAPH_HOST}/v1.0/sites/site%2C1%2C2/lists/L1/items?skip=1"
+    assert lm._checked_next_link(ok, expected) == ok

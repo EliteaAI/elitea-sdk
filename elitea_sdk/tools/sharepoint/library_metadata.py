@@ -232,6 +232,7 @@ class FieldMapper:
 
     def __init__(self, settings: LibrarySettings):
         self._explicit = settings.field_map
+        self.resolved: set = set()      # explicit entries that matched a field of some list
 
     def plan(self, field_names: Iterable[str]) -> Dict[str, str]:
         """{source field: metadata key}.
@@ -256,11 +257,17 @@ class FieldMapper:
             snake = normalize_field_name(source)
             actual = by_lower.get(source.lower()) or by_readable.get(snake) or by_snake.get(snake)
             if actual:
+                self.resolved.add(source)
                 explicit[actual] = target or defaults.get(actual) or normalize_field_name(actual)
         taken = set(explicit.values())
-        plan = {src: tgt for src, tgt in plan.items() if src not in explicit and tgt not in taken}
+        # A field whose default name an explicit mapping took keeps its value under `<name>_original`.
+        plan = {src: (f"{tgt}_original" if tgt in taken else tgt)
+                for src, tgt in plan.items() if src not in explicit}
         plan.update(explicit)
         return self._dedupe(plan)
+
+    def unresolved(self) -> set:
+        return {source for source, _ in self._explicit if source != "*"} - self.resolved
 
     @staticmethod
     def _default_plan(names: List[str]) -> Dict[str, str]:
@@ -490,7 +497,8 @@ def _checked_next_link(link: Any, expected_path: str) -> Optional[str]:
     if not isinstance(link, str) or _CONTROL_RE.search(link) or not is_graph_url(link):
         raise LibraryMetadataError("SharePoint returned a paging link to another location.")
     parts = urlsplit(link)
-    if parts.username or parts.password or parts.fragment or unquote(parts.path) != unquote(expected_path):
+    same_path = [unquote(seg) for seg in parts.path.split("/")] == [unquote(seg) for seg in expected_path.split("/")]
+    if parts.username or parts.password or parts.fragment or not same_path:
         raise LibraryMetadataError("SharePoint returned a paging link to another location.")
     return link
 
@@ -523,10 +531,12 @@ class LibraryEntry:
 class JoinCounts:
     by_path: int = 0
     by_name: int = 0
-    no_metadata: int = 0
-    ambiguous: int = 0
-    category_skipped: int = 0
+    no_metadata: int = 0              # kept files without a list item
+    ambiguous: int = 0                # kept files whose name several items share
+    category_skipped: int = 0         # joined files of another category
+    unmatched_skipped: int = 0        # files the categories filter dropped because no single item matched
     list_items: int = 0
+    unresolved_fields: int = 0        # metadata field settings that matched no field
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -537,6 +547,7 @@ class LibraryIndex:
     entries: List[LibraryEntry] = field(default_factory=list)
     by_path: Dict[str, List[LibraryEntry]] = field(default_factory=dict)
     by_name: Dict[str, List[LibraryEntry]] = field(default_factory=dict)
+    unresolved_fields: set = field(default_factory=set)
 
     def add(self, entry: LibraryEntry) -> None:
         self.entries.append(entry)
@@ -548,8 +559,9 @@ class LibraryIndex:
     def match(self, file_meta: Dict[str, Any]) -> Tuple[Optional[LibraryEntry], str]:
         """(entry, how) with how in {'path', 'name', 'ambiguous', 'none'}.
 
-        The name fallback never lends a list item to a file that lives outside that item's own
-        library: a same-named file elsewhere on the site is 'none', not a match."""
+        When both the file's path and the item's library root are known, the name fallback never
+        lends a list item to a file outside that library: a same-named file elsewhere on the site is
+        'none'. Without a file path or a library root the name fallback is unrestricted."""
         file_path = None
         for key in ("Link", "Path", "web_url"):
             path = _server_relative_path(file_meta.get(key))
@@ -594,7 +606,16 @@ def build_index(client: GraphListClient, settings: LibrarySettings) -> LibraryIn
                 root=root))
         logger.info("[SP-library] list %d of %d: %d items, %d fields copied",
                     position, len(resolved), len(items), len(plan))
+    index.unresolved_fields = mapper.unresolved()
     return index
+
+
+CATEGORY_MAPPING_HINT = ("Map one in Metadata fields with the name list_library_categories shows, "
+                         "for example `*, area=category`.")
+
+
+def has_categories(index: LibraryIndex) -> bool:
+    return any(_categories_of(entry.metadata) for entry in index.entries)
 
 
 def _categories_of(metadata: Dict[str, Any]) -> List[str]:
@@ -612,7 +633,7 @@ def apply_library_metadata(file_meta: Dict[str, Any], index: LibraryIndex, setti
     if entry is None:
         status = STATUS_AMBIGUOUS if how == "ambiguous" else STATUS_NO_METADATA
         if settings.categories:
-            counts.category_skipped += 1
+            counts.unmatched_skipped += 1
             return False
         file_meta["metadata_status"] = status
         if how == "ambiguous":

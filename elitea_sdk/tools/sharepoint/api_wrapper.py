@@ -22,8 +22,9 @@ from .graph_wrapper import SharepointGraphWrapper
 from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
 from .library_metadata import (
-    LIBRARY_LISTING_LIMIT, STATUS_AMBIGUOUS, STATUS_OK, JoinCounts, LibraryIndex, LibrarySettings,
-    apply_library_metadata, build_index, category_values, report_label,
+    CATEGORY_MAPPING_HINT, LIBRARY_LISTING_LIMIT, STATUS_AMBIGUOUS, STATUS_OK, JoinCounts, LibraryIndex,
+    LibraryMetadataError, LibrarySettings, apply_library_metadata, build_index, category_values,
+    has_categories, report_label,
 )
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.file_metadata import bound_read_result, describe_requested_range
@@ -1154,6 +1155,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     message="List of the files has been extracted", tool_name="loader")
             except Exception as e:
                 raise ToolException(f"Unable to extract files: {e}")
+            if list_limit > limit_files and len(all_files) >= list_limit:
+                raise LibraryMetadataError(
+                    f"The categories filter looks at most {list_limit} files and the library has more. "
+                    "Narrow the scope with Path or Form Name.")
 
             kept = 0
             for file in all_files:
@@ -1168,9 +1173,6 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 kept += 1
                 yield Document(page_content="", metadata=metadata)
             if library is not None:
-                if list_limit > limit_files and len(all_files) >= list_limit:
-                    logging.warning("[SP-library] listing reached %d files; later files were not considered",
-                                    list_limit)
                 logging.info("[SP-library] join: %s", library[2].as_dict())
 
         # ── OneNote pages ─────────────────────────────────────────────
@@ -1193,7 +1195,14 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             return None
         self._log_tool_event(message="Reading the library lists", tool_name="loader")
         index = build_index(self._backend.library_list_client(), settings)
-        counts = JoinCounts(list_items=len(index.entries))
+        counts = JoinCounts(list_items=len(index.entries), unresolved_fields=len(index.unresolved_fields))
+        if index.unresolved_fields:
+            logging.warning("[SP-library] %d metadata field setting(s) match no field of the lists",
+                            len(index.unresolved_fields))
+        if settings.categories and not has_categories(index):
+            raise LibraryMetadataError(
+                "The categories filter needs a list field stored as `category`, and none of the library lists "
+                f"has one. {CATEGORY_MAPPING_HINT}")
         self._log_tool_event(
             message=f"Library lists read: {len(index.entries)} items", tool_name="loader")
         return settings, index, counts
@@ -1233,9 +1242,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             "metadata_fields": fields,
             "categories": category_values(index),
         }
+        if index.unresolved_fields:
+            result["unresolved_metadata_fields"] = sorted(index.unresolved_fields)
         if 'category' not in fields:
-            result["note"] = ("No field is stored as `category`. Map one in Metadata fields, "
-                              "for example `DocumentCategory=category`.")
+            result["note"] = f"No field is stored as `category`. {CATEGORY_MAPPING_HINT}"
         return result
 
     def _onenote_base_loader(
