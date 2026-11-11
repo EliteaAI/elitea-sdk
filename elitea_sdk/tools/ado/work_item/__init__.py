@@ -10,6 +10,7 @@ from ....configurations.ado import AdoConfiguration
 from ....configurations.pgvector import PgVectorConfiguration
 from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...base.tool import BaseAction
+from ..utils import check_organization_access
 from ...utils import clean_string, get_max_toolkit_length, check_connection_response, normalize_base_url
 from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
@@ -19,7 +20,7 @@ def get_toolkit(tool):
     return AzureDevOpsWorkItemsToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         ado_configuration=tool['settings']['ado_configuration'],
-        project=tool['settings']['project'],
+        project=tool['settings'].get('project'),
         limit=tool['settings'].get('limit', 5),
         toolkit_name=tool.get('toolkit_name', ''),
         elitea=tool['settings'].get('elitea', None),
@@ -42,7 +43,7 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
         m = create_model(
             name,
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), json_schema_extra={'configuration_types': ['ado']})),
-            project=(str, Field(description="ADO project name")),
+            project=(Optional[str], Field(default=None, description="Default ADO project; leave empty to let each tool call name the project")),
             limit=(Optional[int], Field(description="Default ADO boards result limit (can be overridden by agent instructions)", default=5, gt=0)),
             selected_tools=(List[Literal[tuple(selected_tools)]], Field(default=[], json_schema_extra={'args_schemas': selected_tools, 'tool_groups': tool_groups})),
             # indexer settings
@@ -83,9 +84,9 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
             if not ado_config:
                 raise ValueError("ADO configuration is required")
             project = self.project
-            if not project:
-                raise ValueError("ADO project is required")
             token = ado_config.token.get_secret_value() if ado_config.token else ""
+            if not project:
+                return check_organization_access(normalize_base_url(ado_config.organization_url), token)
             response = requests.get(
                 f'{normalize_base_url(ado_config.organization_url)}/{project}/_apis/wit/workitemtypes?api-version=7.0',
                 headers={'Authorization': f'Bearer {token}'},
@@ -117,7 +118,7 @@ class AzureDevOpsWorkItemsToolkit(BaseToolkit):
             if selected_tools:
                 if tool["name"] not in selected_tools:
                     continue
-            description = tool["description"] + f"\nADO instance: {azure_devops_api_wrapper.organization_url}/{azure_devops_api_wrapper.project}"
+            description = tool["description"] + f"\nADO instance: {azure_devops_api_wrapper.organization_url}/{azure_devops_api_wrapper.project or ''}"
             if toolkit_name:
                 description = f"{description}\nToolkit: {toolkit_name}"
             description = description[:1000]

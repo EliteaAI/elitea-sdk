@@ -14,6 +14,7 @@ from msrest.authentication import BasicAuthentication
 from pydantic import create_model, PrivateAttr, model_validator, SecretStr
 from pydantic.fields import FieldInfo as Field
 
+from ..utils import AdoProjectScope, with_project_argument
 from ..work_item import AzureDevOpsApiWrapper
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils import normalize_base_url
@@ -173,12 +174,13 @@ GetAllTestCaseFieldsModel = create_model(
     force_refresh=(Optional[bool], Field(description="If True, reload field definitions from Azure DevOps API. Use this if project configuration has changed.", default=False))
 )
 
-class TestPlanApiWrapper(NonCodeIndexerToolkit):
+class TestPlanApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
     index_item_labels = ('test case', 'test cases')
     # TODO use ado_configuration instead of organization_url, project and token
     __test__ = False
     organization_url: str
-    project: str
+    # Default project; each tool call may target another one
+    project: Optional[str] = None
     token: SecretStr
     limit: Optional[int] = 5
     _client: Optional[TestPlanClient] = PrivateAttr()
@@ -190,17 +192,21 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
     @model_validator(mode='before')
     def validate_toolkit(cls, values):
         values['organization_url'] = normalize_base_url(values.get('organization_url'))
-        try:
-            credentials = BasicAuthentication('', values['token'])
-            connection = Connection(base_url=values['organization_url'], creds=credentials)
-            cls._client = connection.clients.get_test_plan_client()
+        return super().validate_toolkit(values)
 
-            # Initialize work item wrapper at class level
-            cls._work_item_wrapper = AzureDevOpsApiWrapper(
-                organization_url=values['organization_url'],
-                token=values['token'],
-                project=values['project'],
-                llm=values.get('llm', None)
+    @model_validator(mode='after')
+    def connect(self):
+        try:
+            credentials = BasicAuthentication('', self.token.get_secret_value())
+            connection = Connection(base_url=self.organization_url, creds=credentials)
+            self._client = connection.clients.get_test_plan_client()
+
+            # Per instance: toolkits of different projects must not share one wrapper
+            self._work_item_wrapper = AzureDevOpsApiWrapper(
+                organization_url=self.organization_url,
+                token=self.token.get_secret_value(),
+                project=self.project,
+                llm=self.llm
             )
         except Exception as e:
             error_msg = str(e).lower()
@@ -226,7 +232,15 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                 )
             else:
                 raise ValueError(f"Azure DevOps connection failed: {e}")
-        return super().validate_toolkit(values)
+        return self
+
+    def _in_work_item_project(self):
+        """Run a delegated work item call in this call's project, not the wrapper's default."""
+        return self._work_item_wrapper._project_scope(self._project())
+
+    def _get_work_item(self, **kwargs):
+        with self._in_work_item_project():
+            return self._work_item_wrapper.get_work_item(**kwargs)
 
     @tool_group('read')
     def get_all_test_case_fields_for_project(self, force_refresh: bool = False) -> str:
@@ -242,8 +256,8 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         Returns:
             Formatted string with field names, types, and requirements
         """
-        # Use the class-level work_item wrapper instance
-        return self._work_item_wrapper.get_work_item_type_fields(work_item_type="Test Case", force_refresh=force_refresh)
+        with self._in_work_item_project():
+            return self._work_item_wrapper.get_work_item_type_fields(work_item_type="Test Case", force_refresh=force_refresh)
 
     @tool_group('write')
     def create_test_plan(self, test_plan_create_params: str):
@@ -251,7 +265,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         try:
             params = json.loads(test_plan_create_params)
             test_plan_create_params_obj = TestPlanCreateParams(**params)
-            test_plan = self._client.create_test_plan(test_plan_create_params_obj, self.project)
+            test_plan = self._client.create_test_plan(test_plan_create_params_obj, self._project())
             return f"Test plan {test_plan.id} created successfully."
         except Exception as e:
             logger.error(f"Error creating test plan: {e}")
@@ -261,7 +275,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
     def delete_test_plan(self, plan_id: int):
         """Delete a test plan in Azure DevOps."""
         try:
-            self._client.delete_test_plan(self.project, plan_id)
+            self._client.delete_test_plan(self._project(), plan_id)
             return f"Test plan {plan_id} deleted successfully."
         except Exception as e:
             logger.error(f"Error deleting test plan: {e}")
@@ -272,10 +286,10 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         """Get a test plan or list of test plans in Azure DevOps."""
         try:
             if plan_id:
-                test_plan = self._client.get_test_plan_by_id(self.project, plan_id)
+                test_plan = self._client.get_test_plan_by_id(self._project(), plan_id)
                 return test_plan.as_dict()
             else:
-                test_plans = self._client.get_test_plans(self.project)
+                test_plans = self._client.get_test_plans(self._project())
                 return [plan.as_dict() for plan in test_plans]
         except Exception as e:
             logger.error(f"Error getting test plan(s): {e}")
@@ -287,7 +301,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         try:
             params = json.loads(test_suite_create_params)
             test_suite_create_params_obj = TestSuiteCreateParams(**params)
-            test_suite = self._client.create_test_suite(test_suite_create_params_obj, self.project, plan_id)
+            test_suite = self._client.create_test_suite(test_suite_create_params_obj, self._project(), plan_id)
             return f"Test suite {test_suite.id} created successfully."
         except Exception as e:
             logger.error(f"Error creating test suite: {e}")
@@ -297,7 +311,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
     def delete_test_suite(self, plan_id: int, suite_id: int):
         """Delete a test suite in Azure DevOps."""
         try:
-            self._client.delete_test_suite(self.project, plan_id, suite_id)
+            self._client.delete_test_suite(self._project(), plan_id, suite_id)
             return f"Test suite {suite_id} deleted successfully."
         except Exception as e:
             logger.error(f"Error deleting test suite: {e}")
@@ -308,10 +322,10 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         """Get a test suite or list of test suites in Azure DevOps."""
         try:
             if suite_id:
-                test_suite = self._client.get_test_suite_by_id(self.project, plan_id, suite_id)
+                test_suite = self._client.get_test_suite_by_id(self._project(), plan_id, suite_id)
                 return test_suite.as_dict()
             else:
-                test_suites = self._client.get_test_suites_for_plan(self.project, plan_id)
+                test_suites = self._client.get_test_suites_for_plan(self._project(), plan_id)
                 return [suite.as_dict() for suite in test_suites]
         except Exception as e:
             logger.error(f"Error getting test suite(s): {e}")
@@ -325,7 +339,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                 suite_test_case_create_update_parameters = json.loads(suite_test_case_create_update_parameters)
             suite_test_case_create_update_params_obj = [SuiteTestCaseCreateUpdateParameters(**param) for param in
                                                         suite_test_case_create_update_parameters]
-            test_cases = self._client.add_test_cases_to_suite(suite_test_case_create_update_params_obj, self.project,
+            test_cases = self._client.add_test_cases_to_suite(suite_test_case_create_update_params_obj, self._project(),
                                                               plan_id, suite_id)
             return [test_case.as_dict() for test_case in test_cases]
         except Exception as e:
@@ -366,11 +380,11 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
 
         work_item_json = self.build_ado_test_case(title, description, steps_xml, additional_fields_dict)
 
-        # Use the class-level work_item wrapper instance
         try:
-            create_work_item_result = self._work_item_wrapper.create_work_item(
-                work_item_json=json.dumps(work_item_json), wi_type="Test Case"
-            )
+            with self._in_work_item_project():
+                create_work_item_result = self._work_item_wrapper.create_work_item(
+                    work_item_json=json.dumps(work_item_json), wi_type="Test Case"
+                )
         except ToolException as e:
             error_msg = str(e)
             if "TF401320" in error_msg or "validation" in error_msg.lower():
@@ -459,9 +473,9 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         """Get a test case from a suite in Azure DevOps with all custom fields."""
         try:
             # Get test case reference from test plan client (basic info only)
-            test_cases = self._client.get_test_case(self.project, plan_id, suite_id, test_case_id)
+            test_cases = self._client.get_test_case(self._project(), plan_id, suite_id, test_case_id)
             if not test_cases:
-                return f"No test cases found per given criteria: project {self.project}, plan {plan_id}, suite {suite_id}, test case id {test_case_id}"
+                return f"No test cases found per given criteria: project {self._project()}, plan {plan_id}, suite {suite_id}, test case id {test_case_id}"
 
             test_case = test_cases[0]
             test_case_dict = test_case.as_dict()
@@ -474,13 +488,13 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                 # Note: Azure DevOps API does not allow using expand with fields parameter
                 if fields:
                     # When specific fields requested, cannot use expand
-                    full_work_item = self._work_item_wrapper.get_work_item(
+                    full_work_item = self._get_work_item(
                         id=work_item_id,
                         fields=fields
                     )
                 else:
                     # When all fields requested, can use expand for relations
-                    full_work_item = self._work_item_wrapper.get_work_item(
+                    full_work_item = self._get_work_item(
                         id=work_item_id,
                         expand='Relations'
                     )
@@ -501,7 +515,7 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
         """Get test cases from a suite in Azure DevOps with all custom fields."""
         try:
             # Get test case references from test plan client (basic info only)
-            test_cases = self._client.get_test_case_list(self.project, plan_id, suite_id)
+            test_cases = self._client.get_test_case_list(self._project(), plan_id, suite_id)
             result = []
 
             for test_case in test_cases:
@@ -515,13 +529,13 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
                     # Note: Azure DevOps API does not allow using expand with fields parameter
                     if fields:
                         # When specific fields requested, cannot use expand
-                        full_work_item = self._work_item_wrapper.get_work_item(
+                        full_work_item = self._get_work_item(
                             id=work_item_id,
                             fields=fields
                         )
                     else:
                         # When all fields requested, can use expand for relations
-                        full_work_item = self._work_item_wrapper.get_work_item(
+                        full_work_item = self._get_work_item(
                             id=work_item_id,
                             expand='Relations'
                         )
@@ -543,13 +557,16 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
     def get_suites_in_plan(self, plan_id: int) -> List[dict]:
         """Get all test suites in a test plan."""
         try:
-            test_suites = self._client.get_test_suites_for_plan(self.project, plan_id)
+            test_suites = self._client.get_test_suites_for_plan(self._project(), plan_id)
             return [suite.as_dict() for suite in test_suites]
         except Exception as e:
             logger.error(f"Error getting test suites: {e}")
             raise ToolException(f"Error getting test suites: {e}")
 
-    def _base_loader(self, plan_id: int, suite_ids: Optional[List[int]] = [], chunking_tool: str = None, **kwargs) -> Generator[Document, None, None]:
+    def _base_loader(self, *args, project: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
+        return self._load_in_project(lambda: self._load_test_cases(*args, **kwargs))
+
+    def _load_test_cases(self, plan_id: int, suite_ids: Optional[List[int]] = [], chunking_tool: str = None, **kwargs) -> Generator[Document, None, None]:
         cases = []
         if not suite_ids:
             suites = self.get_suites_in_plan(plan_id)
@@ -597,8 +614,10 @@ class TestPlanApiWrapper(NonCodeIndexerToolkit):
             "suite_ids": (Optional[List[int]], Field(description='List of test suite IDs for which test cases are requested '
                                                                  '(can be empty for all suites indexing from the plan). '
                                                                  'Example: [2, 23]', default=[])),
+            **self._project_field(),
         }
 
+    @with_project_argument
     @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):
