@@ -13,6 +13,7 @@ from docx import Document as DocxDocument
 from docx.oxml.ns import qn
 from bs4 import BeautifulSoup
 
+from .docx_headings import number_headings
 from .utils import perform_llm_prediction_for_image_bytes
 from ..tools.utils import encode_image_bytes_for_llm
 
@@ -431,6 +432,9 @@ class EliteADocxMammothLoader(BaseLoader):
         """
         # Load document with python-docx
         doc = DocxDocument(docx_stream)
+        # Word keeps automatic heading numbers out of the text; write them in so chunks and their
+        # section metadata carry the number a reader sees (EL-7355).
+        number_headings(doc)
         
         # Generate unique markers to avoid conflicts with document content
         unique_id = uuid.uuid4().hex[:8]
@@ -655,7 +659,7 @@ class EliteADocxMammothLoader(BaseLoader):
         result_content = self.get_content()
         # Imported lazily: module-level tools imports from a document loader are circular (see EliteAImageLoader)
         from elitea_sdk.tools.chunkers.sematic.markdown_chunker import markdown_by_headers_chunker
-        return list(markdown_by_headers_chunker(iter([Document(page_content=result_content, metadata={'source': str(self.path)})]), config={'max_tokens':self.max_tokens}))
+        return list(markdown_by_headers_chunker(iter([Document(page_content=result_content, metadata={'source': str(self.path)})]), config={'max_tokens':self.max_tokens, 'emit_sections': True}))
 
     def get_content(self):
         """Extracts and converts the content of the Docx file.
