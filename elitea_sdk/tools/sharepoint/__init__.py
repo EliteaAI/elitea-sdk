@@ -92,9 +92,6 @@ def get_tools(tool):
         sharepoint_configuration=tool['settings']['sharepoint_configuration'],
         site_url=tool['settings'].get('site_url'),
         site_path=tool['settings'].get('site_path'),
-        library_lists=tool['settings'].get('library_lists'),
-        metadata_fields=tool['settings'].get('metadata_fields'),
-        categories=tool['settings'].get('categories'),
         tokens = tool['settings'].get('tokens', {}),
         toolkit_name=tool.get('toolkit_name'),
         toolkit_id=tool.get('id'),
@@ -128,31 +125,6 @@ class SharepointToolkit(BaseToolkit):
                     "Use when the Site URL is only the tenant URL. "
                     "Examples: sites/site-name or teams/team-name. "
                     "Leave empty when the Site URL already includes the site path."
-                ),
-            )),
-            # document-library mode (#7352)
-            library_lists=(List[str], Field(
-                default=[],
-                description=(
-                    "Library lists: SharePoint lists (usually the document libraries themselves) whose items "
-                    "describe the indexed files. When set, indexing adds each file's list fields to its metadata. "
-                    "Example: Policies."
-                ),
-            )),
-            metadata_fields=(List[str], Field(
-                default=[],
-                description=(
-                    "List fields to copy into document metadata. Empty: all simple fields, stored under readable "
-                    "snake_case names. Name a field as list_library_categories shows it; Field=name chooses the "
-                    "metadata name and * keeps all other fields, for example: *, area=category. A field whose "
-                    "default name is taken by a mapping keeps its value as <name>_original."
-                ),
-            )),
-            categories=(List[str], Field(
-                default=[],
-                description=(
-                    "Index only files whose category is one of these values (the field stored as category). "
-                    "The list_library_categories tool returns the values used on the site."
                 ),
             )),
             # indexer settings

@@ -86,10 +86,11 @@ ReadList = create_model(
 
 ListLibraryCategories = create_model(
     "ListLibraryCategories",
-    library_lists=(Optional[List[str]], Field(
-        description="Names of the library lists to read the categories from. "
-                    "Leave empty to use the toolkit's Library lists setting.",
-        default=None)),
+    library_lists=(List[str], Field(
+        description="Names of the library lists (usually the document libraries) to read.")),
+    metadata_fields=(Optional[List[str]], Field(
+        description="Optional field mapping, as for index_data, e.g. `[\"*\", \"area=category\"]`.",
+        default=[])),
 )
 
 GetFiles = create_model(
@@ -483,10 +484,6 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     toolkit_id: Optional[int] = None
     toolkit_name: Optional[str] = None
     elitea: Any = None
-    # Document-library mode (#7352): list fields become document metadata when library_lists is set
-    library_lists: Optional[List[str]] = None
-    metadata_fields: Optional[List[str]] = None
-    categories: Optional[List[str]] = None
     _backend: BaseSharepointWrapper = PrivateAttr()
 
     @model_validator(mode='after')
@@ -1068,6 +1065,22 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                             "OneNote page attachments (when include_attachments is enabled). "
                             'i.e. `["*.exe", "*.zip"]`',
                 default=[])),
+            # Document-library mode (#7352): per index, so one toolkit can serve several sources
+            'library_lists': (Optional[List[str]], Field(
+                description="SharePoint lists (usually the document libraries themselves) whose items describe "
+                            "the indexed files. When set, each file gets its list fields as metadata.",
+                default=[])),
+            'metadata_fields': (Optional[List[str]], Field(
+                description="List fields to copy when library_lists is set. Empty: all simple fields under "
+                            "readable snake_case names. Name a field as list_library_categories shows it; "
+                            "Field=name chooses the metadata name and * keeps all other fields, e.g. "
+                            '`["*", "area=category"]`. A field whose default name is taken by a mapping keeps '
+                            "its value as <name>_original.",
+                default=[])),
+            'categories': (Optional[List[str]], Field(
+                description="Index only files whose category (the list field stored as category) is one of "
+                            "these values. list_library_categories returns the values used on the site.",
+                default=[])),
             'path': (Optional[str], Field(
                 description="Folder path. "
                             "Accepts either a full server-relative path "
@@ -1136,7 +1149,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         form_name = kwargs.get('form_name') or None
 
         if limit_files > 0:
-            library = self._library_join_context()
+            library = self._library_join_context(
+                kwargs.get('library_lists'), kwargs.get('metadata_fields'), kwargs.get('categories'))
             # The categories filter drops files after listing: list up to the library bound and keep
             # limit_files of the files that pass, so selected files beyond the first limit_files listed
             # are not lost.
@@ -1184,13 +1198,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     # ------------------------------------------------------------------ #
 
 
-    def _library_settings(self, library_lists=None) -> LibrarySettings:
-        return LibrarySettings.from_settings(
-            library_lists if library_lists else self.library_lists, self.metadata_fields, self.categories)
-
-    def _library_join_context(self):
-        """(settings, index, counts) when library mode is on, else None. The lists are read once per run."""
-        settings = self._library_settings()
+    def _library_join_context(self, library_lists=None, metadata_fields=None, categories=None):
+        """(settings, index, counts) when the index_data call sets library_lists, else None.
+        The lists are read once per run."""
+        settings = LibrarySettings.from_settings(library_lists, metadata_fields, categories)
         if not settings.enabled:
             return None
         self._log_tool_event(message="Reading the library lists", tool_name="loader")
@@ -1222,18 +1233,18 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         return True
 
     @tool_group('read')
-    def list_library_categories(self, library_lists: Optional[List[str]] = None):
+    def list_library_categories(self, library_lists: List[str], metadata_fields: Optional[List[str]] = None):
         """Lists the category values used in the library lists, with the number of items in each.
 
-        Reads the items of the library lists (the toolkit's Library lists setting, or the given
-        names) and returns the distinct values of the field stored as `category`, most used first.
-        Use these values for the toolkit's Categories filter. Also returns the metadata field
-        names each list provides, so the Metadata fields setting can map them.
+        Reads the items of the given library lists and returns the distinct values of the field
+        stored as `category`, most used first. Use these values for index_data's categories
+        parameter. Also returns the metadata field names each list provides, so index_data's
+        metadata_fields parameter can map them (e.g. `["*", "area=category"]`).
         """
         self._sync_backend_context()
-        settings = self._library_settings(library_lists)
+        settings = LibrarySettings.from_settings(library_lists, metadata_fields)
         if not settings.enabled:
-            raise ToolException("Set the Library lists setting (or pass library_lists) first.")
+            raise ToolException("Pass the names of the library lists to read (library_lists).")
         index = build_index(self._backend.library_list_client(), settings)
         fields = sorted({key for entry in index.entries for key in entry.metadata})
         result = {

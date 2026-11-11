@@ -515,19 +515,29 @@ def test_only_graph_is_called():
 #  Toolkit integration                                                          #
 # --------------------------------------------------------------------------- #
 
-def _wrapper(monkeypatch, files, graph, **settings_kwargs):
-    w = SharepointApiWrapper(site_url=SITE, llm=None, token="tok", scopes=["Sites.Read.All"], **settings_kwargs)
+_INDEX_PARAMS = {}   # the index_data parameters each test wrapper's loader runs with
+
+
+def _wrapper(monkeypatch, files, graph, **index_params):
+    """A Graph-backed wrapper whose listing returns ``files``; ``index_params`` are the library
+    parameters of the index_data call (they are index parameters, not toolkit settings)."""
+    w = SharepointApiWrapper(site_url=SITE, llm=None, token="tok", scopes=["Sites.Read.All"])
     monkeypatch.setattr(lm.requests, "get", graph.get)
     monkeypatch.setattr(w._backend, "get_files_list", lambda *a, **k: files)
     w._init_indexing_stats()
+    _INDEX_PARAMS[id(w)] = index_params
     return w
+
+
+def load(w, **kwargs):
+    return list(w._base_loader(**_INDEX_PARAMS.get(id(w), {}), **kwargs))
 
 
 def test_loader_merges_fields_and_reports(monkeypatch, caplog):
     files = [graph_file(P1), rest_file(P2), graph_file("/sites/handbook/Handbook Library/Unlisted.pdf")]
     w = _wrapper(monkeypatch, files, FakeGraph(standard_lists()), library_lists=[LIB])
     with caplog.at_level(logging.DEBUG):
-        docs = list(w._base_loader(limit_files=10))
+        docs = load(w, limit_files=10)
     assert [d.metadata["metadata_status"] for d in docs] == ["ok", "ok", "no metadata"]
     assert docs[0].metadata["document_id"] == "HB-001" and docs[0].metadata["updated_on"] == "2026-02-01T00:00:00Z"
     assert SECRET_VALUE not in caplog.text
@@ -546,7 +556,7 @@ def test_loader_merges_fields_and_reports(monkeypatch, caplog):
 def test_loader_category_filter_counts_skipped(monkeypatch):
     files = [graph_file(P1), graph_file(P2), graph_file(P3)]
     w = _wrapper(monkeypatch, files, FakeGraph(standard_lists()), library_lists=[LIB], categories=["Travel"])
-    docs = list(w._base_loader(limit_files=10))
+    docs = load(w, limit_files=10)
     assert [d.metadata["file_name"] for d in docs] == ["Travel Rules.pdf"]
     assert w.get_indexing_stats().documents_skipped_filtered == {P2, P3}
 
@@ -554,14 +564,14 @@ def test_loader_category_filter_counts_skipped(monkeypatch):
 def test_loader_without_library_lists_is_unchanged(monkeypatch):
     graph = FakeGraph(standard_lists())
     w = _wrapper(monkeypatch, [graph_file(P1)], graph)
-    docs = list(w._base_loader(limit_files=10))
+    docs = load(w, limit_files=10)
     assert docs[0].metadata == {("updated_on" if k == "Modified" else k): str(v) for k, v in graph_file(P1).items()}
     assert graph.calls == []
 
 
 def test_list_library_categories_tool(monkeypatch):
-    w = _wrapper(monkeypatch, [], FakeGraph(standard_lists()), library_lists=[LIB])
-    result = w.list_library_categories()
+    w = _wrapper(monkeypatch, [], FakeGraph(standard_lists()))
+    result = w.list_library_categories([LIB])
     assert result["items"] == 3
     assert result["categories"][0] == {"value": "People", "items": 2}
     assert "category" in result["metadata_fields"] and "note" not in result
@@ -570,8 +580,8 @@ def test_list_library_categories_tool(monkeypatch):
 
 def test_list_library_categories_explains_missing_category(monkeypatch):
     lists = {LIB_ID: [item(1, P1, Topic="x")]}
-    w = _wrapper(monkeypatch, [], FakeGraph(lists), library_lists=[LIB])
-    assert "note" in w.list_library_categories()
+    w = _wrapper(monkeypatch, [], FakeGraph(lists))
+    assert "note" in w.list_library_categories([LIB])
 
 
 def test_rest_bearer_backend_refuses_library_mode():
@@ -601,20 +611,60 @@ def test_rest_app_backend_uses_app_only_graph_token(monkeypatch):
     assert all(c["headers"]["Authorization"] == "Bearer app-token" for c in graph.calls)
 
 
-def test_toolkit_passes_library_settings(monkeypatch):
+def _toolkit_wrapper(monkeypatch, settings):
     from elitea_sdk.tools import sharepoint as sp
-    captured = {}
+    built = []
 
     class Recorder(SharepointApiWrapper):
         def __init__(self, **kwargs):
-            captured.update(kwargs)
             super().__init__(**kwargs)
+            built.append(self)
 
     monkeypatch.setattr(sp, "SharepointApiWrapper", Recorder)
     sp.get_tools({"toolkit_name": "tk", "settings": {
         "sharepoint_configuration": {"token": "t", "scopes": ["Sites.Read.All"]}, "site_url": SITE,
-        "library_lists": [LIB], "metadata_fields": ["A=b"], "categories": ["C"], "selected_tools": []}})
-    assert captured["library_lists"] == [LIB] and captured["metadata_fields"] == ["A=b"] and captured["categories"] == ["C"]
+        "selected_tools": [], **settings}})
+    return built[0]
+
+
+def test_saved_toolkit_settings_with_the_old_keys_are_ignored(monkeypatch):
+    """A toolkit saved while these were toolkit settings keeps working and stays in plain mode."""
+    w = _toolkit_wrapper(monkeypatch, {"library_lists": [LIB], "metadata_fields": ["*", "area=category"],
+                                       "categories": ["Travel"]})
+    graph = FakeGraph(standard_lists())
+    monkeypatch.setattr(lm.requests, "get", graph.get)
+    monkeypatch.setattr(w._backend, "get_files_list", lambda *a, **k: [graph_file(P1)])
+    w._init_indexing_stats()
+    docs = list(w._base_loader(limit_files=10))
+    assert docs[0].metadata == {("updated_on" if k == "Modified" else k): str(v) for k, v in graph_file(P1).items()}
+    assert graph.calls == []
+    assert not {"library_lists", "metadata_fields", "categories"} & set(type(w).model_fields)
+
+
+def test_toolkit_schema_has_no_library_settings():
+    from elitea_sdk.tools.sharepoint import SharepointToolkit
+    props = SharepointToolkit.toolkit_config_schema().model_json_schema()["properties"]
+    assert set(props) == {"sharepoint_configuration", "selected_tools", "site_url", "site_path",
+                          "pgvector_configuration", "embedding_model"}
+
+
+def test_index_parameters_carry_the_library_options():
+    params = SharepointApiWrapper.model_construct()._index_tool_params()
+    for key in ("library_lists", "metadata_fields", "categories"):
+        annotation, field = params[key]
+        assert annotation == params["include_extensions"][0] and field.default == []
+
+
+@pytest.mark.parametrize("bad", [{"library_lists": ["Lib\r\nX"]}, {"library_lists": [LIB], "categories": [5]},
+                                 {"categories": ["Travel"]}, {"library_lists": [f"L{i}" for i in range(11)]}])
+def test_invalid_index_parameters_fail_typed_before_any_listing(monkeypatch, bad):
+    listed = []
+    graph = FakeGraph(standard_lists())
+    w = _wrapper(monkeypatch, [], graph, **bad)
+    monkeypatch.setattr(w._backend, "get_files_list", lambda *a, **k: listed.append(1) or [])
+    with pytest.raises(lm.LibraryMetadataError):
+        load(w, limit_files=10)
+    assert listed == [] and graph.calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -631,7 +681,7 @@ def test_category_filter_is_applied_before_the_file_limit(monkeypatch):
         return files[:limit]
 
     monkeypatch.setattr(w._backend, "get_files_list", listing)
-    docs = list(w._base_loader(limit_files=1))
+    docs = load(w, limit_files=1)
     assert asked["limit"] == lm.LIBRARY_LISTING_LIMIT
     assert [d.metadata["document_id"] for d in docs] == ["HB-002"]      # limit_files counts kept files
 
@@ -642,7 +692,7 @@ def test_same_named_files_are_reported_separately(monkeypatch):
     files = [graph_file("/sites/handbook/Handbook Library/one/Same.pdf"),
              graph_file("/sites/handbook/Handbook Library/two/Same.pdf")]
     w = _wrapper(monkeypatch, files, FakeGraph(lists), library_lists=[LIB])
-    list(w._base_loader(limit_files=10))
+    load(w, limit_files=10)
     assert w.get_indexing_stats().documents_metadata_ambiguous == {
         "/sites/handbook/Handbook Library/one/Same.pdf", "/sites/handbook/Handbook Library/two/Same.pdf"}
 
@@ -730,14 +780,6 @@ def test_category_filter_works_on_a_mapped_field():
     assert len(kept) == 2 and kept[0]["category"] == "Operations" and counts.category_skipped == 0
 
 
-def test_toolkit_form_gets_plain_array_settings():
-    """EliteaUI turns comma-separated text into a list only for plain `type: array` fields."""
-    from elitea_sdk.tools.sharepoint import SharepointToolkit
-    props = SharepointToolkit.toolkit_config_schema().model_json_schema()["properties"]
-    for key in ("library_lists", "metadata_fields", "categories"):
-        assert props[key]["type"] == "array" and props[key]["default"] == []
-
-
 # --------------------------------------------------------------------------- #
 #  Delta review follow-ups                                                     #
 # --------------------------------------------------------------------------- #
@@ -746,7 +788,7 @@ def test_categories_without_a_category_field_fail_loudly(monkeypatch):
     lists = {LIB_ID: [item(1, P1, TopicArea="Travel")]}
     w = _wrapper(monkeypatch, [graph_file(P1)], FakeGraph(lists), library_lists=[LIB], categories=["Travel"])
     with pytest.raises(lm.LibraryMetadataError, match="needs a list field stored as `category`"):
-        list(w._base_loader(limit_files=10))
+        load(w, limit_files=10)
 
 
 def test_a_mistyped_category_mapping_fails_loudly_too(monkeypatch):
@@ -754,14 +796,14 @@ def test_a_mistyped_category_mapping_fails_loudly_too(monkeypatch):
     w = _wrapper(monkeypatch, [graph_file(P1)], FakeGraph(lists), library_lists=[LIB],
                  metadata_fields=["*", "Aera=category"], categories=["Travel"])
     with pytest.raises(lm.LibraryMetadataError, match="area=category"):
-        list(w._base_loader(limit_files=10))
+        load(w, limit_files=10)
 
 
 def test_unmatched_files_under_the_filter_are_counted_and_logged(monkeypatch, caplog):
     files = [graph_file(P1), graph_file("/sites/handbook/Handbook Library/Unlisted.pdf")]
     w = _wrapper(monkeypatch, files, FakeGraph(standard_lists()), library_lists=[LIB], categories=["People"])
     with caplog.at_level(logging.INFO):
-        assert list(w._base_loader(limit_files=10)) == []
+        assert load(w, limit_files=10) == []
     assert "'category_skipped': 1" in caplog.text and "'unmatched_skipped': 1" in caplog.text
 
 
@@ -773,10 +815,10 @@ def test_a_mapping_never_drops_the_field_whose_name_it_takes():
 def test_unresolved_field_settings_are_reported(monkeypatch, caplog):
     w = _wrapper(monkeypatch, [], FakeGraph(standard_lists()), library_lists=[LIB],
                  metadata_fields=["*", "Aera=category", "Nope"])
-    result = w.list_library_categories()
+    result = w.list_library_categories([LIB], ["*", "Aera=category", "Nope"])
     assert result["unresolved_metadata_fields"] == ["Aera", "Nope"]
     with caplog.at_level(logging.WARNING):
-        list(w._base_loader(limit_files=10))
+        load(w, limit_files=10)
     assert "2 metadata field setting(s) match no field" in caplog.text
 
 
@@ -785,9 +827,9 @@ def test_listing_limit_under_the_filter_is_a_typed_failure(monkeypatch):
     files = [graph_file(f"/sites/handbook/Handbook Library/f{i}.pdf") for i in range(3)]
     w = _wrapper(monkeypatch, files, FakeGraph(standard_lists()), library_lists=[LIB], categories=["People"])
     with pytest.raises(lm.LibraryMetadataError, match="at most 3 files"):
-        list(w._base_loader(limit_files=1))
+        load(w, limit_files=1)
     w = _wrapper(monkeypatch, files[:2], FakeGraph(standard_lists()), library_lists=[LIB], categories=["People"])
-    assert list(w._base_loader(limit_files=1)) == []      # under the limit: a normal run
+    assert load(w, limit_files=1) == []      # under the limit: a normal run
 
 
 def test_paging_link_compares_path_segments():

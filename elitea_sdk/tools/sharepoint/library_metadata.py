@@ -610,8 +610,8 @@ def build_index(client: GraphListClient, settings: LibrarySettings) -> LibraryIn
     return index
 
 
-CATEGORY_MAPPING_HINT = ("Map one in Metadata fields with the name list_library_categories shows, "
-                         "for example `*, area=category`.")
+CATEGORY_MAPPING_HINT = ("Map one in metadata_fields with the name list_library_categories shows, "
+                         "for example [\"*\", \"area=category\"].")
 
 
 def has_categories(index: LibraryIndex) -> bool:
