@@ -186,7 +186,7 @@ class TestBitbucket:
             try:
                 bb_module.BitbucketAPIWrapper(
                     url='https://bitbucket.example.com/', username='u', password='p',
-                    project='PRJ', repository='repo', cloud=cloud,
+                    project='PRJ', repository='repo', cloud=cloud, llm=None,
                 )
             except Exception:
                 pass
