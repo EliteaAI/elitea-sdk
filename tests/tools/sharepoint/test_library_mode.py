@@ -727,3 +727,11 @@ def test_category_filter_works_on_a_mapped_field():
     kept, counts, _ = join([graph_file(P1), graph_file(P2)], metadata_fields=["*", "area=category"],
                            categories=["operations"])
     assert len(kept) == 2 and kept[0]["category"] == "Operations" and counts.category_skipped == 0
+
+
+def test_toolkit_form_gets_plain_array_settings():
+    """EliteaUI turns comma-separated text into a list only for plain `type: array` fields."""
+    from elitea_sdk.tools.sharepoint import SharepointToolkit
+    props = SharepointToolkit.toolkit_config_schema().model_json_schema()["properties"]
+    for key in ("library_lists", "metadata_fields", "categories"):
+        assert props[key]["type"] == "array" and props[key]["default"] == []
