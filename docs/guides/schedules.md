@@ -183,6 +183,8 @@ Starts one run now. It works on a paused schedule too.
 Another value raises `ValueError` before any request.
 The answer holds the `run_id`. The run itself goes on in the background.
 
+When a project admin runs another user's schedule, the run uses the admin's credentials. The schedule owner approves or rejects its sensitive actions, so the owner decides about actions that use someone else's credentials. Start Run now on another user's schedule only when this is acceptable (see "Who sees what").
+
 ```python
 answer = client.run_schedule(schedule_id)
 print(answer["run_id"])
@@ -260,7 +262,7 @@ It has the same rights as that user has in the UI.
 - A user with the `schedules.admin` permission (a project admin) sees every schedule of the project. They may edit, pause, resume and delete any of them, change the owner, and run them now.
 - The owner and any user with the `schedules.admin` permission may run a schedule now (Test). They also need the `schedules.run` permission. A user who is neither the owner nor a `schedules.admin` user gets 404, because the schedule is outside their scope.
 - Only the schedule owner may approve or reject a run in status `waiting_for_approval`, or answer its sign-in request (Authorize or Skip). This holds for every run tied to a schedule or webhook: a cron run, a webhook run, and Run now, also when a project admin started it. Any other caller gets 403, a project admin included. A member who is neither the owner nor an admin gets 404 on the REST routes, because the schedule is hidden from them.
-- An admin's Run now acts with the admin's credentials. This includes Run now on an index schedule of another owner: it is allowed and runs as the admin. Run without asking does not apply to it, so it always pauses before a sensitive action, and the schedule owner decides. A draft Test run has no schedule row and stays with the user who started it.
+- An admin's Run now acts with the admin's credentials. This includes Run now on an index schedule of another owner: it is allowed and runs as the admin. Run without asking does not apply to it, so it always pauses before a sensitive action, and the schedule owner decides. This means the owner approves or rejects actions that use someone else's credentials, the admin's. The owner can be any project member. A project admin should start Run now on another user's schedule only when this is acceptable. A draft Test run has no schedule row and stays with the user who started it.
 - A project admin may pause, resume, change the owner, delete, Run now, and start a Test run as themselves. After Change owner, a waiting run stays with the owner it had when it started: the old owner keeps it and the new owner gets 403 on it. New runs go to the new owner.
 - Each schedule has `allowed_actions`: the actions the caller may take on it.
 

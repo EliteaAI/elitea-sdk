@@ -6,6 +6,7 @@ from langchain_community.document_loaders import PyPDFium2Loader
 from langchain_text_splitters import TokenTextSplitter
 
 from .ImageParser import ImageParser
+from .sections import SECTION_KEYS, SectionIndex, detect_headings, outline_headings, page_metadata
 from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
 from ..tools.utils import encode_image_bytes_for_llm
 from langchain_core.tools import ToolException
@@ -189,11 +190,44 @@ class EliteAPDFLoader:
                 extract_images = self.extract_images,
                 images_parser = images_parser,
             ).load()
+        sections = self._section_index(docs)
         for doc in docs:
             doc.metadata['chunk_id'] = doc.metadata['page']
+            doc.metadata.update(page_metadata(doc.metadata['page']))
+            doc.metadata.update(sections.section_at(doc.metadata['page']))
         if self.max_tokens and self.max_tokens > 0:
-            splitter = TokenTextSplitter(encoding_name="cl100k_base", chunk_size=self.max_tokens, chunk_overlap=0)
+            splitter = TokenTextSplitter(encoding_name="cl100k_base", chunk_size=self.max_tokens, chunk_overlap=0,
+                                         add_start_index=True)
             docs = splitter.split_documents(docs)
+            cursor = {}   # page -> where the previous chunk of that page ended
             for idx, doc in enumerate(docs):
                 doc.metadata['chunk_id'] = idx
+                page = doc.metadata['page']
+                start = doc.metadata.pop('start_index', -1)
+                if start < 0:   # chunk text not found verbatim in the page (token split inside a character)
+                    start = cursor.get(page, 0)
+                cursor[page] = start + len(doc.page_content)
+                if sections:
+                    for key in SECTION_KEYS:
+                        doc.metadata.pop(key, None)
+                    doc.metadata.update(sections.section_at(page, start))
         return docs
+
+    def _section_index(self, docs) -> SectionIndex:
+        """Sections from the PDF outline when it has entries, otherwise from numbered headings in the text."""
+        page_texts = [''] * (max((d.metadata.get('page', 0) for d in docs), default=-1) + 1)
+        for doc in docs:
+            page_texts[doc.metadata['page']] = doc.page_content or ''
+        toc = []
+        try:
+            with pymupdf.open(filename=self.file_path, filetype="pdf") as report:
+                if report.needs_pass and self.password:
+                    report.authenticate(self.password)
+                # get_toc() is native and proportional to the file's size; outline_headings bounds the work
+                # done with it. (Walking pymupdf.Outline by hand crashes on documents without an outline.)
+                toc = report.get_toc(simple=True)
+        except Exception as e:  # pylint: disable=broad-except
+            # An unreadable outline only costs the outline; the heading heuristic still runs.
+            logger.warning("Failed to read the PDF outline of %s: %s", self.file_path, e)
+        headings = outline_headings(toc, page_texts) if toc else []
+        return SectionIndex(headings or detect_headings(page_texts))
