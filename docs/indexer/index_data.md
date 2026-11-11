@@ -94,3 +94,12 @@ Set _use_prompt_default_ to _true_ to use built-in detailed prompt to process im
 Note: the complexity of a prompt may affect processing time and token usage.  
 **Example:** `{".pdf": {"use_llm": true, "prompt": "Provide only information regarding colors and wrap output with image tag."}}`
 
+### Excel (`.xlsx`, `.xls`) chunk size
+
+Excel sheets are split into chunks of rows of at most _max_tokens_ tokens each (default: `512`), so a large sheet does not overflow the model's context window.
+A single row longer than _max_tokens_ becomes a chunk of its own. Set _add_header_to_chunks_ to _true_ to repeat the header row at the top of every chunk.
+Set _max_tokens_ to `-1` to index each sheet as one chunk (the pre-R-2.0.9 default).  
+**Example:** `{".xlsx": {"max_tokens": 1000, "add_header_to_chunks": true}, ".xls": {"max_tokens": -1}}`
+
+`read_file` is not affected: it still returns each sheet as one chunk.
+
