@@ -22,9 +22,7 @@ logger = logging.getLogger(__name__)
 _REVIEWED: ContextVar[frozenset] = ContextVar('sensitive_tool_reviewed', default=frozenset())
 
 # (tool id, input) pairs that an async call approved just before it raised NotImplementedError or
-# AttributeError. The usual case is AttributeError: a callback handler without `run_inline` makes
-# langchain fail the async tool call while it dispatches the start event, after the guard approved it.
-# The caller then runs the sync invoke for the same logical call. The approval was
+# AttributeError. The caller then runs the sync invoke for the same logical call. The approval was
 # already taken from the resume value, so a second review would pause again on the same call.
 # The first sync invoke with an equal input takes its pair out, so a later call is still reviewed.
 _FALLBACK_APPROVED: ContextVar[tuple] = ContextVar('sensitive_tool_fallback_approved', default=())
