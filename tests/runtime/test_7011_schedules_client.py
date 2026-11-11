@@ -92,6 +92,7 @@ def test_list_schedules_rejects_bad_paging(client, send, kwargs):
     {"entity-type": "agent"}, {"bogus": 1}, {"owner_ids": [1, "2"]}, {"owner_ids": 5}, {"enabled": "true"},
     {"entity_id": 0}, {"entity_id": "3"}, {"version_id": True}, {"version_id": -1}, {"version_id": 2**31},
     {"sort_by": "created"}, {"sort_order": "up"}, {"entity_type": "toolkit"}, {"status": "done"},
+    {"index_name": ""}, {"index_name": 5}, {"index_name": ["a"]}, {"index_name": "x" * 257},
 ])
 def test_list_schedules_rejects_bad_filters(client, send, filters):
     with pytest.raises(ValueError):
@@ -111,10 +112,12 @@ def test_schedule_input_limits_match_the_core_api():
     assert module.SCHEDULE_LIST_MAX_LIMIT == 100
     assert module.SCHEDULE_TRIGGERS == ("manual", "test")
     assert module.SCHEDULE_LIST_FILTERS == {
-        "entity_type", "status", "enabled", "owner_ids", "entity_id", "version_id", "search", "sort_by", "sort_order"}
+        "entity_type", "status", "enabled", "owner_ids", "entity_id", "version_id", "index_name", "search", "sort_by",
+        "sort_order"}
     assert module.SCHEDULE_SORT_BY == {"name", "entity_name", "entity_type", "next_run", "last_run", "enabled"}
     assert module.SCHEDULE_SORT_ORDER == {"asc", "desc"}
-    assert module.SCHEDULE_ENTITY_TYPES == {"agent", "pipeline"}
+    assert module.SCHEDULE_ENTITY_TYPES == {"agent", "pipeline", "toolkit_index"}
+    assert module.SCHEDULE_INDEX_NAME_MAX_LENGTH == 256
     assert module.SCHEDULE_RUN_STATUSES == {
         "running", "success", "failed", "skipped", "blocked", "waiting_for_approval"}
 
@@ -122,6 +125,12 @@ def test_schedule_input_limits_match_the_core_api():
 def test_list_schedules_sends_version_id(client, send):
     client.list_schedules(version_id=31)
     assert send.call_args[1]["params"]["version_id"] == 31
+
+
+def test_list_schedules_sends_toolkit_index_filters(client, send):
+    client.list_schedules(entity_type="toolkit_index", entity_id=7, index_name="docs v2")
+    assert send.call_args[1]["params"] == {
+        "limit": 20, "offset": 0, "entity_type": "toolkit_index", "entity_id": 7, "index_name": "docs v2"}
 
 
 def test_list_schedules_sends_owner_ids_as_list(client, send):

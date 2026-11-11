@@ -1,6 +1,6 @@
 # Schedules
 
-A schedule runs an agent or a pipeline on a cron timetable.
+A schedule runs an agent, a pipeline or a toolkit index on a cron timetable.
 `EliteAClient` has one method for each Schedules API call.
 This guide shows each method, who may call it, the errors, and one full example.
 
@@ -71,9 +71,10 @@ When the API answers 400 or more, the method raises `ApiDetailsRequestError` (se
 ### `list_schedules`
 
 Lists one page of the project schedules. `limit` is 1 to 100.
-Filters go to the query: `entity_type`, `status` (of the last run), `enabled`, `owner_ids`, `entity_id`, `version_id`, `search`, `sort_by` and `sort_order`.
+Filters go to the query: `entity_type`, `status` (of the last run), `enabled`, `owner_ids`, `entity_id`, `version_id`, `index_name`, `search`, `sort_by` and `sort_order`.
+`entity_type` is `agent`, `pipeline` or `toolkit_index`. For `toolkit_index`, `entity_id` is the toolkit id and `index_name` is the exact index name.
 A filter set to `None` is not sent.
-`list_schedules` raises `ValueError` before any request for a `limit` outside 1 to 100, an `offset` outside 0 to 2147483647, an unknown filter key, `owner_ids` that is not a list of ints, an `entity_id` or `version_id` that is not an int from 1 to 2147483647, `enabled` that is not a bool, a `sort_by` that is not one of name, entity_name, entity_type, next_run, last_run, enabled, a `sort_order` that is not asc or desc, an `entity_type` that is not agent or pipeline, or a `status` that is not a run status.
+`list_schedules` raises `ValueError` before any request for a `limit` outside 1 to 100, an `offset` outside 0 to 2147483647, an unknown filter key, `owner_ids` that is not a list of ints, an `entity_id` or `version_id` that is not an int from 1 to 2147483647, an `index_name` that is not a string of 1 to 256 characters, `enabled` that is not a bool, a `sort_by` that is not one of name, entity_name, entity_type, next_run, last_run, enabled, a `sort_order` that is not asc or desc, an `entity_type` that is not agent, pipeline or toolkit_index, or a `status` that is not a run status.
 `list_schedule_runs` raises `ValueError` for a `limit` below 1, an `offset` outside 0 to 2147483647, or a `status` that is not a run status.
 
 ```python
@@ -87,7 +88,7 @@ for row in page["rows"]:
 
 Creates a schedule. The client sends `data` as it is; the API checks it.
 
-Keys: `name`, `description`, `entity_type` (`agent` or `pipeline`), `application_id`, `version_id`, `run_mode`, `prompt`, `variables`, `cron`, `timezone`, `expires_at`, `approval_rule` and `enabled`.
+Keys: `name`, `description`, `entity_type` (`agent`, `pipeline` or `toolkit_index`), `application_id`, `toolkit_id`, `index_name`, `version_id`, `run_mode`, `prompt`, `variables`, `cron`, `timezone`, `expires_at`, `approval_rule` and `enabled`.
 `enabled` false saves the schedule paused. The default is true.
 `approval_rule` is `pause_and_ask` or `run_without_asking`.
 A save can answer 409 for a risk. See [Risk refusals](#risk-refusals).
@@ -261,7 +262,7 @@ It has the same rights as that user has in the UI.
 - A user with the `schedules.admin` permission (a project admin) sees every schedule of the project. They may edit, pause, resume and delete any of them, change the owner, and run them now.
 - The owner and any user with the `schedules.admin` permission may run a schedule now (Test). They also need the `schedules.run` permission. A user who is neither the owner nor a `schedules.admin` user gets 404, because the schedule is outside their scope.
 - Only the schedule owner may approve or reject a run in status `waiting_for_approval`, or answer its sign-in request (Authorize or Skip). This holds for every run tied to a schedule or webhook: a cron run, a webhook run, and Run now, also when a project admin started it. Any other caller gets 403, a project admin included. A member who is neither the owner nor an admin gets 404 on the REST routes, because the schedule is hidden from them.
-- An admin's Run now acts with the admin's credentials. Run without asking does not apply to it, so it always pauses before a sensitive action, and the schedule owner decides. This means the owner approves or rejects actions that use someone else's credentials, the admin's. The owner can be any project member. A project admin should start Run now on another user's schedule only when this is acceptable. A draft Test run has no schedule row and stays with the user who started it.
+- An admin's Run now acts with the admin's credentials. This includes Run now on an index schedule of another owner: it is allowed and runs as the admin. Run without asking does not apply to it, so it always pauses before a sensitive action, and the schedule owner decides. This means the owner approves or rejects actions that use someone else's credentials, the admin's. The owner can be any project member. A project admin should start Run now on another user's schedule only when this is acceptable. A draft Test run has no schedule row and stays with the user who started it.
 - A project admin may pause, resume, change the owner, delete, Run now, and start a Test run as themselves. After Change owner, a waiting run stays with the owner it had when it started: the old owner keeps it and the new owner gets 403 on it. New runs go to the new owner.
 - Each schedule has `allowed_actions`: the actions the caller may take on it.
 
@@ -285,7 +286,7 @@ Every refusal of the Schedules API has the same `body`:
 | 400 | A field is not valid: `code` is `invalid_input` and `field` names the field, for example a bad `cron` or a `run_mode` rule. |
 | 403 | The caller lacks the right for this action, for example a user without the `schedules.run` permission. A caller who is not the schedule owner of the run and approves, rejects or answers a sign-in (Authorize or Skip) also gets 403, a project admin included. After Change owner, the new owner gets 403 on a run that started under the old owner. The REST decision route answers with `code` `not_owner`. The chat answer has `error` and `status`, but no `code`. |
 | 404 | The schedule does not exist, or it belongs to another user and the caller does not have the `schedules.admin` permission: `code` is `not_found` (`run_not_found` for a run). This includes Run now, approve and reject. |
-| 409 | Run now: a run of this schedule is still active. `code` is `run_active`, and `body["active_run_id"]` holds its id. Resume: the project has its maximum number of active schedules. |
+| 409 | Run now: a run of this schedule is still active. `code` is `run_active`, and `body["active_run_id"]` is the id of the active run. It is null when that run belongs to another user or is an index run that has no run row. Resume: the project has its maximum number of active schedules. |
 
 `update_schedule` with `enabled` raises `ValueError` before any request.
 
@@ -299,7 +300,11 @@ try:
 except ApiDetailsRequestError as error:
     if error.status_code != 409 or error.body.get("code") != "run_active":
         raise
-    print(f"Status {error.status_code}: run {error.body['active_run_id']} is still active")
+    active_run_id = error.body.get("active_run_id")  # null for another user's run or an index run
+    if active_run_id is None:
+        print(f"Status {error.status_code}: a run is still active")
+    else:
+        print(f"Status {error.status_code}: run {active_run_id} is still active")
 ```
 
 ## Risk refusals
