@@ -206,7 +206,7 @@ def test_new_async_call_drops_the_approval_left_by_an_earlier_failure():
         try:
             await wrapped.ainvoke({'title': 'T'})
         except NotImplementedError:
-            pass  # the first async call is meant to fail; the test checks the approval it leaves behind
+            pass
         wrapped.async_ok = True
         await wrapped.ainvoke({'title': 'T'})
         wrapped.invoke({'title': 'T'})
