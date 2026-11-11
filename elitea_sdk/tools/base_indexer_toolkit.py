@@ -160,6 +160,12 @@ class IndexingStats:
     # Not a failure: parent is unchanged, so we skip it to save work.
     documents_already_indexed: Set[str] = field(default_factory=set)
 
+    # Indexed documents that a source could not describe with its own metadata (SharePoint
+    # library mode: no list item, or several items share the file name). Informational: the
+    # documents were indexed, so these never enter total_skipped.
+    documents_without_metadata: Set[str] = field(default_factory=set)
+    documents_metadata_ambiguous: Set[str] = field(default_factory=set)
+
     # Dependent/child items that failed within successful parent documents
     # These are tracked separately since the parent document was still indexed
     dependent_items_skipped: Set[str] = field(default_factory=set)
@@ -270,6 +276,14 @@ class IndexingStats:
                 "count": len(self.documents_already_indexed),
                 "items": sorted(self.documents_already_indexed),
             },
+            "documents_without_metadata": {
+                "count": len(self.documents_without_metadata),
+                "items": sorted(self.documents_without_metadata),
+            },
+            "documents_metadata_ambiguous": {
+                "count": len(self.documents_metadata_ambiguous),
+                "items": sorted(self.documents_metadata_ambiguous),
+            },
         }
 
     def get_summary(self) -> str:
@@ -292,8 +306,9 @@ class IndexingStats:
 
         total_skipped = file_skips + doc_skips
         dependent_skipped = len(self.dependent_items_skipped) + len(self.images_not_described)
+        metadata_notes = len(self.documents_without_metadata) + len(self.documents_metadata_ambiguous)
 
-        if total_skipped == 0 and dependent_skipped == 0:
+        if total_skipped == 0 and dependent_skipped == 0 and metadata_notes == 0:
             return ""
 
         if total_skipped > 0:
@@ -385,6 +400,15 @@ class IndexingStats:
             if len(sorted_unchanged) > 5:
                 lines.append(f"    ... and {len(sorted_unchanged) - 5} more")
 
+        for title, names in (("Indexed with no metadata", self.documents_without_metadata),
+                             ("Indexed without metadata, several list items match the file name",
+                              self.documents_metadata_ambiguous)):
+            if names:
+                ordered = sorted(names)
+                lines.append(f"\n{title} ({len(ordered)}): {', '.join(ordered[:5])}")
+                if len(ordered) > 5:
+                    lines.append(f"    ... and {len(ordered) - 5} more")
+
         return "\n".join(lines)
 
     def build_report(
@@ -433,6 +457,14 @@ class IndexingStats:
                     dependent=True, counted=False,
                 )
             )
+
+        # Indexed, but without the source's own metadata: context for the indexed count,
+        # never counted again.
+        for reason, label, attribute in _METADATA_NOTE_SPECS:
+            items = sorted(getattr(self, attribute))
+            if items:
+                categories[ReportKind.INDEXED]["groups"].append(
+                    _build_report_group(reason, label, items, counted=False))
 
         # Unchanged items are reported beside the categories, never inside `skipped`:
         # they were not left out of the index, and folding them in would make every
@@ -488,6 +520,12 @@ _REPORT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, Tuple[str, ...]], ...] = 
      ("files_skipped_read_error",)),
     (ReportKind.FAILED, "processing_error", "Could not be processed",
      ("documents_skipped_error", "runtime_skipped_error")),
+)
+
+_METADATA_NOTE_SPECS: Tuple[Tuple[str, str, str], ...] = (
+    ("no_metadata", "Indexed with no metadata", "documents_without_metadata"),
+    ("ambiguous_metadata", "Indexed without metadata: several list items match the file name",
+     "documents_metadata_ambiguous"),
 )
 
 _DEPENDENT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, str, Optional[Tuple[str, str]]], ...] = (
