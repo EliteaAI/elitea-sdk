@@ -21,6 +21,7 @@ _SETTINGS = {
     "client_secret": "secret-not-sent",
     "refresh_token": None,
     "configuration_uuid": "uuid-1",
+    "configuration_project_id": 77,
 }
 
 
@@ -87,7 +88,10 @@ def test_dataverse_call_without_a_login_interrupts_for_sign_in():
     metadata = interrupt["resource_metadata"]
     assert metadata["oauth_authorization_server"]["token_endpoint"] == f"{_AUTHORITY}/oauth2/v2.0/token"
     assert metadata["configuration_uuid"] == "uuid-1"
+    assert metadata["configuration_project_id"] == 77
     assert metadata["provided_settings"]["mcp_client_id"] == "client-abc"
+    assert metadata["provided_settings"]["mcp_client_secret"] == "****"
+    assert metadata["provided_settings"]["credential_type"] == "dataverse"
 
 
 def test_dataverse_interrupt_payload_holds_no_secret():

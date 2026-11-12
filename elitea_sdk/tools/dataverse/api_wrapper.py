@@ -92,6 +92,7 @@ class DataverseApiWrapper(BaseToolApiWrapper):
     refresh_token: Optional[SecretStr] = None
     access_token: Optional[SecretStr] = None
     configuration_uuid: Optional[str] = None
+    configuration_project_id: Optional[int] = None
     # Set by the tool loader (_inject_toolkit_id); the chat sign-in reads the client secret by it
     toolkit_id: Optional[int] = None
 
@@ -100,6 +101,7 @@ class DataverseApiWrapper(BaseToolApiWrapper):
             "url": self.url, "tenant_id": self.tenant_id, "client_id": self.client_id,
             "client_secret": self.client_secret, "refresh_token": self.refresh_token,
             "access_token": self.access_token, "configuration_uuid": self.configuration_uuid,
+            "configuration_project_id": self.configuration_project_id,
         }
 
     def _login_required(self, error: DataverseLoginRequired) -> ToolException:
@@ -112,6 +114,9 @@ class DataverseApiWrapper(BaseToolApiWrapper):
             return ToolException(str(signal))
         signal.tool_name = None  # the runner names the leaf tool
         signal.toolkit_id = self.toolkit_id
+        # Masked marker: the chat sign-in window skips the secret field, the proxy reads it by toolkit id
+        if self.toolkit_id is not None and self.client_secret and self.client_secret.get_secret_value():
+            signal.resource_metadata["provided_settings"]["mcp_client_secret"] = "****"
         return signal
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:

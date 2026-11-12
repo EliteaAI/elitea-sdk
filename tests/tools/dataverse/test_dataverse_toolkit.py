@@ -121,11 +121,34 @@ def test_missing_refresh_token_requests_login_with_entra_endpoints(http):
     assert meta["scopes_supported"] == [f"{ORG}/user_impersonation", "offline_access"]
     assert meta["configuration_uuid"] == "uuid-1"
     assert meta["provided_settings"]["mcp_client_id"] == "client-1"
+    # The credential and toolkit pages have no toolkit id, so their window keeps sending the form secret
     assert "mcp_client_secret" not in meta["provided_settings"]
+    assert meta["provided_settings"]["credential_type"] == "dataverse"
+    assert "secret-1" not in str(exc.value.to_dict())
     assert http.token_calls == []
 
 
 LOGGED_OUT = {**SETTINGS, "refresh_token": None, "configuration_uuid": "uuid-1"}
+
+
+def _sign_in_signal(settings, toolkit_id):
+    tool = tools(settings)["who_am_i"]
+    tool.api_wrapper.toolkit_id = toolkit_id
+    with pytest.raises(McpAuthorizationRequired) as exc:
+        tool.run({})
+    return exc.value.resource_metadata["provided_settings"]
+
+
+def test_chat_sign_in_reads_the_stored_secret_by_toolkit_id(http):
+    # Fully masked: the window skips the secret field and the proxy resolves the secret from the toolkit row
+    settings = _sign_in_signal(LOGGED_OUT, 4711)
+    assert settings["mcp_client_secret"] == "****"
+    assert settings["credential_type"] == "dataverse"
+
+
+def test_sign_in_without_a_toolkit_row_lets_the_window_ask_for_the_secret(http):
+    # Standalone runs have no toolkit id, so the proxy has no row to read the secret from
+    assert "mcp_client_secret" not in _sign_in_signal(LOGGED_OUT, None)
 
 
 def test_tool_call_without_login_asks_for_a_sign_in(http):
