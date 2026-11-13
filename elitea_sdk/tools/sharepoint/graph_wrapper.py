@@ -260,6 +260,16 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             resp = requests.delete(url, headers=self._auth_headers(), timeout=30)
         self._raise_with_body(resp)
 
+    def library_list_client(self):
+        """Graph list reads for library mode with this delegated token (refreshed on a 401)."""
+        from .library_metadata import GraphListClient
+        return GraphListClient(
+            self.site_url,
+            get_token=lambda: self._token,
+            refresh=self._try_refresh_token,
+            on_unauthorized=self._raise_authorization_required,
+        )
+
     # ------------------------------------------------------------------ #
     #  Site / Drive resolution (lazily cached)                            #
     # ------------------------------------------------------------------ #

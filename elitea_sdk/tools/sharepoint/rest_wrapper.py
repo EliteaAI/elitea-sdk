@@ -73,6 +73,29 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             token_json="",
         )
 
+    def library_list_client(self):
+        """Graph list reads for library mode with an app-only Graph token from the app credentials."""
+        if not (self._client_id and self._client_secret):
+            return super().library_list_client()
+        from .library_metadata import GraphListClient, LibraryMetadataError
+        token_holder: dict = {}
+
+        def get_token() -> str:
+            if 'token' not in token_holder:
+                try:
+                    token_holder['token'], _ = self._graph_helper().generate_token_and_site_id(self.site_url)
+                except Exception as exc:   # the helper's message may carry the token endpoint, not secrets
+                    logging.warning("[SP-library] app-only Graph token failed: %s", type(exc).__name__)
+                    raise LibraryMetadataError(
+                        "Could not get a Microsoft Graph token with the app credentials. Check the client id, "
+                        "the secret and that the app has the Graph Sites.Read.All application permission.")
+            return token_holder['token']
+
+        def refresh() -> bool:   # app-only tokens are re-issued, not refreshed: drop the cached one once
+            return token_holder.pop('token', None) is not None
+
+        return GraphListClient(self.site_url, get_token=get_token, refresh=refresh)
+
     def _rest_bfs_files(self, root_folder_url: str, limit_files: int) -> list:
         """Enumerate files using parallel BFS with non-recursive per-folder REST calls."""
         from concurrent.futures import ThreadPoolExecutor, as_completed

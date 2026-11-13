@@ -248,3 +248,16 @@ class BaseSharepointWrapper(ABC):
                            end_line: Optional[int] = None
                            ) -> Union[str, Dict[str, Any]]:
         raise ToolException(self._FILE_URL_NOT_SUPPORTED)
+
+    # ------------------------------------------------------------------ #
+    #  Document-library mode (#7352): Graph reads of library list items   #
+    # ------------------------------------------------------------------ #
+
+    _LIBRARY_MODE_NOT_SUPPORTED = (
+        "Library mode reads the library lists through Microsoft Graph. Use a credential with a "
+        "Microsoft sign-in (OAuth) or with app credentials (client id and secret)."
+    )
+
+    def library_list_client(self):
+        """A :class:`library_metadata.GraphListClient` bound to this backend's credential."""
+        raise ToolException(self._LIBRARY_MODE_NOT_SUPPORTED)
