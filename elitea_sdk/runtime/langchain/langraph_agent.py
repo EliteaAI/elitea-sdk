@@ -2389,7 +2389,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     "preservation (tool=%s)",
                                     hitl_interrupt.get('tool_name', ''),
                                 )
-                    elif guardrail_type == 'clarifying_question':
+                    elif guardrail_type in ('clarifying_question', 'credential_form'):
                         # Ask-user (clarifying question) resume. The ask_user tool
                         # fired interrupt() from inside the single LLM+tools node,
                         # so re-executing the node would re-invoke the LLM non-
@@ -2397,8 +2397,11 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         # the sensitive-tool path) so the LLM node skips the LLM
                         # call and re-issues the SAME ask_user tool call; its own
                         # interrupt() then consumes the resume value (the answer).
+                        # (#7228) the credential form's tool resumes the same way; its record arrives as
+                        # the resume value, which the tool turns into a fixed sentence
+                        form_tool = 'request_credential' if guardrail_type == 'credential_form' else 'ask_user'
                         resume_ctx = {
-                            'tool_name': 'ask_user',
+                            'tool_name': form_tool,
                             'toolkit_name': '',
                             'tool_args': hitl_interrupt.get('tool_args', {}) or {},
                             'tool_call_id': (
@@ -2419,14 +2422,14 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                 resume_ctx['pending_messages'] = trimmed
                             original_ai_dict = self._extract_original_ai_message(
                                 pending_msgs_dicts,
-                                tool_name='ask_user',
+                                tool_name=form_tool,
                                 tool_args=resume_ctx['tool_args']
                                 if isinstance(resume_ctx['tool_args'], dict) else {},
                             )
                             if original_ai_dict is not None:
                                 resume_ctx['original_ai_message'] = original_ai_dict
                         hitl_resume_ctx = resume_ctx
-                        logger.info("[HITL] Prepared clarifying-question resume for ask_user")
+                        logger.info("[HITL] Prepared %s resume for %s", guardrail_type, form_tool)
                     elif guardrail_type in {
                         'parallel_sensitive_tools',
                         'parallel_mcp_auth',
@@ -3317,7 +3320,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         if not (hitl_interrupt and hitl_resume_ctx and is_execution_finished):
             return False
 
-        if hitl_interrupt.get('guardrail_type') not in ('sensitive_tool', 'clarifying_question'):
+        if hitl_interrupt.get('guardrail_type') not in ('sensitive_tool', 'clarifying_question', 'credential_form'):
             return False
 
         interrupt_id = str(hitl_interrupt.get('interrupt_id') or '').strip()
@@ -3501,7 +3504,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         # hitl_resume flag) still routes to the resume path.
         return normalized_action in {
             'approve', 'reject', 'edit', 'block_with_comment', 'reject_with_comment',
-            'answer',
+            'answer', 'created', 'cancel',
         }
 
     @staticmethod
