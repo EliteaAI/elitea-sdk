@@ -290,6 +290,25 @@ class McpAuthorizationRequired(ToolException):
         return result
 
 
+def mcp_authorization_from_dict(data: Dict[str, Any]) -> McpAuthorizationRequired:
+    """Rebuild the error ``McpAuthorizationRequired.to_dict`` serialized."""
+    error = McpAuthorizationRequired(
+        data.get("message") or "Authorization required",
+        server_url=data.get("server_url"),
+        resource_metadata_url=data.get("resource_metadata_url"),
+        www_authenticate=data.get("www_authenticate"),
+        resource_metadata=data.get("resource_metadata"),
+        status=data.get("status"),
+        tool_name=data.get("tool_name"),
+        toolkit_type=data.get("toolkit_type"),
+        toolkit_name=data.get("toolkit_name"),
+    )
+    for attribute in ("authorization_servers", "toolkit_id", "provided_settings"):
+        if data.get(attribute) is not None:
+            setattr(error, attribute, data[attribute])
+    return error
+
+
 def extract_authorization_uri(www_authenticate: Optional[str]) -> Optional[str]:
     """
     Extract authorization_uri from WWW-Authenticate header.

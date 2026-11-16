@@ -1479,8 +1479,8 @@ def create_graph(
 
                 # When an explicitly connected toolkit cannot load before OAuth, its
                 # real tools are replaced by a deferred authorization gateway. Preserve
-                # that gateway (and the preferred auth control tool) on this LLM node;
-                # otherwise exact-name filtering removes the entire toolkit.
+                # that gateway on this LLM node; otherwise exact-name filtering removes
+                # the entire toolkit.
                 if connected_toolkit_names:
                     auth_gateway_names = []
                     for tool in tools:
@@ -1505,17 +1505,6 @@ def create_graph(
                             ):
                                 available_tools.append(tool)
                                 selected_ids.add(id(tool))
-                        if any(
-                            isinstance(tool, BaseTool) and tool.name == 'mcp_auth_control'
-                            for tool in tools
-                        ):
-                            auth_control = next(
-                                tool for tool in tools
-                                if isinstance(tool, BaseTool) and tool.name == 'mcp_auth_control'
-                            )
-                            if id(auth_control) not in selected_ids:
-                                available_tools.append(auth_control)
-                                selected_ids.add(id(auth_control))
 
                 # For non-agent LLM nodes (PIPELINE node without toolkits defined) we don't add any hidden tools by default, to avoid confusion and encourage explicit tool selection
                 if explicit_tool_selection:
