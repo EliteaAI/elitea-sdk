@@ -12,6 +12,11 @@ from elitea_sdk.configurations.outlook import (
     OUTLOOK_SCOPES,
     OutlookConfiguration,
 )
+from elitea_sdk.configurations.sharepoint import (
+    SHAREPOINT_DEFAULT_SCOPES,
+    SHAREPOINT_SCOPES,
+    SharepointConfiguration,
+)
 from elitea_sdk.configurations.teams import TEAMS_DEFAULT_SCOPES, TEAMS_SCOPES, TeamsConfiguration
 from elitea_sdk.tools.outlook.api_wrapper import OutlookApiWrapper
 from elitea_sdk.tools.outlook.graph_wrapper import OutlookGraphWrapper
@@ -64,6 +69,7 @@ class TestCredentialSchema:
     @pytest.mark.parametrize("model, options, default", [
         (OutlookConfiguration, OUTLOOK_SCOPES, OUTLOOK_DEFAULT_SCOPES),
         (TeamsConfiguration, TEAMS_SCOPES, TEAMS_DEFAULT_SCOPES),
+        (SharepointConfiguration, SHAREPOINT_SCOPES, SHAREPOINT_DEFAULT_SCOPES),
     ])
     def test_scopes_field_is_a_checkbox_list(self, model, options, default):
         field = model.model_json_schema()["properties"]["scopes"]
@@ -74,12 +80,28 @@ class TestCredentialSchema:
         assert "myapps.microsoft.com" in field["description"]
 
     def test_user_read_and_offline_access_are_not_options(self):
-        assert "User.Read" not in TEAMS_SCOPES
-        assert "offline_access" not in TEAMS_SCOPES + OUTLOOK_SCOPES
+        assert "User.Read" not in TEAMS_SCOPES + SHAREPOINT_SCOPES
+        assert "offline_access" not in TEAMS_SCOPES + OUTLOOK_SCOPES + SHAREPOINT_SCOPES
 
     def test_default_scopes_are_offered(self):
         assert set(OUTLOOK_DEFAULT_SCOPES) <= set(OUTLOOK_SCOPES)
         assert set(TEAMS_DEFAULT_SCOPES) <= set(TEAMS_SCOPES)
+        assert set(SHAREPOINT_DEFAULT_SCOPES) <= set(SHAREPOINT_SCOPES)
+
+    def test_sharepoint_default_covers_every_tool(self):
+        # ReadWrite includes Read: sites and lists, files and sharing links, OneNote
+        assert SHAREPOINT_DEFAULT_SCOPES == ["Sites.ReadWrite.All", "Files.ReadWrite.All", "Notes.ReadWrite.All"]
+
+    def test_sharepoint_saved_values_are_normalized(self):
+        # Free text saved before the list existed: unknown values (and a non-Graph permission) are dropped
+        config = SharepointConfiguration(client_id="stub-client", client_secret="stub-secret",
+                                         scopes="sites.read.all, Lists.ReadWrite.All offline_access "
+                                                "https://graph.microsoft.com/Notes.Read.All")
+        assert config.scopes == ["Sites.Read.All", "Notes.Read.All"]
+
+    def test_sharepoint_missing_scopes_use_default(self):
+        config = SharepointConfiguration(client_id="stub-client", client_secret="stub-secret")
+        assert config.scopes == SHAREPOINT_DEFAULT_SCOPES
 
     def test_saved_values_are_normalized(self):
         config = OutlookConfiguration(client_id="stub-client", client_secret="stub-secret",

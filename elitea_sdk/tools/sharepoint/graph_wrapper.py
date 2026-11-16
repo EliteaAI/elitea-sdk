@@ -6,9 +6,10 @@ OAuth flow).  It communicates directly with
 ``https://graph.microsoft.com/v1.0`` using plain ``requests`` calls — the
 *office365-rest-python-client* library is **not** used here.
 
-Required OAuth scopes (delegated):
-    ``Sites.ReadWrite.All``, ``Files.ReadWrite.All``, ``Lists.ReadWrite.All``
-    (read-only variants also work for non-mutating operations)
+OAuth scopes (delegated): the SharePoint credential's list (``SHAREPOINT_SCOPE_DESCRIPTIONS`` in
+``elitea_sdk/configurations/sharepoint.py``); by default ``Sites.ReadWrite.All``,
+``Files.ReadWrite.All`` and ``Notes.ReadWrite.All``. Read-only variants cover the reading tools,
+except sharing links (``/shares`` has no read-only permission).
 """
 from __future__ import annotations
 
