@@ -3,7 +3,7 @@ import logging
 from typing import Optional, List, Dict
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from .microsoft_graph_scopes import SCOPES_NOTE, normalize_scopes, scopes_field_extra
+from .microsoft_graph_scopes import SCOPES_NOTE, admin_consent_scopes, normalize_scopes, scopes_field_extra
 from .oauth_app_mode import OAUTH_APP_ID_FIELD, require_app_client
 
 log = logging.getLogger(__name__)
@@ -11,13 +11,22 @@ log = logging.getLogger(__name__)
 # Permissions offered as checkboxes, in display order (Microsoft Graph delegated permissions).
 TEAMS_SCOPE_DESCRIPTIONS: Dict[str, str] = {
     "User.ReadBasic.All": "Look up people by email: chat members, senders and recipients.",
-    "Chat.Read": "Read your chats and chat messages: list_chats, find_chat_messages, search_teams_messages.",
+    "Chat.Read": (
+        "Read your chats and chat messages: list_chats, find_chat_messages. "
+        "search_teams_messages also needs ChannelMessage.Read.All."
+    ),
     "ChatMessage.Send": "Send chat messages as you: send_chat_message.",
     "Chat.Create": "Start a new 1:1 or group chat when send_chat_message finds no existing chat.",
     "Team.ReadBasic.All": "List the teams you are a member of: list_teams, team names, connection test.",
     "Channel.ReadBasic.All": "List the channels of a team: list_channels, channel names.",
     "ChannelMessage.Send": "Post and reply in channels as you: send_channel_message.",
+    "ChannelMessage.Read.All": (
+        "Search and read channel messages (search_teams_messages across channels). "
+        "Requires Entra admin consent. Leave off unless your Entra admin has granted it."
+    ),
 }
+# Only an Entra admin can grant these: never preselected, flagged in the schema for the UIs and the sign-in prompt
+TEAMS_ADMIN_CONSENT_SCOPES = ["ChannelMessage.Read.All"]
 TEAMS_SCOPES = list(TEAMS_SCOPE_DESCRIPTIONS)
 TEAMS_DEFAULT_SCOPES = ["User.ReadBasic.All", "Chat.Read", "Team.ReadBasic.All", "Channel.ReadBasic.All"]
 
@@ -70,7 +79,7 @@ class TeamsConfiguration(BaseModel):
     scopes: Optional[List[str]] = Field(
         default=list(TEAMS_DEFAULT_SCOPES),
         description=SCOPES_NOTE,
-        json_schema_extra=scopes_field_extra(TEAMS_SCOPE_DESCRIPTIONS),
+        json_schema_extra=scopes_field_extra(TEAMS_SCOPE_DESCRIPTIONS, TEAMS_ADMIN_CONSENT_SCOPES),
     )
     auto_refresh_token: Optional[bool] = Field(
         default=True,
@@ -320,6 +329,10 @@ class TeamsConfiguration(BaseModel):
                 provided_settings["mcp_client_secret"] = mask_secret(secret_value)
         if effective_scopes:
             provided_settings["scopes"] = effective_scopes
+            # The sign-in window explains a refused sign-in by these (Entra admin consent)
+            consent_scopes = admin_consent_scopes(TeamsConfiguration, effective_scopes)
+            if consent_scopes:
+                provided_settings["admin_consent_scopes"] = consent_scopes
         if oauth_app_id:
             # Default app mode: the platform holds the secret; sign-in sends this reference instead
             provided_settings["oauth_app_id"] = oauth_app_id

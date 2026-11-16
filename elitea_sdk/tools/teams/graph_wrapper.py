@@ -9,11 +9,13 @@ OAuth scopes (delegated), ticked in the Teams credential:
     ChatMessage.Send, Chat.Create             send to people / group chats
     Team.ReadBasic.All, Channel.ReadBasic.All list teams and channels
     ChannelMessage.Send                       post / reply in channels
+    ChannelMessage.Read.All (admin consent)   search_teams_messages (Search API)
     (offline_access is always added, for token refresh)
 
 Graph has no delegated "all my chats" message feed, so messages are read per
-chat, or found across Teams with the Search API. Reading channel messages
-needs ChannelMessage.Read.All (admin consent) and is intentionally not supported.
+chat, or found across Teams with the Search API. The Search API for Teams
+messages needs ChannelMessage.Read.All on top of Chat.Read; it needs Entra admin
+consent, so it is optional and never preselected.
 """
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ from urllib.parse import urlparse
 import requests
 from langchain_core.tools import ToolException
 
-from ...configurations.microsoft_graph_scopes import missing_permission_hint
+from ...configurations.microsoft_graph_scopes import admin_consent_scopes, missing_permission_hint
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -76,7 +78,8 @@ def _needed_permission(method: Optional[str], url: str) -> Optional[str]:
             return "ChatMessage.Send" if "messages" in parts else "Chat.Create"
         return "Chat.Read"
     if parts[0] == "search":
-        return "Chat.Read"
+        # Chat.Read is a default scope; the Search API refuses Teams messages without this one
+        return "ChannelMessage.Read.All"
     if parts[0] in ("users", "me"):
         return "User.ReadBasic.All"
     return None
@@ -355,7 +358,8 @@ class TeamsGraphWrapper:
         where = ""
         hint = ""
         if resp.status_code == 403:
-            hint = missing_permission_hint(_needed_permission(method, resp.url))
+            needed = _needed_permission(method, resp.url)
+            hint = missing_permission_hint(needed, bool(admin_consent_scopes(TeamsConfiguration, [needed])))
         elif resp.status_code == 404:
             path = urlparse(resp.url or "").path
             if path:

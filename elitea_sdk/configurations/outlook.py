@@ -3,7 +3,7 @@ import logging
 from typing import Optional, List, Dict
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from .microsoft_graph_scopes import SCOPES_NOTE, normalize_scopes, scopes_field_extra
+from .microsoft_graph_scopes import SCOPES_NOTE, admin_consent_scopes, normalize_scopes, scopes_field_extra
 from .oauth_app_mode import OAUTH_APP_ID_FIELD, require_app_client
 
 log = logging.getLogger(__name__)
@@ -339,6 +339,10 @@ class OutlookConfiguration(BaseModel):
                 provided_settings["mcp_client_secret"] = mask_secret(secret_value)
         if effective_scopes:
             provided_settings["scopes"] = effective_scopes
+            # The sign-in window explains a refused sign-in by these (Entra admin consent)
+            consent_scopes = admin_consent_scopes(OutlookConfiguration, effective_scopes)
+            if consent_scopes:
+                provided_settings["admin_consent_scopes"] = consent_scopes
         if oauth_app_id:
             # Default app mode: the platform holds the secret; sign-in sends this reference instead
             provided_settings["oauth_app_id"] = oauth_app_id
