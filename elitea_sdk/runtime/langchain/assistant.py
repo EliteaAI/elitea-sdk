@@ -23,6 +23,8 @@ from .constants import (
 )
 from ..middleware.tool_exception_handler import (
     ToolExceptionHandlerMiddleware,
+    pending_authorization,
+    resolve_pending_authorizations,
     swarm_awrap_tool_call,
     swarm_handle_tool_errors,
     swarm_wrap_tool_call,
@@ -460,7 +462,7 @@ class Assistant:
             logger.info(f"Added {len(actual_internal_tools)} internal tools as first-class: {actual_internal_tools}")
 
         # For pipeline agents, find the toolkit names of direct MCP/toolkit pipeline nodes
-        # so that mcp_auth_control is not injected for them (direct nodes bypass LLM decision-making).
+        # so that a skip on such a node stops the pipeline (direct nodes bypass LLM decision-making).
         pipeline_node_toolkit_names = None
         if self.app_type == APP_TYPE_PIPELINE:
             try:
@@ -502,8 +504,7 @@ class Assistant:
             # two toolkits with same-named tools (e.g. GitHub's create_issue and
             # Jira's create_issue) are both preserved.
             # Process injected tools first, then get_tools() results — get_tools() wins on
-            # conflict.  This ensures mcp_auth_control from get_tools() (which carries the
-            # ignored_mcp_servers guard) takes precedence over the injected version.
+            # conflict.
             _seen: dict = {}
             for _t in tools:
                 _toolkit = (getattr(_t, 'metadata', None) or {}).get('toolkit_name')
@@ -1001,6 +1002,13 @@ class Assistant:
         # Not "parent" or "coordinator" — just another peer in the swarm.
         main_agent_name = "main_agent"
 
+        def _repeats_paused_request(prior_msgs: list, new_human: HumanMessage) -> bool:
+            """Continuing a run paused for authorization re-sends its request; asking it again would redo finished steps."""
+            if not pending_authorization(prior_msgs):
+                return False
+            paused_request = next((m for m in reversed(prior_msgs) if isinstance(m, HumanMessage)), None)
+            return paused_request is not None and paused_request.text == new_human.text
+
         # --- Helper: filter orphaned tool_use blocks from message history ---
         def filter_orphaned_tool_calls(messages: list) -> list:
             """
@@ -1055,6 +1063,10 @@ class Assistant:
 
             def agent_node(state: MessagesState, config: RunnableConfig = None):
                 messages = state["messages"]
+                # Ending the subgraph here commits the batch to the swarm state; the
+                # wrapper raises once the graph returns (#7470).
+                if pending_authorization(messages):
+                    return {"messages": []}
                 # Filter out existing system messages to avoid "multiple non-consecutive system messages" error
                 filtered_messages = [m for m in messages if not isinstance(m, SystemMessage)]
                 # Filter orphaned tool_use blocks to avoid Anthropic API errors
@@ -1609,12 +1621,20 @@ class Assistant:
                                     break
                             if new_human is not None:
                                 input = dict(input)
-                                input["messages"] = [new_human]
+                                input["messages"] = resolve_pending_authorizations(prior_msgs, main_tools) + (
+                                    [] if _repeats_paused_request(prior_msgs, new_human) else [new_human]
+                                )
                                 logger.info(
                                     "[SWARM] Continuation: keeping checkpoint state, "
                                     "appending only the new HumanMessage"
                                 )
                     result = self._graph.invoke(input, config, **kwargs)
+
+                deferred_authorization = pending_authorization(
+                    result.get("messages", []) if isinstance(result, dict) else []
+                )
+                if deferred_authorization:
+                    raise deferred_authorization
 
                 # Check for HITL interrupt: when a peer's Application tool calls
                 # interrupt(), the swarm pregel suppresses GraphInterrupt and

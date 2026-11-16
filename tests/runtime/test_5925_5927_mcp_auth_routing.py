@@ -79,53 +79,15 @@ def test_pipeline_mcp_config_defers_auth_to_checkpointed_node(monkeypatch):
         proxy.invoke({})
 
 
-def test_auth_control_resolves_participant_name_through_dynamic_mcp_type(monkeypatch):
-    """Conversation toolkit display names must resolve to the configured MCP URL."""
-
-    discovered_urls = []
-
-    monkeypatch.setattr(
-        runtime_tools,
-        "load_mcp_servers_config",
-        lambda: {SERVER_NAME: {"url": SERVER_URL}},
-    )
-
-    from elitea_sdk.runtime.utils import mcp_tools_discovery
-
-    def discover_mcp_tools(*, url, **_kwargs):
-        discovered_urls.append(url)
-        return []
-
-    monkeypatch.setattr(mcp_tools_discovery, "discover_mcp_tools", discover_mcp_tools)
-
-    toolkit_config = {
-        "type": f"mcp_{SERVER_NAME}",
-        "toolkit_name": TOOLKIT_NAME,
-        "settings": {},
-    }
-    auth_control = runtime_tools._make_mcp_auth_control_tool([toolkit_config])[0]
-
-    result = json.loads(
-        auth_control.func(
-            action="authorize",
-            server_url=TOOLKIT_NAME,
-            tool_name="get_lists",
-        )
-    )
-
-    assert discovered_urls == [SERVER_URL]
-    assert result["server_url"] == SERVER_URL
-
-
-def test_auth_control_uses_delegated_toolkit_auth_url(monkeypatch):
-    """A built-in SharePoint alias must re-raise auth with its configured URL."""
+def test_delegated_auth_gateway_raises_with_its_configured_url(monkeypatch):
+    """A built-in SharePoint gateway must raise auth with its configured URL."""
 
     _patch_sharepoint_auth_loader(monkeypatch)
     tools = runtime_tools.get_tools([_sharepoint_tool_config()])
-    auth_control = next(tool for tool in tools if tool.name == "mcp_auth_control")
+    gateway = next(tool for tool in tools if tool.name.startswith("mcp_authorize_"))
 
     with pytest.raises(McpAuthorizationRequired) as exc_info:
-        auth_control.func(action="authorize", server_url="sharepoint")
+        gateway.func()
 
     assert exc_info.value.server_url == SHAREPOINT_URL
     assert exc_info.value.toolkit_name == "sharepoint"
@@ -371,12 +333,12 @@ def test_multiple_agent_toolkits_keep_distinct_auth_urls(monkeypatch):
             _sharepoint_tool_config("sharepoint-second", second_url),
         ]
     )
-    auth_control = next(tool for tool in tools if tool.name == "mcp_auth_control")
+    gateways = {tool.name: tool for tool in tools if tool.name.startswith("mcp_authorize_")}
 
     with pytest.raises(McpAuthorizationRequired) as first_request:
-        auth_control.func(action="authorize", server_url="sharepoint-first")
+        gateways["mcp_authorize_sharepoint-first"].func()
     with pytest.raises(McpAuthorizationRequired) as second_request:
-        auth_control.func(action="authorize", server_url="sharepoint-second")
+        gateways["mcp_authorize_sharepoint-second"].func()
 
     assert first_request.value.server_url == first_url
     assert second_request.value.server_url == second_url
@@ -390,11 +352,6 @@ def test_pipeline_llm_binds_auth_tools_for_selected_unavailable_toolkit():
         name="mcp_authorize_sharepoint",
         description="SharePoint authorization gateway",
         metadata={"toolkit_name": "sharepoint", "toolkit_type": "sharepoint"},
-    )
-    auth_control = StructuredTool.from_function(
-        func=lambda: "authorization required",
-        name="mcp_auth_control",
-        description="Authorization control",
     )
     normal_tool = StructuredTool.from_function(
         func=lambda: "ok",
@@ -425,14 +382,13 @@ def test_pipeline_llm_binds_auth_tools_for_selected_unavailable_toolkit():
     graph = create_graph(
         client=None,
         yaml_schema=schema,
-        tools=[proxy, auth_control, normal_tool],
+        tools=[proxy, normal_tool],
         memory=MemorySaver(),
     )
     llm_node = graph.get_graph().nodes["LLM1"].data
 
     assert {tool.name for tool in llm_node.get_filtered_tools()} == {
         "mcp_authorize_sharepoint",
-        "mcp_auth_control",
         "search_issues",
     }
 

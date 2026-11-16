@@ -26,6 +26,7 @@ Example:
 
 import asyncio
 import inspect
+import json
 import logging
 from functools import wraps
 from typing import List, Optional, Dict, Any, Callable, Tuple
@@ -44,8 +45,12 @@ from elitea_sdk.runtime.tool_outcome import (
     retriable_for,
 )
 from elitea_sdk.runtime.credential_slots import GovernedCredentialError
-from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
-from langchain_core.messages import ToolMessage
+from elitea_sdk.runtime.utils.mcp_oauth import (
+    McpAuthorizationRequired,
+    build_mcp_auth_decision_result,
+    mcp_authorization_from_dict,
+)
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from langgraph.errors import GraphBubbleUp
 
@@ -146,17 +151,97 @@ def _stamp_error_status(result, recorded):
     return result
 
 
+AUTH_PENDING_ARTIFACT_KEY = 'mcp_auth_pending'
+
+
+def _auth_pending_message(request, error: McpAuthorizationRequired) -> ToolMessage:
+    """Answer the guarded call so ToolNode commits its siblings; the agent node raises it next (#7470)."""
+    return ToolMessage(
+        content=json.dumps({'status': 'authorization_pending', 'toolkit_name': error.toolkit_name}),
+        tool_call_id=request.tool_call['id'],
+        artifact={AUTH_PENDING_ARTIFACT_KEY: error.to_dict()},
+    )
+
+
+def _pending_messages(messages: list) -> List[ToolMessage]:
+    batch_start = len(messages)
+    while batch_start and isinstance(messages[batch_start - 1], ToolMessage):
+        batch_start -= 1
+    return [
+        message for message in messages[batch_start:]
+        if isinstance(message.artifact, dict) and message.artifact.get(AUTH_PENDING_ARTIFACT_KEY)
+    ]
+
+
+def pending_authorization(messages: list) -> Optional[McpAuthorizationRequired]:
+    """The first authorization a swarm tool batch deferred, while that batch is still the latest turn."""
+    pending = _pending_messages(messages)
+    return mcp_authorization_from_dict(pending[0].artifact[AUTH_PENDING_ARTIFACT_KEY]) if pending else None
+
+
+def resolve_pending_authorizations(messages: list, tools: list) -> List[ToolMessage]:
+    """Replace each deferred result whose gateway shows the user's decision; an undecided one stays pending for its own card."""
+    gateways = {
+        (tool.metadata or {}).get('toolkit_name'): tool for tool in tools if tool.name.startswith('mcp_authorize_')
+    }
+    resolved = []
+    for message in _pending_messages(messages):
+        error = message.artifact[AUTH_PENDING_ARTIFACT_KEY]
+        gateway = gateways.get(error.get('toolkit_name'))
+        try:
+            declined = gateway.func() if gateway is not None else None
+        except McpAuthorizationRequired:
+            continue
+        resolved.append(ToolMessage(
+            id=message.id,
+            tool_call_id=message.tool_call_id,
+            content=declined or build_mcp_auth_decision_result(
+                status='authorization_resolved',
+                server_url=error.get('server_url') or '',
+                tool_name=error.get('tool_name') or '',
+                toolkit_type=error.get('toolkit_type') or '',
+                message=(
+                    'The user has made the authorization decision for this toolkit. The other results in '
+                    'this turn are already done.'
+                ),
+                next_step=(
+                    'Continue the original task from its next unfinished step. Do not repeat any step '
+                    'that already has a result above. Use this toolkit if its tools are now available, '
+                    'otherwise continue without it.'
+                ),
+            ),
+        ))
+    return resolved
+
+
+def _batch_hands_off(state) -> bool:
+    """A handoff Command replaces the swarm messages with its own, so a deferred sibling result would be lost."""
+    messages = state.get('messages', []) if isinstance(state, dict) else getattr(state, 'messages', None) or []
+    turn = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+    return turn is not None and any(call['name'].startswith('transfer_to_') for call in turn.tool_calls)
+
+
 def swarm_wrap_tool_call(request, execute):
     """``wrap_tool_call`` for the swarm ToolNodes (#6477)."""
-    with outcome_sink() as recorded:
-        result = execute(request)
+    try:
+        with outcome_sink() as recorded:
+            result = execute(request)
+    except McpAuthorizationRequired as error:
+        if _batch_hands_off(request.state):
+            raise
+        return _auth_pending_message(request, error)
     return _stamp_error_status(result, recorded)
 
 
 async def swarm_awrap_tool_call(request, execute):
     """``awrap_tool_call``: without it ToolNode would run the sync wrapper on the loop."""
-    with outcome_sink() as recorded:
-        result = await execute(request)
+    try:
+        with outcome_sink() as recorded:
+            result = await execute(request)
+    except McpAuthorizationRequired as error:
+        if _batch_hands_off(request.state):
+            raise
+        return _auth_pending_message(request, error)
     return _stamp_error_status(result, recorded)
 
 

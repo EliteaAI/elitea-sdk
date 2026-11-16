@@ -17,6 +17,7 @@ from langgraph.prebuilt import ToolNode
 from elitea_sdk.runtime.middleware.strategies import LoggingStrategy
 from elitea_sdk.runtime.middleware.tool_exception_handler import (
     ToolExceptionHandlerMiddleware,
+    pending_authorization,
     swarm_awrap_tool_call,
     swarm_handle_tool_errors,
     swarm_wrap_tool_call,
@@ -110,14 +111,15 @@ def test_content_and_artifact_failure_reports_error_status():
     assert message.status == "error"
 
 
-def test_signal_from_a_wrapped_tool_still_escapes():
+def test_auth_signal_from_a_wrapped_tool_is_deferred_not_swallowed():
     def _needs_auth() -> str:
         raise McpAuthorizationRequired("auth needed", "https://mcp.example")
 
     tool = _wrapped(StructuredTool.from_function(func=_needs_auth, name="mcp_tool", description="x"))
 
-    with pytest.raises(McpAuthorizationRequired):
-        _graph_with(tool).invoke({"messages": [_call("mcp_tool")]})
+    message = _last(_graph_with(tool).invoke({"messages": [_call("mcp_tool")]}))
+
+    assert pending_authorization([message]).server_url == "https://mcp.example"
 
 
 def test_unwrapped_raising_tool_is_unaffected():
