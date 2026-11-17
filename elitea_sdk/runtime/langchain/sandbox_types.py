@@ -39,3 +39,5 @@ class BridgeExecutionResult:
     error: str | None = None
     error_type: BridgeErrorType | None = None
     calls_completed: int = 0
+    # Calls still in flight when the run ended; their side effects may be partial or missing.
+    calls_cancelled: int = 0

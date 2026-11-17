@@ -359,6 +359,7 @@ async function runPython(
 }
 
 // --bridge: line-delimited JSON over stdin/stdout so a running program can call tools in the worker (#7578).
+// The protocol is owned by indexer_worker data/sandbox/main.js; keep this block in step with it.
 const DEFAULT_BRIDGE_MAX_LINE_BYTES = 4 * 1024 * 1024;
 const BRIDGE_FIRST_LINE_TIMEOUT_MS = 30000;
 const bridgeEncoder = new TextEncoder();

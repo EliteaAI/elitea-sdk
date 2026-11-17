@@ -6,6 +6,7 @@ where Deno or a Pyodide distribution is missing.
 """
 import asyncio
 import json
+import re
 import os
 import shutil
 import sys
@@ -70,6 +71,16 @@ FAKE_SANDBOX = textwrap.dedent(r'''
     elif scenario == "killed_during_call":
         send({"type": "call", "id": 1, "name": "t.echo", "args": "{}"})
         os.kill(os.getpid(), 9)
+    elif scenario == "fire_and_forget":
+        # The program started a write with create_task and returned without awaiting it.
+        send({"type": "call", "id": 1, "name": "t.slow", "args": "{}"})
+        time.sleep(0.3)
+        final(success=True, result="returned early")
+    elif scenario == "fanout":
+        for i in range(6):
+            send({"type": "call", "id": i, "name": "t.counted", "args": "{}"})
+        replies = [json.loads(sys.stdin.readline()) for _ in range(6)]
+        final(success=True, result=len(replies))
     elif scenario == "memory_error":
         final(error="MemoryError", error_type="out_of_memory")
 ''')
@@ -176,6 +187,31 @@ def test_cancellation_kills_the_process(sandbox):
     assert time.time() - started < 5
 
 
+def test_calls_in_flight_at_the_end_are_reported_as_cancelled(sandbox):
+    result = run(sandbox, "fire_and_forget")
+    assert result.status == "success" and result.result == "returned early"
+    assert result.calls_completed == 0
+    assert result.calls_cancelled == 1
+
+
+def test_concurrent_calls_are_capped(sandbox):
+    running = 0
+    peak = 0
+
+    async def counted(name, args_json):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.2)
+        running -= 1
+        return "null"
+
+    result = run(sandbox, "fanout", dispatcher=counted, max_concurrent_calls=2)
+    assert result.status == "success" and result.result == 6
+    assert peak == 2
+    assert result.calls_completed == 6 and result.calls_cancelled == 0
+
+
 def test_command_without_bridge_is_unchanged():
     box = PyodideSandbox(pkg_name="main.js", skip_deno_check=True)
     cmd = box._build_command(memory_limit_mb=128)
@@ -215,10 +251,14 @@ big = await elitea_bridge.call("t.big2mb", "{}")
 '''
 
 
-@pytest.fixture
-def real_sandbox(monkeypatch):
+# The production copy lives in indexer_worker; point BRIDGE_MAIN_JS at it to run the same tests against both.
+ENTRYPOINTS = [MAIN_TS] + ([Path(os.environ["BRIDGE_MAIN_JS"])] if os.environ.get("BRIDGE_MAIN_JS") else [])
+
+
+@pytest.fixture(params=ENTRYPOINTS, ids=lambda path: path.name)
+def real_sandbox(request, monkeypatch):
     from elitea_sdk.runtime.tools.sandbox import build_offline_pyodide_sandbox
-    monkeypatch.setenv("PYODIDE_SANDBOX_PKG", str(MAIN_TS))
+    monkeypatch.setenv("PYODIDE_SANDBOX_PKG", str(request.param))
     monkeypatch.setenv("SANDBOX_BASE", _sandbox_base())
     return build_offline_pyodide_sandbox()
 
@@ -275,3 +315,22 @@ def test_real_memory_error(real_sandbox, memory_limit_mb):
     assert result.error_type in ("out_of_memory", "sandbox_crashed")
     if memory_limit_mb == 256:
         assert result.error_type == "out_of_memory"
+
+
+def _bridge_fingerprint(path):
+    # String literals and constants carry the protocol (message types, keys, error types, limits);
+    # comparing them survives TypeScript annotations, which a line-by-line diff would not.
+    source = path.read_text()
+    start = source.index("// --bridge:")
+    end = source.index("function printHelp()" if path.suffix == ".js" else "async function main()")
+    # Timing labels exist only in the production copy.
+    block = re.sub(r"markTiming\([^)]*\);", "", source[start:end])
+    literals = re.findall(r'"(?:[^"\\]|\\.)*"|`[^`]*`', block)
+    constants = re.findall(r"const (BRIDGE_\w+|DEFAULT_BRIDGE_\w+) = ([^;]+);", block)
+    keys = re.findall(r"\b(type|id|name|args|ok|value|error|error_type|success|result|text|code)\s*[:,}]", block)
+    return sorted(literals), sorted(constants), sorted(set(keys))
+
+
+@pytest.mark.skipif(not os.environ.get("BRIDGE_MAIN_JS"), reason="set BRIDGE_MAIN_JS to the indexer_worker main.js")
+def test_both_entrypoints_carry_the_same_bridge_protocol():
+    assert _bridge_fingerprint(MAIN_TS) == _bridge_fingerprint(Path(os.environ["BRIDGE_MAIN_JS"]))

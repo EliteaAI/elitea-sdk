@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 from .sandbox_types import BridgeExecutionResult, CodeExecutionResult, Status  # noqa: E402
 
 BRIDGE_MAX_LINE_BYTES = 4 * 1024 * 1024
+BRIDGE_MAX_CONCURRENT_CALLS = 8
 _BRIDGE_OUTPUT_KEEP_CHARS = 1024 * 1024
 _BRIDGE_STDERR_TAIL_BYTES = 64 * 1024
 
@@ -321,6 +322,7 @@ class PyodideSandbox(BasePyodideSandbox):
         max_tool_calls: int,
         memory_limit_mb: int | None = None,
         max_line_bytes: int = BRIDGE_MAX_LINE_BYTES,
+        max_concurrent_calls: int = BRIDGE_MAX_CONCURRENT_CALLS,
         on_output: Callable[[str, str], None] | None = None,
     ) -> BridgeExecutionResult:
         """Run `code` with `elitea_bridge.call(name, args_json)` routed to `dispatcher(name, args_json) -> value_json`.
@@ -334,6 +336,7 @@ class PyodideSandbox(BasePyodideSandbox):
         calls_completed = 0
         calls_started = 0
         call_tasks: set[asyncio.Task] = set()
+        call_slots = asyncio.Semaphore(max(1, max_concurrent_calls))
         write_lock = asyncio.Lock()
 
         cmd = self._build_command(memory_limit_mb=memory_limit_mb, bridge_max_line_bytes=max_line_bytes)
@@ -372,7 +375,8 @@ class PyodideSandbox(BasePyodideSandbox):
         async def run_call(call_id: Any, name: str, args_json: str) -> None:
             nonlocal calls_completed
             try:
-                value = await dispatcher(name, args_json)
+                async with call_slots:
+                    value = await dispatcher(name, args_json)
                 reply = {"type": "result", "id": call_id, "ok": True, "value": value}
             except Exception as exc:  # pylint: disable=broad-except
                 reply = {"type": "result", "id": call_id, "ok": False, "error": str(exc) or type(exc).__name__}
@@ -426,6 +430,8 @@ class PyodideSandbox(BasePyodideSandbox):
         except asyncio.TimeoutError:
             fail("timeout", f"Execution timed out after {timeout_seconds} seconds.")
         finally:
+            # Calls still running when the program ends or times out are cancelled and reported, not hidden.
+            calls_cancelled = len(call_tasks)
             for task in list(call_tasks):
                 task.cancel()
             if process.returncode is None:
@@ -453,6 +459,7 @@ class PyodideSandbox(BasePyodideSandbox):
             error=None if success else (final.get("error") or "unknown sandbox error"),
             error_type=None if success else (final.get("error_type") or "sandbox_crashed"),
             calls_completed=calls_completed,
+            calls_cancelled=calls_cancelled,
         )
 
 
