@@ -1,4 +1,5 @@
 import logging
+import traceback
 from copy import deepcopy
 
 import requests
@@ -2630,6 +2631,9 @@ class EliteAClient:
                 return {
                     "success": False,
                     "error": f"Tool execution failed: {str(tool_error)}",
+                    # The full exception chain goes behind the panel's expandable details,
+                    # so the headline above stays a readable message.
+                    "debug_error": "".join(traceback.format_exception(tool_error)),
                     **outcome.model_dump(
                         mode='json', include={'error_class', 'retriable', 'exception_type'}
                     ),
