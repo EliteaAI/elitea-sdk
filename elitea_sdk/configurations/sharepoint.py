@@ -5,9 +5,42 @@ from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from .microsoft_graph_scopes import SCOPES_NOTE, normalize_scopes, scopes_field_extra
 from .oauth_app_mode import OAUTH_APP_ID_FIELD, require_app_client
 
 log = logging.getLogger(__name__)
+
+# Permissions offered as checkboxes, in display order (Microsoft Graph delegated permissions). The delegated
+# (Default app / Custom app) toolkit works through Microsoft Graph only; App-only does not use them.
+SHAREPOINT_SCOPE_DESCRIPTIONS: Dict[str, str] = {
+    "Sites.Read.All": (
+        "Read sites, lists and files in site libraries: get_lists, read_list, get_list_columns, "
+        "get_files_list, read_document, connection test."
+    ),
+    "Sites.ReadWrite.All": "Add list items and upload files to sites: create_list_item, upload_file.",
+    "Files.Read.All": "Read files you can open, including OneDrive: get_files_list, read_document.",
+    "Files.ReadWrite.All": (
+        "Open sharing links and file URLs, upload files: read_file_from_sharing_link, read_file_from_url, "
+        "upload_file. Microsoft offers no read-only permission for sharing links."
+    ),
+    "Notes.Read.All": (
+        "Read site OneNote notebooks, sections, pages and attachments: onenote_get_*, onenote_read_*, "
+        "onenote_list_attachments."
+    ),
+    "Notes.ReadWrite.All": (
+        "Create, change and delete OneNote notebooks, sections and pages: onenote_create_*, "
+        "onenote_update_page, onenote_replace_page_content, onenote_delete_page."
+    ),
+}
+SHAREPOINT_SCOPES = list(SHAREPOINT_SCOPE_DESCRIPTIONS)
+# Read-only, like Teams and Outlook: the reading, OneNote and indexing tools work; writes and sharing links need
+# the ReadWrite permissions ticked
+SHAREPOINT_DEFAULT_SCOPES = ["Sites.Read.All", "Files.Read.All", "Notes.Read.All"]
+
+
+def normalize_sharepoint_scopes(value) -> List[str]:
+    """Allowed SharePoint permissions from a stored value (list or string); default when empty."""
+    return normalize_scopes(value, SHAREPOINT_SCOPES, SHAREPOINT_DEFAULT_SCOPES, source="SharePoint")
 
 # A credential that acts with the signed-in person's Microsoft sign-in (C-1009 #6756): it holds no secret; the platform
 # mints a Graph token on the person's behalf when a governed run starts and puts it in ``access_token``
@@ -73,7 +106,11 @@ class SharepointConfiguration(BaseModel):
 
     # Additional fields for delegated/OAuth flows
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth Discovery Endpoint. Usually in format: https://login.microsoftonline.com/{tenant_id}")
-    scopes: Optional[List[str]] = Field(default=None, description="OAuth Scopes")
+    scopes: Optional[List[str]] = Field(
+        default=list(SHAREPOINT_DEFAULT_SCOPES),
+        description=SCOPES_NOTE,
+        json_schema_extra=scopes_field_extra(SHAREPOINT_SCOPE_DESCRIPTIONS),
+    )
     auto_refresh_token: Optional[bool] = Field(
         default=False,
         description="Automatically refresh the access token using the offline_access scope. "
@@ -111,6 +148,11 @@ class SharepointConfiguration(BaseModel):
         if value and not is_entra_url(value):
             raise ValueError("Must be https://login.microsoftonline.com/<tenant_id>")
         return value
+
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def _normalize_scopes(cls, value):
+        return normalize_sharepoint_scopes(value)
 
     @staticmethod
     def check_connection(settings: dict) -> str | None:
