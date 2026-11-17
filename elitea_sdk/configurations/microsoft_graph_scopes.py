@@ -7,7 +7,7 @@ for the Entra app, so unticking a box never removes a granted permission.
 """
 import logging
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -27,37 +27,14 @@ SCOPES_NOTE = (
 )
 
 
-def scope_options(descriptions: Dict[str, str], admin_consent: Iterable[str] = ()) -> List[Dict[str, Any]]:
-    """Checkbox options for the UI: one {value, label, description} per permission.
-
-    Permissions in ``admin_consent`` need Entra admin consent: their option carries
-    ``admin_consent: true``, which the UIs and the sign-in prompt read from the schema.
-    """
-    consent = set(admin_consent)
-    unknown = consent - set(descriptions)
-    if unknown:
-        raise ValueError(f"Admin consent set for permissions not offered: {', '.join(sorted(unknown))}")
-    options: List[Dict[str, Any]] = []
-    for name, text in descriptions.items():
-        option: Dict[str, Any] = {"value": name, "label": name, "description": text}
-        if name in consent:
-            option["admin_consent"] = True
-        options.append(option)
-    return options
+def scope_options(descriptions: Dict[str, str]) -> List[Dict[str, str]]:
+    """Checkbox options for the UI: one {value, label, description} per permission."""
+    return [{"value": name, "label": name, "description": text} for name, text in descriptions.items()]
 
 
-def scopes_field_extra(descriptions: Dict[str, str], admin_consent: Iterable[str] = ()) -> Dict[str, Any]:
+def scopes_field_extra(descriptions: Dict[str, str]) -> Dict[str, Any]:
     """json_schema_extra for a scopes field rendered as a checkbox list."""
-    return {"ui_component": "checkbox_list", "checkbox_options": scope_options(descriptions, admin_consent)}
-
-
-def admin_consent_scopes(model: Any, scopes: Optional[Iterable[str]]) -> List[str]:
-    """The given scopes that the credential model's ``scopes`` options mark as needing admin consent."""
-    field = getattr(model, "model_fields", {}).get("scopes")
-    extra = getattr(field, "json_schema_extra", None)
-    options = extra.get("checkbox_options", []) if isinstance(extra, dict) else []
-    flagged = {option["value"] for option in options if option.get("admin_consent")}
-    return [scope for scope in (scopes or []) if scope in flagged]
+    return {"ui_component": "checkbox_list", "checkbox_options": scope_options(descriptions)}
 
 
 def normalize_scopes(
@@ -101,13 +78,10 @@ def normalize_scopes(
     return result or list(default)
 
 
-def missing_permission_hint(needed: Optional[str], admin_consent: bool = False) -> str:
-    """403 hint naming the permission a tool needs; ``admin_consent`` when only an Entra admin can grant it."""
+def missing_permission_hint(needed: Optional[str]) -> str:
+    """403 hint naming the permission a tool needs."""
     if not needed:
         return (" The signed-in account lacks the Microsoft Graph permission this tool needs: "
                 "tick it in the credential scopes and sign in again (an Entra admin may need to grant it).")
-    if admin_consent:
-        return (f" This tool needs the Microsoft Graph permission {needed}, which requires Entra admin "
-                "consent: ask your Entra admin to grant it, tick it in the credential scopes and sign in again.")
     return (f" This tool needs the Microsoft Graph permission {needed}: tick it in the credential "
             "scopes and sign in again (an Entra admin may need to grant it).")

@@ -161,58 +161,29 @@ class TestTeamsForbiddenHint:
         assert f"needs the Microsoft Graph permission {needed}:" in str(exc.value)
 
 
-class TestAdminConsentScopes:
-    """#7542: ChannelMessage.Read.All is optional, off by default and flagged as admin consent in the schema."""
+
+class TestChannelMessageReadAll:
+    """#7542: ChannelMessage.Read.All is optional and off by default; the description says it needs admin consent."""
 
     def test_option_is_offered_but_not_preselected(self):
         assert "ChannelMessage.Read.All" in TEAMS_SCOPES
         assert "ChannelMessage.Read.All" not in TEAMS_DEFAULT_SCOPES
 
-    def test_schema_flags_only_admin_consent_options(self):
+    def test_description_says_it_requires_admin_consent(self):
         options = TeamsConfiguration.model_json_schema()["properties"]["scopes"]["checkbox_options"]
-        flagged = [o["value"] for o in options if o.get("admin_consent")]
-        assert flagged == ["ChannelMessage.Read.All"]
-        assert "admin consent" in next(o for o in options if o["value"] == "ChannelMessage.Read.All")["description"]
+        option = next(o for o in options if o["value"] == "ChannelMessage.Read.All")
+        assert "Requires Entra admin consent" in option["description"]
 
     def test_saved_credential_keeps_it(self):
         config = TeamsConfiguration(client_id="stub-client", client_secret="stub-secret",
                                     scopes=["Chat.Read", "ChannelMessage.Read.All"])
         assert config.scopes == ["Chat.Read", "ChannelMessage.Read.All"]
 
-    def test_lookup_reads_the_model_schema(self):
-        from elitea_sdk.configurations.microsoft_graph_scopes import admin_consent_scopes
-        assert admin_consent_scopes(TeamsConfiguration, ["Chat.Read", "ChannelMessage.Read.All"]) == [
-            "ChannelMessage.Read.All"]
-        assert admin_consent_scopes(OutlookConfiguration, OUTLOOK_SCOPES) == []
-        assert admin_consent_scopes(TeamsConfiguration, None) == []
-
-    def test_unknown_admin_consent_permission_is_rejected(self):
-        from elitea_sdk.configurations.microsoft_graph_scopes import scope_options
-        with pytest.raises(ValueError):
-            scope_options({"A.Read": "a"}, admin_consent=["B.Read"])
-
-    @patch("elitea_sdk.runtime.utils.mcp_oauth.fetch_oauth_authorization_server_metadata", return_value=None)
-    def test_sign_in_prompt_lists_admin_consent_scopes(self, _metadata):
-        prompt = TeamsConfiguration._build_mcp_authorization_required(
-            message="sign in", oauth_discovery_endpoint="https://login.microsoftonline.com/stub-tenant",
-            scopes=["Chat.Read", "ChannelMessage.Read.All"], client_id="stub-client")
-        settings = prompt.resource_metadata["provided_settings"]
-        assert settings["admin_consent_scopes"] == ["ChannelMessage.Read.All"]
-
-    @patch("elitea_sdk.runtime.utils.mcp_oauth.fetch_oauth_authorization_server_metadata", return_value=None)
-    def test_sign_in_prompt_without_admin_consent_scopes_has_no_list(self, _metadata):
-        prompt = TeamsConfiguration._build_mcp_authorization_required(
-            message="sign in", oauth_discovery_endpoint="https://login.microsoftonline.com/stub-tenant",
-            scopes=["Chat.Read"], client_id="stub-client")
-        assert "admin_consent_scopes" not in prompt.resource_metadata["provided_settings"]
-
-    def test_search_403_names_channel_permission_and_admin_consent(self):
+    def test_search_403_names_channel_permission(self):
         url = "https://graph.microsoft.com/v1.0/search/query"
         wrapper = TeamsApiWrapper(token=FAKE_TOKEN, scopes=["Chat.Read"])
         resp = _resp(403, url, {"error": {"message": "Access to ChatMessage requires ChannelMessage.Read.All"}})
         with patch("requests.request", return_value=resp):
             with pytest.raises(ToolException) as exc:
                 wrapper._backend._request("POST", url)
-        text = str(exc.value)
-        assert "ChannelMessage.Read.All, which requires Entra admin consent" in text
-        assert "permission Chat.Read" not in text
+        assert "needs the Microsoft Graph permission ChannelMessage.Read.All:" in str(exc.value)

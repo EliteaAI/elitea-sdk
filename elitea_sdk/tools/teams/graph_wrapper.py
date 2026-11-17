@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 import requests
 from langchain_core.tools import ToolException
 
-from ...configurations.microsoft_graph_scopes import admin_consent_scopes, missing_permission_hint
+from ...configurations.microsoft_graph_scopes import missing_permission_hint
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -358,8 +358,7 @@ class TeamsGraphWrapper:
         where = ""
         hint = ""
         if resp.status_code == 403:
-            needed = _needed_permission(method, resp.url)
-            hint = missing_permission_hint(needed, bool(admin_consent_scopes(TeamsConfiguration, [needed])))
+            hint = missing_permission_hint(_needed_permission(method, resp.url))
         elif resp.status_code == 404:
             path = urlparse(resp.url or "").path
             if path:
