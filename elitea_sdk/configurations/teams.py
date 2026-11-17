@@ -11,12 +11,19 @@ log = logging.getLogger(__name__)
 # Permissions offered as checkboxes, in display order (Microsoft Graph delegated permissions).
 TEAMS_SCOPE_DESCRIPTIONS: Dict[str, str] = {
     "User.ReadBasic.All": "Look up people by email: chat members, senders and recipients.",
-    "Chat.Read": "Read your chats and chat messages: list_chats, find_chat_messages, search_teams_messages.",
+    "Chat.Read": (
+        "Read your chats and chat messages: list_chats, find_chat_messages. "
+        "search_teams_messages also needs ChannelMessage.Read.All."
+    ),
     "ChatMessage.Send": "Send chat messages as you: send_chat_message.",
     "Chat.Create": "Start a new 1:1 or group chat when send_chat_message finds no existing chat.",
     "Team.ReadBasic.All": "List the teams you are a member of: list_teams, team names, connection test.",
     "Channel.ReadBasic.All": "List the channels of a team: list_channels, channel names.",
     "ChannelMessage.Send": "Post and reply in channels as you: send_channel_message.",
+    "ChannelMessage.Read.All": (
+        "Search and read channel messages (search_teams_messages across channels). "
+        "Requires Entra admin consent. Leave off unless your Entra admin has granted it."
+    ),
 }
 TEAMS_SCOPES = list(TEAMS_SCOPE_DESCRIPTIONS)
 TEAMS_DEFAULT_SCOPES = ["User.ReadBasic.All", "Chat.Read", "Team.ReadBasic.All", "Channel.ReadBasic.All"]

@@ -159,3 +159,31 @@ class TestTeamsForbiddenHint:
             with pytest.raises(ToolException) as exc:
                 wrapper._backend._request(method, url)
         assert f"needs the Microsoft Graph permission {needed}:" in str(exc.value)
+
+
+
+class TestChannelMessageReadAll:
+    """#7542: ChannelMessage.Read.All is optional and off by default; the description says it needs admin consent."""
+
+    def test_option_is_offered_but_not_preselected(self):
+        assert "ChannelMessage.Read.All" in TEAMS_SCOPES
+        assert "ChannelMessage.Read.All" not in TEAMS_DEFAULT_SCOPES
+
+    def test_description_says_it_requires_admin_consent(self):
+        options = TeamsConfiguration.model_json_schema()["properties"]["scopes"]["checkbox_options"]
+        option = next(o for o in options if o["value"] == "ChannelMessage.Read.All")
+        assert "Requires Entra admin consent" in option["description"]
+
+    def test_saved_credential_keeps_it(self):
+        config = TeamsConfiguration(client_id="stub-client", client_secret="stub-secret",
+                                    scopes=["Chat.Read", "ChannelMessage.Read.All"])
+        assert config.scopes == ["Chat.Read", "ChannelMessage.Read.All"]
+
+    def test_search_403_names_channel_permission(self):
+        url = "https://graph.microsoft.com/v1.0/search/query"
+        wrapper = TeamsApiWrapper(token=FAKE_TOKEN, scopes=["Chat.Read"])
+        resp = _resp(403, url, {"error": {"message": "Access to ChatMessage requires ChannelMessage.Read.All"}})
+        with patch("requests.request", return_value=resp):
+            with pytest.raises(ToolException) as exc:
+                wrapper._backend._request("POST", url)
+        assert "needs the Microsoft Graph permission ChannelMessage.Read.All:" in str(exc.value)
