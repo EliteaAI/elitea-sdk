@@ -6,7 +6,7 @@ import fnmatch
 import threading
 import zipfile
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import requests
@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, create_model, model_validator
 
 from github import Auth, Github, GithubIntegration, GithubRetry, Repository
 from github.GithubException import RateLimitExceededException
+from github.PaginatedList import PaginatedListBase
 from github.Requester import Requester
 from urllib3.exceptions import MaxRetryError
 from github.Consts import DEFAULT_BASE_URL
@@ -115,6 +116,55 @@ def _means_ref_is_absent(error) -> bool:
     return getattr(error, "status", None) == 404
 GITHUB_DEFAULT_PAGE_SIZE = 30
 GITHUB_ISSUE_COMMENTS_LIMIT = GITHUB_DEFAULT_PAGE_SIZE
+GENERIC_CALL_LIST_LIMIT = GITHUB_DEFAULT_PAGE_SIZE
+# The dispatch endpoint returns 204 with no body; the run it starts shows up a few seconds later.
+DISPATCHED_RUN_LOOKUP_ATTEMPTS = 5
+DISPATCHED_RUN_LOOKUP_INTERVAL_SECONDS = 2.0
+INVALID_RUN_ID_MESSAGE = (
+    "run_id must be a numeric workflow run ID (e.g. 43029359437). "
+    "Use get_workflow_runs to find run IDs."
+)
+RUN_NOT_FOUND_HINT = (
+    "Check that run_id is a workflow run ID, not a workflow ID. "
+    "Use get_workflow_runs to find run IDs."
+)
+
+
+def _parse_run_id(run_id) -> Optional[int]:
+    """The numeric run ID, or None when the model passed something else (a name, a URL)."""
+    try:
+        return int(str(run_id).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _workflow_run_error(action: str, error: Exception) -> str:
+    message = f"An error occurred while {action}: {error}"
+    if getattr(error, "status", None) == 404:
+        message = f"{message}. {RUN_NOT_FOUND_HINT}"
+    return message
+
+
+def _generic_call_result(response):
+    """JSON-friendly data of what a PyGithub method returned.
+
+    Lists are capped; their items' data is the one already fetched, because `raw_data`
+    on a lazily-listed object refetches it — one request per item.
+    """
+    if isinstance(response, (PaginatedListBase, list, tuple)):
+        items = []
+        truncated = False
+        for item in response:
+            if len(items) >= GENERIC_CALL_LIST_LIMIT:
+                truncated = True
+                break
+            items.append(getattr(item, "_rawData", item))
+        return {"items": items, "count": len(items), "truncated": truncated}
+    if hasattr(response, "raw_data"):
+        return response.raw_data
+    if response is None or isinstance(response, (str, int, float, bool, dict)):
+        return response
+    return str(response)
 GITHUB_TOOLKIT_TYPE = 'github'
 GITHUB_ISSUE_COMMENTS_NOTE_RESERVE = 512
 
@@ -2272,7 +2322,8 @@ class GitHubClient(BaseModel):
             repo_name (Optional[str]): Name of the repository in format 'owner/repo'
 
         Returns:
-            str: A JSON string containing the workflow run details, including the run ID
+            str: A JSON string with the triggered workflow and the started run's run_id. run_id is null when
+                the run hasn't appeared yet; get_workflow_runs finds it later.
         """
         try:
             repo = self._get_repo(repo_name)
@@ -2282,16 +2333,21 @@ class GitHubClient(BaseModel):
                 workflow = repo.get_workflow(workflow_id)
             except Exception:
                 # If that fails, try by ID
-                try:
-                    workflows = repo.get_workflows()
-                    workflow = next(wf for wf in workflows if str(wf.id) == workflow_id)
-                except StopIteration:
-                    return f"Workflow with ID or filename '{workflow_id}' not found in repository {repo.full_name}"
+                workflow = next((wf for wf in repo.get_workflows() if str(wf.id) == str(workflow_id)), None)
+                if workflow is None:
+                    return {
+                        "error": True,
+                        "message": f"Workflow with ID or filename '{workflow_id}' not found in repository {repo.full_name}",
+                    }
 
-            # Create a workflow dispatch event
-            workflow_run = workflow.create_dispatch(ref, inputs or {})
+            triggered_at = datetime.now(timezone.utc).replace(microsecond=0)
+            # PyGithub's create_dispatch returns False on a rejected dispatch and drops GitHub's reason
+            # (e.g. "No ref found for: ..."); the checked request raises it instead.
+            workflow._requester.requestJsonAndCheck(
+                "POST", f"{workflow.url}/dispatches", input={"ref": ref, "inputs": inputs or {}}
+            )
 
-            # Return run details
+            run = self._find_dispatched_run(workflow, ref, triggered_at)
             result = {
                 "success": True,
                 "message": f"Workflow '{workflow.name}' triggered successfully on ref '{ref}'",
@@ -2299,12 +2355,40 @@ class GitHubClient(BaseModel):
                 "workflow_name": workflow.name,
                 "workflow_url": workflow.html_url,
                 "ref": ref,
-                "inputs": inputs or {}
+                "inputs": inputs or {},
+                "run_id": run.id if run else None,
+                "run_url": run.html_url if run else None,
             }
-
+            if run is None:
+                result["note"] = ("The run hasn't appeared yet. Call get_workflow_runs with this workflow_id "
+                                  "and branch to find its run_id.")
             return result
         except Exception as e:
-            return f"An error occurred while triggering workflow: {str(e)}"
+            return {
+                "error": True,
+                "message": f"An error occurred while triggering workflow: {str(e)}"
+            }
+
+    @staticmethod
+    def _find_dispatched_run(workflow, ref: str, triggered_at: datetime):
+        """The run a dispatch just started, or None. GitHub's created_at has whole-second precision."""
+        import time
+
+        for attempt in range(DISPATCHED_RUN_LOOKUP_ATTEMPTS):
+            if attempt:
+                time.sleep(DISPATCHED_RUN_LOOKUP_INTERVAL_SECONDS)
+            try:
+                for run in workflow.get_runs(event="workflow_dispatch", branch=ref):
+                    created_at = run.created_at
+                    if created_at and created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    if created_at and created_at >= triggered_at:
+                        return run
+                    break  # newest first: an older run means ours isn't listed yet
+            except Exception as e:
+                logger.warning(f"[trigger_workflow] Looking up the dispatched run failed: {e}")
+                return None
+        return None
 
     @tool_group('read')
     def get_workflow_status(self, run_id: str, repo_name: Optional[str] = None) -> str:
@@ -2318,11 +2402,14 @@ class GitHubClient(BaseModel):
         Returns:
             str: A JSON string containing details about the workflow run status
         """
+        numeric_run_id = _parse_run_id(run_id)
+        if numeric_run_id is None:
+            return {"error": True, "message": INVALID_RUN_ID_MESSAGE}
         try:
             repo = self._get_repo(repo_name)
 
             # Get the workflow run
-            run = repo.get_workflow_run(int(run_id))
+            run = repo.get_workflow_run(numeric_run_id)
 
             # Get additional details about the run jobs
             jobs = list(run.jobs())
@@ -2360,7 +2447,7 @@ class GitHubClient(BaseModel):
             # Return error as JSON instead of plain text
             return {
                 "error": True,
-                "message": f"An error occurred while getting workflow status: {str(e)}"
+                "message": _workflow_run_error("getting workflow status", e)
             }
 
     @tool_group('read')
@@ -2465,11 +2552,14 @@ class GitHubClient(BaseModel):
                 With include_logs=True: includes full log content in 'logs' dict.
                 With include_logs=False: includes only job metadata in 'jobs' list.
         """
+        numeric_run_id = _parse_run_id(run_id)
+        if numeric_run_id is None:
+            return {"error": True, "message": INVALID_RUN_ID_MESSAGE}
         try:
             repo = self._get_repo(repo_name)
 
             # Get the workflow run
-            run = repo.get_workflow_run(int(run_id))
+            run = repo.get_workflow_run(numeric_run_id)
 
             # Base result with run metadata
             result = {
@@ -2523,7 +2613,8 @@ class GitHubClient(BaseModel):
                         }
                         for job in jobs
                     ],
-                    "note": "Full logs couldn't be retrieved directly. Only job details are available."
+                    "note": ("Job and step details only. Call again with include_logs: true to get log content "
+                             "(add failed_only: true for failed jobs only).")
                 }
                 # Add artifacts if requested
                 if include_artifacts:
@@ -2640,7 +2731,7 @@ class GitHubClient(BaseModel):
                 return result
 
         except Exception as e:
-            return f"An error occurred while getting workflow logs: {str(e)}"
+            return _workflow_run_error("getting workflow logs", e)
 
     @tool_group('write')
     def comment_on_issue(self, issue_number: str, comment: str, repo_name: Optional[str] = None) -> str:
@@ -2804,11 +2895,7 @@ class GitHubClient(BaseModel):
             # Call the method with the provided arguments
             response = _method(**method_kwargs)
 
-            # Ensure `raw_data` exists in the response object
-            if hasattr(response, "raw_data"):
-                return response.raw_data
-            else:
-                return f"API method '{method}' was called successfully, but 'raw_data' attribute is missing in the response."
+            return _generic_call_result(response)
 
         except Exception as e:
             raise ToolException(str(e))
@@ -2958,10 +3045,12 @@ class GitHubClient(BaseModel):
 
             # Paginate results
             code_results = []
+            listed_any = False
             start_idx = (page - 1) * per_page
             end_idx = start_idx + per_page
 
             for idx, code_item in enumerate(results):
+                listed_any = True
                 if idx < start_idx:
                     continue
                 if idx >= end_idx:
@@ -2989,6 +3078,18 @@ class GitHubClient(BaseModel):
                         for match in code_item.text_matches
                     ]
                 code_results.append(item_data)
+
+            if not listed_any:
+                # PyGithub 2.3.0 clears the query after the first page, so totalCount on an empty
+                # result refetches without `q` and GitHub answers 400 "missing field `q`".
+                return json.dumps({
+                    "total_count": 0,
+                    "incomplete_results": False,
+                    "items": [],
+                    "page": page,
+                    "per_page": per_page,
+                    "message": f"No code found for query '{query}'.",
+                }, indent=2)
 
             response = {
                 "total_count": results.totalCount,
