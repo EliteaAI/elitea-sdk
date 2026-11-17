@@ -88,9 +88,9 @@ class TestCredentialSchema:
         assert set(TEAMS_DEFAULT_SCOPES) <= set(TEAMS_SCOPES)
         assert set(SHAREPOINT_DEFAULT_SCOPES) <= set(SHAREPOINT_SCOPES)
 
-    def test_sharepoint_default_covers_every_tool(self):
-        # ReadWrite includes Read: sites and lists, files and sharing links, OneNote
-        assert SHAREPOINT_DEFAULT_SCOPES == ["Sites.ReadWrite.All", "Files.ReadWrite.All", "Notes.ReadWrite.All"]
+    def test_sharepoint_default_is_read_only(self):
+        # Like Teams and Outlook: reading, OneNote and indexing work; writes need a ReadWrite permission ticked
+        assert SHAREPOINT_DEFAULT_SCOPES == ["Sites.Read.All", "Files.Read.All", "Notes.Read.All"]
 
     def test_sharepoint_saved_values_are_normalized(self):
         # Free text saved before the list existed: unknown values (and a non-Graph permission) are dropped

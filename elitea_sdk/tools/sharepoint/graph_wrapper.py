@@ -7,9 +7,9 @@ OAuth flow).  It communicates directly with
 *office365-rest-python-client* library is **not** used here.
 
 OAuth scopes (delegated): the SharePoint credential's list (``SHAREPOINT_SCOPE_DESCRIPTIONS`` in
-``elitea_sdk/configurations/sharepoint.py``); by default ``Sites.ReadWrite.All``,
-``Files.ReadWrite.All`` and ``Notes.ReadWrite.All``. Read-only variants cover the reading tools,
-except sharing links (``/shares`` has no read-only permission).
+``elitea_sdk/configurations/sharepoint.py``); by default the read-only ``Sites.Read.All``,
+``Files.Read.All`` and ``Notes.Read.All``. Writes need the ReadWrite variants, and so do sharing
+links (``/shares`` has no read-only permission).
 """
 from __future__ import annotations
 

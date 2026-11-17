@@ -33,8 +33,9 @@ SHAREPOINT_SCOPE_DESCRIPTIONS: Dict[str, str] = {
     ),
 }
 SHAREPOINT_SCOPES = list(SHAREPOINT_SCOPE_DESCRIPTIONS)
-# Every tool works with these: ReadWrite includes Read
-SHAREPOINT_DEFAULT_SCOPES = ["Sites.ReadWrite.All", "Files.ReadWrite.All", "Notes.ReadWrite.All"]
+# Read-only, like Teams and Outlook: the reading, OneNote and indexing tools work; writes and sharing links need
+# the ReadWrite permissions ticked
+SHAREPOINT_DEFAULT_SCOPES = ["Sites.Read.All", "Files.Read.All", "Notes.Read.All"]
 
 
 def normalize_sharepoint_scopes(value) -> List[str]:
