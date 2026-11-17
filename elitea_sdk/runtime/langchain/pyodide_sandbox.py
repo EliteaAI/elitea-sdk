@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Awaitable, Callable, Literal
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForToolRun,
@@ -27,7 +27,11 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
-from .sandbox_types import CodeExecutionResult, Status  # noqa: E402
+from .sandbox_types import BridgeExecutionResult, CodeExecutionResult, Status  # noqa: E402
+
+BRIDGE_MAX_LINE_BYTES = 4 * 1024 * 1024
+_BRIDGE_OUTPUT_KEEP_CHARS = 1024 * 1024
+_BRIDGE_STDERR_TAIL_BYTES = 64 * 1024
 
 
 def get_default_pkg_name() -> str | None:
@@ -121,6 +125,7 @@ class BasePyodideSandbox:
         memory_limit_mb: int | None = None,
         root_ca_path: str | None = None,
         insecure_tls_domains: list[str] | None = None,
+        bridge_max_line_bytes: int | None = None,
     ) -> list[str]:
         """Build the Deno command with appropriate flags."""
         cmd = [
@@ -173,6 +178,9 @@ class BasePyodideSandbox:
 
         # Add the package and stdin flag (code will be passed via stdin to avoid
         # Linux kernel's MAX_ARG_STRLEN 128KB limit on individual CLI arguments)
+        if bridge_max_line_bytes:
+            cmd.extend([self.pkg_name, "--bridge", f"--max-line-bytes={int(bridge_max_line_bytes)}"])
+            return cmd
         cmd.extend([self.pkg_name, "--stdin"])
 
         # Add stateful flag
@@ -302,6 +310,149 @@ class PyodideSandbox(BasePyodideSandbox):
             session_metadata=session_metadata,
             session_bytes=session_bytes,
             timed_out=timed_out,
+        )
+
+    async def execute_with_bridge(
+        self,
+        code: str,
+        dispatcher: Callable[[str, str], Awaitable[str]],
+        *,
+        timeout_seconds: float,
+        max_tool_calls: int,
+        memory_limit_mb: int | None = None,
+        max_line_bytes: int = BRIDGE_MAX_LINE_BYTES,
+        on_output: Callable[[str, str], None] | None = None,
+    ) -> BridgeExecutionResult:
+        """Run `code` with `elitea_bridge.call(name, args_json)` routed to `dispatcher(name, args_json) -> value_json`.
+
+        A dispatcher exception becomes a catchable error in the program; tool time counts against the timeout."""
+        start_time = time.time()
+        stdout_parts: list[str] = []
+        stdout_len = 0
+        stderr_tail = bytearray()
+        outcome: dict[str, Any] = {}
+        calls_completed = 0
+        calls_started = 0
+        call_tasks: set[asyncio.Task] = set()
+        write_lock = asyncio.Lock()
+
+        cmd = self._build_command(memory_limit_mb=memory_limit_mb, bridge_max_line_bytes=max_line_bytes)
+        run_directory = self._run_directory()
+        # The reader limit must exceed the line cap, or asyncio rejects lines over its 64 KB default.
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._run_environment(run_directory),
+                limit=max_line_bytes + 1024,
+            )
+        except BaseException:
+            run_directory.cleanup()
+            raise
+
+        def fail(error_type: str, error: str) -> None:
+            outcome.setdefault("final", {"success": False, "error": error, "error_type": error_type})
+
+        async def send(message: dict) -> None:
+            data = (json.dumps(message) + "\n").encode("utf-8")
+            async with write_lock:
+                try:
+                    process.stdin.write(data)
+                    await process.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError, RuntimeError):
+                    pass
+
+        async def drain_stderr() -> None:
+            while chunk := await process.stderr.read(65536):
+                stderr_tail.extend(chunk)
+                del stderr_tail[:-_BRIDGE_STDERR_TAIL_BYTES]
+
+        async def run_call(call_id: Any, name: str, args_json: str) -> None:
+            nonlocal calls_completed
+            try:
+                value = await dispatcher(name, args_json)
+                reply = {"type": "result", "id": call_id, "ok": True, "value": value}
+            except Exception as exc:  # pylint: disable=broad-except
+                reply = {"type": "result", "id": call_id, "ok": False, "error": str(exc) or type(exc).__name__}
+            calls_completed += 1
+            if len(reply.get("value") or "") > max_line_bytes:
+                reply = {"type": "result", "id": call_id, "ok": False,
+                         "error": f"Tool result is over the {max_line_bytes}-byte bridge limit."}
+            await send(reply)
+
+        async def pump() -> None:
+            nonlocal stdout_len, calls_started
+            await send({"type": "code", "code": code})
+            while True:
+                try:
+                    line = await process.stdout.readline()
+                except (asyncio.LimitOverrunError, ValueError):
+                    fail("result_too_large", f"A sandbox message is over the {max_line_bytes}-byte limit.")
+                    return
+                if not line:
+                    return
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                kind = message.get("type")
+                if kind == "final":
+                    outcome.setdefault("final", message)
+                    return
+                if kind in ("stdout", "stderr"):
+                    text = str(message.get("text", ""))
+                    if kind == "stdout" and stdout_len < _BRIDGE_OUTPUT_KEEP_CHARS:
+                        stdout_parts.append(text)
+                        stdout_len += len(text)
+                    elif kind == "stderr":
+                        stderr_tail.extend(text.encode("utf-8", "replace"))
+                        del stderr_tail[:-_BRIDGE_STDERR_TAIL_BYTES]
+                    if on_output:
+                        on_output(kind, text)
+                elif kind == "call":
+                    if calls_started >= max_tool_calls:
+                        fail("call_limit", f"The program made more than {max_tool_calls} tool calls.")
+                        return
+                    calls_started += 1
+                    task = asyncio.create_task(run_call(message.get("id"), str(message.get("name")), str(message.get("args") or "{}")))
+                    call_tasks.add(task)
+                    task.add_done_callback(call_tasks.discard)
+
+        stderr_task = asyncio.create_task(drain_stderr())
+        try:
+            await asyncio.wait_for(pump(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            fail("timeout", f"Execution timed out after {timeout_seconds} seconds.")
+        finally:
+            for task in list(call_tasks):
+                task.cancel()
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            # The pipe closes with the process, so this finishes promptly and keeps the crash message.
+            try:
+                await asyncio.wait_for(stderr_task, timeout=2)
+            except (asyncio.TimeoutError, Exception):  # pylint: disable=broad-except
+                stderr_task.cancel()
+            run_directory.cleanup()
+
+        final = outcome.get("final")
+        stderr = stderr_tail.decode("utf-8", "replace")
+        if final is None:
+            final = {"success": False, "error_type": "sandbox_crashed",
+                     "error": f"The sandbox exited (code {process.returncode}) without a result. {stderr[-2000:]}".strip()}
+        success = bool(final.get("success"))
+        return BridgeExecutionResult(
+            status="success" if success else "error",
+            execution_time=time.time() - start_time,
+            result=final.get("result") if success else None,
+            stdout="".join(stdout_parts),
+            stderr=stderr,
+            error=None if success else (final.get("error") or "unknown sandbox error"),
+            error_type=None if success else (final.get("error_type") or "sandbox_crashed"),
+            calls_completed=calls_completed,
         )
 
 

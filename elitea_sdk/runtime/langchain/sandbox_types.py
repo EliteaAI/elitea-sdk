@@ -20,3 +20,22 @@ class CodeExecutionResult:
     # Typed infra-refusal signal, so callers don't match stderr prose.
     timed_out: bool = False
     infra_category: str | None = None
+
+
+BridgeErrorType = Literal[
+    "out_of_memory", "result_too_large", "timeout", "call_limit", "python_exception", "sandbox_crashed",
+]
+
+
+@dataclasses.dataclass(kw_only=True)
+class BridgeExecutionResult:
+    """Outcome of a `--bridge` run; on error `error_type` is always set, never an empty success."""
+
+    status: Status
+    execution_time: float
+    result: Any = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+    error_type: BridgeErrorType | None = None
+    calls_completed: int = 0
