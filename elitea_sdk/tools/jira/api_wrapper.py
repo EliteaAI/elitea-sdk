@@ -637,14 +637,18 @@ def normalize_and_parse_issue_json(issue_json: str) -> Dict[str, Any]:
     return parsed
 
 
+def _error_summary(error: Exception) -> str:
+    """One readable line for a failed Jira call; the traceback goes to the log, not the user."""
+    return str(error).strip() or type(error).__name__
+
+
 def parse_payload_params(params: Optional[str]) -> Dict[str, Any]:
     if params:
         try:
             return json.loads(clean_json_string(params))
-        except JSONDecodeError:
-            stacktrace = traceback.format_exc()
-            logger.error(f"Jira tool: Error parsing payload params: {stacktrace}")
-            raise ToolException(f"JIRA tool exception. Passed params are not valid JSON. {stacktrace}")
+        except JSONDecodeError as e:
+            logger.error(f"Jira tool: Error parsing payload params: {traceback.format_exc()}")
+            raise ToolException(f"JIRA tool exception. Passed params are not valid JSON: {e}") from e
     return {}
 
 
@@ -1048,10 +1052,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             }
         except ToolException as e:
             raise ToolException(e)
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error creating Jira issue: {stacktrace}")
-            raise ToolException(f"Error creating Jira issue: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error creating Jira issue: {format_exc()}")
+            raise ToolException(f"Error creating Jira issue: {_error_summary(e)}") from e
 
     @tool_group('write')
     def set_issue_status(self, issue_key: str, status_name: str, mandatory_fields_json: str):
@@ -1079,10 +1082,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             return f"Done. Status for issue {issue_key} was updated successfully. You can view it at {issue_url}."
         except ToolException as e:
             raise ToolException(e)
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error setting Jira issue status: {stacktrace}")
-            raise ToolException(f"Error setting Jira issue status: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error setting Jira issue status: {format_exc()}")
+            raise ToolException(f"Error setting status for Jira issue {issue_key}: {_error_summary(e)}") from e
 
     def _update_issue(self, client: Jira, issue_json: str):
         """ Update an issue in Jira.
@@ -1161,10 +1163,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             output = f"Done. Comments were found for issue '{issue_key}': {comments_list}"
             logger.info(output)
             return output
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Unable to extract any comments from the issue: {stacktrace}")
-            return f"Error during the attempt to extract available comments: {stacktrace}"
+        except Exception as e:
+            logger.error(f"Unable to extract any comments from the issue: {format_exc()}")
+            return f"Error during the attempt to extract available comments for issue {issue_key}: {_error_summary(e)}"
 
     @tool_group('write')
     def add_comments(self, issue_key: str, comment: str):
@@ -1180,10 +1181,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.info(output)
             self._add_default_labels(issue_key=issue_key)
             return output
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error adding comment to Jira issue: {stacktrace}")
-            raise ToolException(f"Error adding comment to Jira issue: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error adding comment to Jira issue: {format_exc()}")
+            raise ToolException(f"Error adding comment to Jira issue {issue_key}: {_error_summary(e)}") from e
 
     def _text_to_adf(self, text: str) -> Dict[str, Any]:
         """Convert plain text to Atlassian Document Format."""
@@ -1441,10 +1441,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         try:
             projects = client.projects()
             return self._parse_projects(projects)
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error listing Jira projects: {stacktrace}")
-            raise ToolException(f"Error listing Jira projects: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error listing Jira projects: {format_exc()}")
+            raise ToolException(f"Error listing Jira projects: {_error_summary(e)}") from e
 
     @tool_group('read')
     def get_attachments_content(self, jira_issue_key: str, attachment_pattern: Optional[str] = None):
