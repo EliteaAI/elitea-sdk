@@ -116,9 +116,15 @@ def test_r22_missing_entry_point_suggests_the_legacy_flag_node():
     assert finding['rule'] == 'R22' and 'entry_point: answer' in finding['suggestion']
 
 
-@pytest.mark.parametrize('entry', ['END', 'missing', 'route'])
+@pytest.mark.parametrize('entry', ['END', 'missing'])
 def test_r22_bad_entry_point(entry):
     assert 'R22' in rules(validate_pipeline(spec(entry_point=entry)))
+
+
+def test_r22_routing_node_as_entry_point_is_only_a_warning():
+    # It builds and runs; the UI lets a user pick a router as the entry.
+    result = validate_pipeline(spec(entry_point='route'))
+    assert result['ok'] and 'R22' in rules(result, 'warnings')
 
 
 # ---- R23 status from the registry --------------------------------------------------------------------------
@@ -161,10 +167,48 @@ def test_r23_type_end_node_is_rejected_with_the_fix():
     assert 'transition: END' in finding['suggestion']
 
 
-def test_r23_inline_condition_is_an_error_inline_decision_a_warning():
+CONDITION = {'condition_input': ['intent'], 'condition_definition': "{% if intent == 'bug' %}a{% else %}b{% endif %}",
+             'conditional_outputs': ['a', 'b'], 'default_output': 'END'}
+
+
+def _condition_only(outputs=('a', 'b')):
+    """A toolkit node routed only by an inline condition, the shape the UI's Condition node saves."""
+    condition = dict(CONDITION, conditional_outputs=list(outputs))
+    task = {'type': 'fixed', 'value': 'x'}
+    return with_nodes(
+        {'id': 't', 'type': 'toolkit', 'tool': 'get_issue', 'toolkit_name': 'jira', 'condition': condition},
+        {'id': 'a', 'type': 'llm', 'input_mapping': {'task': task}, 'transition': 'END'},
+        {'id': 'b', 'type': 'llm', 'input_mapping': {'task': task}, 'transition': 'END'},
+        state={'messages': {'type': 'list'}, 'intent': {'type': 'str'}})
+
+
+def test_r23_inline_condition_that_routes_is_a_warning():
+    result = validate_pipeline(_condition_only())
+    assert result['ok'], result['errors']
+    assert [f['rule'] for f in result['warnings']] == ['R23']  # and no false R25 for a or b
+
+
+def test_r23_inline_condition_next_to_a_transition_is_an_error():
     doc = spec()
     doc['nodes'][2]['condition'] = {'condition_definition': '1 == 2', 'conditional_outputs': []}
+    finding = next(f for f in validate_pipeline(doc)['errors'] if f['rule'] == 'R23')
+    assert 'ignored' in finding['message']
+
+
+def test_r23_inline_condition_on_a_hitl_node_is_an_error():
+    doc = with_nodes(
+        {'id': 'a', 'type': 'llm', 'input_mapping': {'task': {'type': 'fixed', 'value': 'x'}}, 'transition': 'h'},
+        {'id': 'h', 'type': 'hitl', 'user_message': {'type': 'fixed', 'value': 'ok?'},
+         'routes': {'approve': 'END'}, 'condition': dict(CONDITION, conditional_outputs=[])})
     assert 'R23' in rules(validate_pipeline(doc))
+
+
+def test_r2_reports_a_mistyped_condition_target():
+    result = validate_pipeline(_condition_only(outputs=('aa', 'b')))
+    assert any(f['rule'] == 'R2' and f['field'] == 'condition.conditional_outputs[0]' for f in result['errors'])
+
+
+def test_inline_decision_is_a_warning():
     doc = spec()
     doc['nodes'][2]['decision'] = {'nodes': ['classify'], 'description': 'loop back'}
     del doc['nodes'][2]['transition']
@@ -283,6 +327,30 @@ def test_r4_runtime_channels_need_no_declaration():
     doc['nodes'][2]['input'] = ['input', 'messages']
     doc['nodes'][2]['input_mapping']['task']['value'] = '{input}'
     assert validate_pipeline(doc)['ok']
+
+
+def test_r4_tool_outcomes_need_no_declaration():
+    # create_state always defines them (#6171); a router branching on the last tool call works.
+    doc = with_nodes(
+        {'id': 't', 'type': 'toolkit', 'tool': 'get_issue', 'toolkit_name': 'jira', 'transition': 'r'},
+        {'id': 'r', 'type': 'router', 'input': ['last_tool_outcome', 'tool_outcomes'],
+         'condition': "{% if last_tool_outcome.status == 'ok' %}done{% endif %}", 'routes': ['done'],
+         'default_output': 'END'},
+        {'id': 'done', 'type': 'llm', 'input_mapping': {'task': {'type': 'fixed', 'value': 'x'}}, 'transition': 'END'},
+        state={'messages': {'type': 'list'}})
+    assert validate_pipeline(doc)['ok']
+
+
+def test_r4_writing_a_runtime_variable_is_a_warning():
+    doc = spec()
+    doc['nodes'][0]['output'] = ['intent', 'last_tool_outcome']
+    result = validate_pipeline(doc)
+    assert result['ok'] and any(f['rule'] == 'R4' and f['node_id'] == 'classify' for f in result['warnings'])
+
+
+def test_runtime_state_vars_are_all_defined_by_the_runtime():
+    from elitea_sdk.runtime.langchain.utils import create_state
+    assert validator.RUNTIME_STATE_VARS <= set(create_state({}).__annotations__)
 
 
 @pytest.mark.parametrize('value', ['input', [{'name': 'input'}]])

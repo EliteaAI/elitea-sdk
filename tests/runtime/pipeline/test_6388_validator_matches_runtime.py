@@ -64,6 +64,28 @@ BOTH_ACCEPT = {
             dict(TOOLKIT, transition='h'),
             {'id': 'h', 'type': 'hitl', 'user_message': fixed('ok?'), 'routes': {'approve': 'END', 'reject': 'END'}},
         ]},
+    # The shape the UI's (hidden) Condition node saves: no transition, so the condition routes.
+    'toolkit routed by an inline condition': {
+        'entry_point': 't', 'nodes': [
+            {k: v for k, v in TOOLKIT.items() if k != 'transition'} | {'condition': {
+                'condition_input': ['messages'], 'condition_definition': 'b',
+                'conditional_outputs': ['a', 'b'], 'default_output': 'END'}},
+            dict(TOOLKIT, id='a', input_mapping={'text': fixed('A')}),
+            dict(TOOLKIT, id='b', input_mapping={'text': fixed('B')}),
+        ]},
+    'router as the entry point': {
+        'entry_point': 'r', 'nodes': [
+            {'id': 'r', 'type': 'router', 'input': ['input'], 'condition': 'b', 'routes': ['b'],
+             'default_output': 'END'},
+            dict(TOOLKIT, id='b', input_mapping={'text': fixed('B')}),
+        ]},
+    'router reading last_tool_outcome': {
+        'entry_point': 't', 'nodes': [
+            dict(TOOLKIT, transition='r'),
+            {'id': 'r', 'type': 'router', 'input': ['last_tool_outcome'], 'condition': 'b', 'routes': ['b'],
+             'default_output': 'END'},
+            dict(TOOLKIT, id='b', input_mapping={'text': fixed('B')}),
+        ]},
 }
 
 BOTH_REJECT = {
@@ -124,6 +146,15 @@ def test_unknown_transition_really_skips_the_rest_of_the_pipeline():
     result = graph.invoke({'input': 'hi', 'messages': []}, config={'configurable': {'thread_id': 'r2'}})
     text = str(result.get('messages'))
     assert 'ECHO:x' in text and 'SECOND' not in text
+
+
+@pytest.mark.parametrize('name', ['toolkit routed by an inline condition', 'router as the entry point',
+                                  'router reading last_tool_outcome'])
+def test_accepted_routing_shapes_really_route(name):
+    graph = build(BOTH_ACCEPT[name])
+    result = graph.invoke({'input': 'hi', 'messages': []}, config={'configurable': {'thread_id': name}})
+    text = str(result.get('messages'))
+    assert 'ECHO:B' in text and 'ECHO:A' not in text
 
 
 def test_code_block_without_type_fails_when_run():

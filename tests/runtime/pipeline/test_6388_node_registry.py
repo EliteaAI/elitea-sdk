@@ -104,7 +104,7 @@ def test_required_alternatives_are_split():
 
 
 def test_inline_constructs():
-    assert pipeline.inline_construct('condition')['status'] == 'removed'
+    assert pipeline.inline_construct('condition')['status'] == 'deprecated'  # it still routes
     assert pipeline.inline_construct('decision')['status'] == 'deprecated'
 
 
