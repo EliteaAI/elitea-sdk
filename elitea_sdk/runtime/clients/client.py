@@ -26,6 +26,7 @@ from ..middleware import (
     SensitiveToolGuardMiddleware,
     TransformErrorStrategy,
 )
+from ..middleware.builder import BuilderMiddleware
 from ..middleware.sensitive_tool_guard import normalize_auto_approve
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..credential_slots import REASON_CODE_RE, GovernedCredentialError
@@ -1529,6 +1530,22 @@ class EliteAClient:
         except ValueError as e:
             logger.warning("Skipping invalid on-demand Project Context: %s", e)
 
+    @staticmethod
+    def _inject_builder(
+        middleware_list: list,
+        builder: Optional[dict],
+        conversation_id: Optional[str] = None,
+        auto_approve_sensitive_actions=False,
+    ) -> None:
+        """Elitea Builder (#7383): core prompt and HITL cards for the platform's Builder tools."""
+        if not builder or any(isinstance(mw, BuilderMiddleware) for mw in middleware_list):
+            return
+        middleware_list.append(BuilderMiddleware(
+            core_prompt=builder.get('core_prompt') or '',
+            interactive=auto_approve_sensitive_actions is not True,
+            conversation_id=conversation_id,
+        ))
+
     def _inject_input_guard(self, middleware_list: list, conversation_id: Optional[str] = None) -> None:
         """Inject the input guardrail (#6886) when the platform enabled it."""
         try:
@@ -1618,6 +1635,7 @@ class EliteAClient:
                     parallel_hitl_max_concurrency: int = 8,
                     user_declined_mcp_servers: Optional[list] = None,
                     project_context: Optional[dict] = None,
+                    builder: Optional[dict] = None,
                     routing_instructions: Optional[str] = None):
         auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
@@ -1692,6 +1710,7 @@ class EliteAClient:
             logger.info(f"Auto-created PlanningMiddleware for conversation_id={conversation_id}")
 
         self._inject_project_context(middleware_list, project_context, conversation_id)
+        self._inject_builder(middleware_list, builder, conversation_id, auto_approve_sensitive_actions)
 
         # Automatically compresses conversation history when threshold is exceeded
         llm = self._with_context_window(llm, context_settings)
@@ -2072,7 +2091,8 @@ class EliteAClient:
                       independent_parallel_hitl: bool = True,
                       parallel_hitl_max_concurrency: int = 8,
                       user_declined_mcp_servers: Optional[list] = None,
-                      project_context: Optional[dict] = None):
+                      project_context: Optional[dict] = None,
+                      builder: Optional[dict] = None):
         """
         Create a predict-type agent with minimal configuration.
 
@@ -2140,6 +2160,7 @@ class EliteAClient:
             logger.info(f"Auto-created PlanningMiddleware for predict agent (conversation_id={conversation_id})")
 
         self._inject_project_context(middleware_list, project_context, conversation_id)
+        self._inject_builder(middleware_list, builder, conversation_id, auto_approve_sensitive_actions)
 
         # Add ToolExceptionHandlerMiddleware to handle tool errors with LLM messages
         self._inject_tool_exception_handler(middleware_list, conversation_id, llm)

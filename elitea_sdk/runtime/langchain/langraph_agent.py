@@ -2378,6 +2378,35 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     "preservation (tool=%s)",
                                     hitl_interrupt.get('tool_name', ''),
                                 )
+                    elif guardrail_type == 'builder_changeset' or (
+                        guardrail_type == 'clarifying_question' and hitl_interrupt.get('builder')
+                    ):
+                        # Elitea Builder (#7383): needs_input (Ask User card) and needs_confirmation (Changes card)
+                        # both fired interrupt() inside the wrapped Builder tool. Re-issue that same tool call
+                        # without a new LLM turn; its interrupt() consumes the answer / decision.
+                        default_action = 'answer' if guardrail_type == 'clarifying_question' else 'cancel'
+                        resume_ctx = {
+                            'tool_name': hitl_interrupt.get('builder_tool_name') or hitl_interrupt.get('tool_name', ''),
+                            'toolkit_name': '',
+                            'tool_args': hitl_interrupt.get('tool_args', {}) or {},
+                            'tool_call_id': hitl_interrupt.get('tool_call_id') or f"call_{uuid4().hex[:24]}",
+                            'action': hitl_resume_value.get('action', default_action),
+                            'value': hitl_resume_value.get('value', ''),
+                        }
+                        config['configurable']['_hitl_resume_context'] = resume_ctx
+                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+                        if pending_msgs_dicts:
+                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
+                            if trimmed:
+                                resume_ctx['pending_messages'] = trimmed
+                            original_ai_dict = self._extract_original_ai_message(
+                                pending_msgs_dicts, tool_name=resume_ctx['tool_name'],
+                                tool_args=resume_ctx['tool_args'] if isinstance(resume_ctx['tool_args'], dict) else {},
+                            )
+                            if original_ai_dict is not None:
+                                resume_ctx['original_ai_message'] = original_ai_dict
+                        hitl_resume_ctx = resume_ctx
+                        logger.info("[HITL] Prepared Elitea Builder resume (%s)", guardrail_type)
                     elif guardrail_type == 'clarifying_question':
                         # Ask-user (clarifying question) resume. The ask_user tool
                         # fired interrupt() from inside the single LLM+tools node,
