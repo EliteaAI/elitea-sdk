@@ -43,6 +43,16 @@ def builds(doc) -> bool:
 TOOLKIT = {'id': 't', 'type': 'toolkit', 'toolkit_name': 'kit', 'tool': 'echo',
            'input_mapping': {'text': fixed('x')}, 'transition': 'END'}
 
+
+def _routed_by(first, *more):
+    """`first`, then toolkit nodes `a`, `b` and `c` that each echo their own letter and end."""
+    return {'entry_point': first['id'], 'nodes': [first, *more] + [
+        dict(TOOLKIT, id=n, input_mapping={'text': fixed(n.upper())}) for n in ('a', 'b', 'c')]}
+
+
+def _condition_node(**condition):
+    return {k: v for k, v in TOOLKIT.items() if k != 'transition'} | {'condition': condition}
+
 BOTH_ACCEPT = {
     'llm -> router -> llm': {
         'entry_point': 'a', 'state': {'messages': {'type': 'list'}, 'intent': {'type': 'str'}},
@@ -101,6 +111,16 @@ BOTH_REJECT = {
     'input as a list of objects': {'entry_point': 'a', 'nodes': [
         {'id': 'a', 'type': 'llm', 'input': [{'name': 'input'}], 'input_mapping': {'task': fixed('x')},
          'transition': 'END'}]},
+    # Malformed inline conditions on a node that routes by them (review of #890, round 2)
+    **{f'inline condition {label}': _routed_by({'id': 't', **{k: v for k, v in TOOLKIT.items()
+                                                               if k not in ('id', 'transition')},
+                                                 'condition': condition})
+       for label, condition in [
+           ('as a string', 'b'),
+           ('as a list', ['a', 'b']),
+           ('with dict outputs', {'condition_definition': 'b', 'conditional_outputs': [{'node': 'a'}, {'node': 'b'}]}),
+           ('with null outputs', {'condition_definition': 'b', 'conditional_outputs': None}),
+       ]},
 }
 
 # Builds, but is wrong once it runs; the validator rejects it on purpose.
@@ -117,6 +137,19 @@ STRICTER_THAN_THE_BUILD = {
         {'id': 'a', 'type': 'llm', 'transition': 'END'}]},
     'removed loop node': {'entry_point': 'l', 'nodes': [
         {'id': 'l', 'type': 'loop', 'tool': 'echo', 'transition': 'END'}]},
+    # Review of #890, round 2: each builds, then fails or misroutes when run.
+    'state_modifier writing tool_outcomes (the dict reducer fails the run)': {
+        'entry_point': 's', 'state': {'messages': {'type': 'list'}}, 'nodes': [
+            {'id': 's', 'type': 'state_modifier', 'template': 'x', 'output': ['tool_outcomes'], 'transition': 'END'}]},
+    'hitl editing tool_outcomes (the resumed edit fails the run)': {
+        'entry_point': 't', 'nodes': [
+            dict(TOOLKIT, transition='h'),
+            {'id': 'h', 'type': 'hitl', 'user_message': fixed('ok?'), 'edit_state_key': 'tool_outcomes',
+             'routes': {'approve': 'END', 'edit': 't2'}},
+            dict(TOOLKIT, id='t2')]},
+    'inline condition reading a bare-string condition_input (reads one letter at a time)': _routed_by(
+        _condition_node(condition_input='input', condition_definition='b', conditional_outputs=['a', 'b'],
+                        default_output='END')),
 }
 
 
@@ -155,6 +188,42 @@ def test_accepted_routing_shapes_really_route(name):
     result = graph.invoke({'input': 'hi', 'messages': []}, config={'configurable': {'thread_id': name}})
     text = str(result.get('messages'))
     assert 'ECHO:B' in text and 'ECHO:A' not in text
+
+
+def test_writing_tool_outcomes_really_fails_the_run():
+    graph = build(STRICTER_THAN_THE_BUILD['state_modifier writing tool_outcomes (the dict reducer fails the run)'])
+    with pytest.raises(ValueError, match='dictionary update sequence'):
+        graph.invoke({'input': 'hi', 'messages': []}, config={'configurable': {'thread_id': 'to'}})
+
+
+def test_editing_tool_outcomes_in_hitl_really_fails_the_resume():
+    graph = build(STRICTER_THAN_THE_BUILD['hitl editing tool_outcomes (the resumed edit fails the run)'])
+    config = {'configurable': {'thread_id': 'hitl-to'}}
+    graph.invoke({'input': 'hi', 'messages': []}, config=config)
+    with pytest.raises(ValueError, match='dictionary update sequence'):
+        graph.invoke({'hitl_resume': True, 'hitl_action': 'edit', 'hitl_value': 'text'}, config=config)
+
+
+# An inline condition with no conditional_outputs routes to whatever the template renders and never
+# uses default_output (ConditionalEdge.invoke).
+EMPTY_OUTPUTS_WORKS = _routed_by(_condition_node(condition_definition='b', conditional_outputs=[], default_output=''))
+EMPTY_OUTPUTS_TYPO = _routed_by(_condition_node(condition_definition='zzz', conditional_outputs=[], default_output='c'))
+
+
+def test_empty_conditional_outputs_route_by_the_template_and_skip_default_output():
+    for doc, expected in ((EMPTY_OUTPUTS_WORKS, 'ECHO:B'), (EMPTY_OUTPUTS_TYPO, None)):
+        result = build(doc).invoke({'input': 'hi', 'messages': []}, config={'configurable': {'thread_id': str(id(doc))}})
+        text = str(result.get('messages'))
+        assert 'ECHO:C' not in text  # default_output is never used
+        assert expected is None or expected in text
+
+
+def test_empty_conditional_outputs_warn_without_blocking():
+    # The validator cannot evaluate the template, so both get the same warning and no error.
+    for doc in (EMPTY_OUTPUTS_WORKS, EMPTY_OUTPUTS_TYPO):
+        result = validate_pipeline(doc)
+        assert result['ok'], result['errors']
+        assert any(f['field'] == 'condition.conditional_outputs' for f in result['warnings'])
 
 
 def test_code_block_without_type_fails_when_run():
