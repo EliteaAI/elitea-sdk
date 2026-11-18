@@ -482,6 +482,28 @@ alita_state = elitea_state.copy()
         result[LAST_TOOL_OUTCOME_KEY] = payload
         return result
 
+    def _with_agent_node_call_id(self, config: Optional[RunnableConfig]) -> RunnableConfig:
+        """Stamp a per-run ``parent_agent_call_id`` for an Agent node (#7128).
+
+        The UI groups a sub-agent's activity by this id. An LLM-issued call gets
+        it from its tool_call_id in ``Application.invoke``; a pipeline node calls
+        the agent directly, so without this every run of the node (e.g. each loop
+        pass) shares the empty id and is merged into one Tool Call History entry.
+        The LangGraph task id is new for every node run but stays the same when a
+        paused run is resumed, so one run stays one entry across a HITL pause.
+        As in ``Application.invoke``, this level's id overrides an inherited one.
+        """
+        config = dict(config or {})
+        configurable = config.get('configurable') or {}
+        run_id = (
+            configurable.get('__pregel_task_id')
+            or (configurable.get('checkpoint_ns') or '').rpartition(':')[2]
+            or uuid4().hex
+        )
+        config['metadata'] = dict(config.get('metadata') or {})
+        config['metadata']['parent_agent_call_id'] = f'pipeline:{self.name}:{run_id}'
+        return config
+
     def _invoke_node(
             self,
             state: Union[str, dict, ToolCall],
@@ -520,6 +542,7 @@ alita_state = elitea_state.copy()
                     logger.debug(f"[FUNC_TOOL] Overriding '{key}' in func_args with state value (value: {value!r})")
                     func_args[key] = value
             logger.debug(f"[FUNC_TOOL] Final func_args keys: {list(func_args.keys())}")
+            config = self._with_agent_node_call_id(config)
 
         # special handler for PyodideSandboxTool
         if self._is_pyodide_tool():
