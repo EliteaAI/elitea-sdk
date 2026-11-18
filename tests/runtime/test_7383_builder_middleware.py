@@ -184,3 +184,15 @@ def test_a_playbook_reaches_the_model_once_per_conversation(middleware, interrup
     second = json.loads(read.invoke({'type': 'agent', 'id': 2}))
     assert 'playbook' in first
     assert 'playbook' not in second
+
+
+@pytest.mark.parametrize('builder, auto, interactive', [
+    ({'core_prompt': 'x'}, False, True),
+    ({'core_prompt': 'x', 'interactive': False}, False, False),
+    ({'core_prompt': 'x'}, True, False),
+])
+def test_the_platform_marks_a_run_non_interactive(builder, auto, interactive):
+    from elitea_sdk.runtime.clients.client import EliteAClient
+    middleware = []
+    EliteAClient._inject_builder(middleware, builder, auto_approve_sensitive_actions=auto)
+    assert middleware[0].interactive is interactive

@@ -1542,7 +1542,7 @@ class EliteAClient:
             return
         middleware_list.append(BuilderMiddleware(
             core_prompt=builder.get('core_prompt') or '',
-            interactive=auto_approve_sensitive_actions is not True,
+            interactive=builder.get('interactive', True) and auto_approve_sensitive_actions is not True,
             conversation_id=conversation_id,
         ))
 
