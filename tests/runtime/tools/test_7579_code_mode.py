@@ -155,7 +155,7 @@ def test_argument_validation_against_args_schema():
 def test_oversized_result_is_refused_before_the_sandbox():
     big = make_tool("dump", "art", "artifact", lambda: "x" * 5000)
     d = dispatcher_for([big], limits={"max_result_bytes": 1000})
-    with pytest.raises(RuntimeError, match=r"art.dump result was 5 KB, limit 1 KB.*fewer items"):
+    with pytest.raises(RuntimeError, match=r"art.dump result was (over )?5 KB, limit 1 KB.*fewer items"):
         run(d("art.dump", "{}"))
     assert d.call_log[0]["error_class"] == "result_too_large"
 
@@ -619,3 +619,47 @@ def test_lazy_mode_survives_when_code_mode_cannot_start(monkeypatch):
                          code_mode=True, lazy_tools_mode=True)
     node = graph.get_graph().nodes["agent"].data
     assert node.lazy_tools_mode and not node.code_mode
+
+
+# --- review round 2 -------------------------------------------------------------------------------------------
+
+def test_huge_result_is_refused_without_serializing_it(monkeypatch):
+    calls = []
+    real_dumps = json.dumps
+    monkeypatch.setattr(code_mode.json, "dumps", lambda *a, **k: calls.append(1) or real_dumps(*a, **k))
+    d = dispatcher_for([make_tool("dump", "art", "artifact", lambda: [{"text": "x" * 1000}] * 50)],
+                       limits={"max_result_bytes": 10_000})
+    with pytest.raises(RuntimeError, match="result was over"):
+        run(d("art.dump", "{}"))
+    assert calls == []
+
+
+def test_small_result_shape_is_still_reported():
+    d = dispatcher_for(github_tools())
+    run(d("gh_main.get_issues", json.dumps({"repo": "a/b"})))
+    assert d.call_log[0]["shape"] == "[{number:int, state:str, repo:str}] x1"
+
+
+def test_timeout_never_exceeds_the_platform_sandbox_timeout(fake_sandbox, monkeypatch):
+    from elitea_sdk.runtime.langchain.pyodide_sandbox import PyodideSandbox
+    seen = {}
+    real = PyodideSandbox.execute_with_bridge
+
+    async def spy(self, code, dispatcher, **kwargs):
+        seen["timeout"] = kwargs["timeout_seconds"]
+        return await real(self, code, dispatcher, **kwargs)
+
+    monkeypatch.setattr(PyodideSandbox, "execute_with_bridge", spy)
+    monkeypatch.setenv("SANDBOX_TIMEOUT_SECONDS", "30")
+    execute(github_tools(), "print(1)", timeout_seconds=120)
+    assert seen["timeout"] == 30
+
+
+def test_calls_cancelled_by_a_timeout_are_reported_as_indeterminate(fake_sandbox):
+    import time as _time
+    slow = make_tool("write_slow", "art", "artifact", lambda: _time.sleep(5) or "ok")
+    report = execute([slow], "await art.write_slow()", timeout_seconds=2)
+    assert report["error_class"] == "timeout"
+    assert report["calls_indeterminate"][0].startswith("art.write_slow failed (indeterminate)")
+    assert "may or may not have taken effect" in report["calls_indeterminate"][-1]
+    assert report["calls_completed"] == []

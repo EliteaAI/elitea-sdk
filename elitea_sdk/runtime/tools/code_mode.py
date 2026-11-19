@@ -305,6 +305,11 @@ class BridgeDispatcher:
         entry.update(ok=False, error_class=error_class, error=message)
         raise RuntimeError(message)
 
+    def _refuse_too_large(self, entry: Dict[str, Any], name: str, size: int, limit: int, at_least: bool = False):
+        self._refuse(entry, "result_too_large",
+                     f"{name} result was {'over ' if at_least else ''}{_size(size)}, limit {_size(limit)}. "
+                     f"{_HINTS['result_too_large']}")
+
     def _approval_needed(self, tool: BaseTool, args: Dict[str, Any]) -> Optional[str]:
         # Without the guard middleware a direct call runs unreviewed, so the program call does too.
         if self.sensitive_guard is None:
@@ -317,6 +322,10 @@ class BridgeDispatcher:
         start = time.monotonic()
         try:
             return await self._dispatch(name, args_json, entry)
+        except asyncio.CancelledError:
+            # The tool may still finish in its thread or remotely; its effect is unknown.
+            entry.update(error_class="indeterminate", error="cancelled while running")
+            raise
         finally:
             entry["ms"] = int((time.monotonic() - start) * 1000)
 
@@ -363,17 +372,21 @@ class BridgeDispatcher:
         error_text = returned_error(result)
         if error_text:
             self._refuse(entry, "tool_error", f"{name} failed: {error_text}")
+        limit = self.limits["max_result_bytes"]
+        # Refuse obvious oversize before building more copies of the result.
+        estimate = _size_lower_bound(result)
+        if estimate > limit:
+            entry["bytes"] = estimate
+            self._refuse_too_large(entry, name, estimate, limit, at_least=True)
         result = parse_json_text(result)
         try:
             value = json.dumps(result)
         except (TypeError, ValueError):
             value = json.dumps(serialize_tool_result(result))
-        entry["bytes"] = len(value.encode("utf-8"))
-        entry["shape"] = value_shape(json.loads(value))[:400]
-        if entry["bytes"] > self.limits["max_result_bytes"]:
-            self._refuse(entry, "result_too_large",
-                         f"{name} result was {_size(entry['bytes'])}, limit {_size(self.limits['max_result_bytes'])}. "
-                         f"{_HINTS['result_too_large']}")
+        entry["bytes"] = len(value) if value.isascii() else len(value.encode("utf-8"))
+        if entry["bytes"] > limit:
+            self._refuse_too_large(entry, name, entry["bytes"], limit)
+        entry["shape"] = value_shape(result)[:400]
         entry["ok"] = True
         return value
 
@@ -426,6 +439,19 @@ def value_shape(value: Any, depth: int = 0) -> str:
     return {bool: "bool", int: "int", float: "float"}.get(type(value), "null" if value is None else type(value).__name__)
 
 
+def _size_lower_bound(value: Any, depth: int = 0) -> int:
+    """A cheap lower bound of the serialized size, so huge results are refused before json.dumps copies them."""
+    if isinstance(value, (str, bytes)):
+        return len(value)
+    if depth >= 2:
+        return 0
+    if isinstance(value, dict):
+        return sum(len(str(k)) + _size_lower_bound(v, depth + 1) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return sum(_size_lower_bound(v, depth + 1) for v in value)
+    return 0
+
+
 def _size(n: int) -> str:
     return f"{n / (1024 * 1024):.1f} MB" if n >= 1024 * 1024 else f"{n / 1024:.0f} KB"
 
@@ -464,6 +490,12 @@ def build_run_report(result: Any, call_log: List[Dict[str, Any]], max_output_cha
     elif error_class == "python_exception" and "MemoryError" in message:
         error_class = "out_of_memory"
     done = [c for c in call_log if c["ok"]]
+    unknown = [c for c in call_log if c.get("error_class") == "indeterminate"]
+    report_extra = {}
+    if unknown:
+        report_extra["calls_indeterminate"] = _format_calls(unknown) + [
+            "These calls were still running when the program stopped; they may or may not have taken effect. "
+            "Check their result before repeating any write."]
     return {
         "status": "error",
         "error_class": error_class,
@@ -472,6 +504,7 @@ def build_run_report(result: Any, call_log: List[Dict[str, Any]], max_output_cha
         "calls_completed": _format_calls(done) + (
             ["These calls already ran. Do not repeat the writes among them."] if done else []),
         "output_before_failure": output,
+        **report_extra,
     }
 
 
@@ -538,10 +571,12 @@ class ExecuteCodeTool(BaseTool):
         if run_manager is not None:
             child_config["callbacks"] = run_manager.get_child()
         dispatcher = BridgeDispatcher(self.stubs, child_config, self.limits, self.sensitive_guard)
+        # The platform sandbox timeout is the ceiling for every sandbox run, Code Mode included.
+        timeout = min(self.limits["timeout_seconds"], sandbox_limits["timeout_seconds"])
         result = await build_offline_pyodide_sandbox().execute_with_bridge(
             PREAMBLE + self.stubs.all_stubs() + "\n\n\n" + self.stubs.strip_toolkit_imports(code),
             dispatcher,
-            timeout_seconds=self.limits["timeout_seconds"],
+            timeout_seconds=timeout,
             max_tool_calls=self.limits["max_tool_calls"],
             memory_limit_mb=sandbox_limits["wasm_max_mem_mb"],
             max_concurrent_calls=1,
