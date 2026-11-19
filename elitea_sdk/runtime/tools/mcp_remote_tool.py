@@ -159,7 +159,7 @@ class McpRemoteTool(McpServerTool):
                 configured_auth=self.configured_auth,
                 tool_name=self.name,
                 toolkit_type=(self.metadata or {}).get("toolkit_type"),
-                toolkit_name=(self.metadata or {}).get("toolkit_name"),
+                toolkit_name=(self.metadata or {}).get("toolkit_name") or self.server,
             )
             
             # Execute tool call (client auto-detects SSE vs Streamable HTTP)
