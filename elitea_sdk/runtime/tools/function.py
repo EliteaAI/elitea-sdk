@@ -554,15 +554,7 @@ alita_state = elitea_state.copy()
                 self._save_code_to_artifact(func_args['code'], self.name)
 
         try:
-            tool_config = config
-            if is_nested_app:
-                # Direct calls lack a ToolCall envelope. Share one ID between
-                # the application wrapper callback and its child events.
-                metadata = dict((config or {}).get('metadata') or {})
-                namespace = metadata.get('langgraph_checkpoint_ns')
-                metadata['parent_agent_call_id'] = f'node:{namespace}' if namespace else str(uuid4())
-                tool_config = {**(config or {}), 'metadata': metadata}
-            tool_result = self.tool.invoke(func_args, tool_config, **kwargs)
+            tool_result = self.tool.invoke(func_args, config, **kwargs)
             tool_result = bound_and_record(
                 tool_result, getattr(self.tool, 'name', None), toolkit_type_of(self.tool))
 
