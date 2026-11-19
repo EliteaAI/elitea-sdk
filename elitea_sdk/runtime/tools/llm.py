@@ -316,6 +316,10 @@ class LLMNode(BaseTool):
         default=False,
         description='Code Mode (#7579): bind execute_code/get_tool_api; registry tools are called from the program.'
     )
+    code_mode_direct_tools: List[str] = Field(
+        default_factory=list,
+        description='Code Mode: tools that need approval, bound directly instead of being called from programs.'
+    )
     tool_registry: Optional[Any] = Field(
         default=None,
         exclude=True,
@@ -917,10 +921,9 @@ class LLMNode(BaseTool):
 
     def _get_code_mode_tools(self) -> List[BaseTool]:
         if self._code_mode_tools is None:
-            from .code_mode import create_code_mode_tools
-            guard = next((mw for mw in getattr(self.middleware_manager, 'wrapping_middleware', [])
-                          if getattr(mw, 'GUARDS_SENSITIVE_ACTIONS', False) and hasattr(mw, 'approval_needed')), None)
-            tools = create_code_mode_tools(self.tool_registry, sensitive_guard=guard)
+            from .code_mode import create_code_mode_tools, find_sensitive_guard
+            tools = create_code_mode_tools(self.tool_registry, sensitive_guard=find_sensitive_guard(self.middleware_manager),
+                                           direct_tool_names=self.code_mode_direct_tools)
             # The dispatcher refuses sensitive calls itself, so the HITL guard is skipped like for meta-tools.
             if self.middleware_manager is not None:
                 tools = [self.middleware_manager.wrap_tool(t, skip_sensitive_guard=True) for t in tools]
@@ -933,7 +936,7 @@ class LLMNode(BaseTool):
     def _registry_index(self) -> str:
         if self.code_mode:
             from .code_mode import generate_code_mode_index
-            return generate_code_mode_index(self.tool_registry)
+            return generate_code_mode_index(self.tool_registry, self.code_mode_direct_tools)
         return self.tool_registry.generate_index()
 
     def get_tool_index(self) -> str:

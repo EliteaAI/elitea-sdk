@@ -1157,21 +1157,23 @@ def find_mcp_auth_proxy(tools: list, toolkit_name: Optional[str]) -> Optional[Ba
 
 
 
-def _build_code_mode_registry(tools, always_bind_tool_names):
-    """(True, registry) when code mode can run here; it needs the local Deno sandbox, never the remote one."""
+def _build_code_mode_registry(tools, always_bind_tool_names, middleware_manager=None):
+    """(enabled, registry, sensitive tools); it needs the local Deno sandbox, never the remote one."""
     import shutil
-    from ..tools.code_mode import code_mode_eligible_tools
+    from ..tools.code_mode import code_mode_eligible_tools, find_sensitive_guard, split_sensitive
     if not shutil.which("deno"):
         logger.warning("[CodeMode] Ignored: no local Deno sandbox available")
-        return False, None
+        return False, None, []
     base_tools = code_mode_eligible_tools([t for t in tools if isinstance(t, BaseTool)
                                            and t.name not in always_bind_tool_names])
+    base_tools, sensitive = split_sensitive(base_tools, find_sensitive_guard(middleware_manager))
     if not base_tools:
-        logger.info("[CodeMode] Ignored: the agent has no toolkit tools")
-        return False, None
+        logger.info("[CodeMode] Ignored: the agent has no toolkit tools outside the ones needing approval")
+        return False, None, []
     registry = ToolRegistry.from_tools(base_tools)
-    logger.info("[CodeMode] Enabled with %d toolkits, %d tools", len(registry.get_toolkit_names()), len(base_tools))
-    return True, registry
+    logger.info("[CodeMode] Enabled with %d toolkits, %d tools; %d bound directly for approval",
+                len(registry.get_toolkit_names()), len(base_tools), len(sensitive))
+    return True, registry, sensitive
 
 
 def create_graph(
@@ -1241,9 +1243,10 @@ def create_graph(
 
     always_bind_tool_names = {t.name for t in always_bind_tools if hasattr(t, 'name')}
 
-    code_registry = None
+    code_registry, sensitive_tools = None, []
     if code_mode:
-        code_mode, code_registry = _build_code_mode_registry(tools, always_bind_tool_names)
+        code_mode, code_registry, sensitive_tools = _build_code_mode_registry(
+            tools, always_bind_tool_names, middleware_manager)
         if code_mode:
             lazy_tools_mode = False
 
@@ -1283,7 +1286,8 @@ def create_graph(
         tool_registry = code_registry
         direct = [t for t in tools if isinstance(t, BaseTool) and is_direct_bind_tool(t)
                   and t.name not in always_bind_tool_names]
-        always_bind_tools = list(always_bind_tools) + direct
+        # Tools that need approval stay bound directly; they already carry the guard from the assistant.
+        always_bind_tools = list(always_bind_tools) + direct + sensitive_tools
 
     if for_subgraph:
         # Sanitization for sub-graphs
@@ -1580,6 +1584,7 @@ def create_graph(
                     # Lazy tools mode parameters
                     lazy_tools_mode=use_lazy_for_node,
                     code_mode=use_code_mode_for_node,
+                    code_mode_direct_tools=[t.name for t in sensitive_tools] if use_code_mode_for_node else [],
                     tool_registry=tool_registry if (use_lazy_for_node or use_code_mode_for_node) else None,
                     # Always-bind tools (e.g., agent/pipeline tools, planning tools)
                     # These should ALWAYS be passed regardless of lazy mode - they need direct LLM access

@@ -395,14 +395,14 @@ def test_llm_node_without_code_mode_is_unchanged():
 def test_create_graph_without_deno_ignores_code_mode(monkeypatch):
     from elitea_sdk.runtime.langchain import langraph_agent
     monkeypatch.setattr("shutil.which", lambda _name: None)
-    assert langraph_agent._build_code_mode_registry(github_tools(), set()) == (False, None)
+    assert langraph_agent._build_code_mode_registry(github_tools(), set()) == (False, None, [])
 
 
 def test_create_graph_registry_excludes_always_bind_and_indexer_tools(monkeypatch):
     from elitea_sdk.runtime.langchain import langraph_agent
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/deno")
     tools = github_tools() + [make_tool("index_data", "gh-main", "github", lambda: "x")]
-    enabled, registry = langraph_agent._build_code_mode_registry(tools, {"create_file"})
+    enabled, registry, _ = langraph_agent._build_code_mode_registry(tools, {"create_file"})
     assert enabled
     assert list(registry.get_toolkit_tools("gh-main")) == ["get_issues"]
 
@@ -671,3 +671,156 @@ def test_description_states_the_effective_time_limit(monkeypatch):
     execute = create_code_mode_tools(ToolRegistry.from_tools(github_tools()))[0]
     assert "finish within 40 s" in execute.description
     assert read_code_mode_limits()["timeout_seconds"] == 40
+
+
+# --- sensitive tools bound directly (#7579 scope extension, part A) -----------------------------------------
+
+def _guarded_graph(monkeypatch, guard, tools=None):
+    """Build a code-mode agent graph the way the assistant does: tools wrapped by the middleware first."""
+    import yaml
+    from langgraph.checkpoint.memory import MemorySaver
+    from elitea_sdk.runtime.langchain.langraph_agent import create_graph
+    from elitea_sdk.runtime.langchain.constants import DEAULT_AGENT_NAME
+    from elitea_sdk.runtime.middleware.base import MiddlewareManager
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/deno")
+    manager = MiddlewareManager()
+    if guard is not None:
+        manager.add(guard)
+    wrapped = [manager.wrap_tool(t) for t in (tools or github_tools())]
+    schema = yaml.safe_dump({
+        "name": DEAULT_AGENT_NAME, "state": {"messages": {"type": "list"}},
+        "nodes": [{"id": "agent", "type": "llm", "transition": "END"}], "entry_point": "agent",
+    })
+    graph = create_graph(client=None, yaml_schema=schema, tools=wrapped, memory=MemorySaver(),
+                         code_mode=True, middleware_manager=manager)
+    return graph.get_graph().nodes["agent"].data, wrapped
+
+
+def test_sensitive_tool_is_bound_directly_and_left_out_of_programs(monkeypatch):
+    from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+    security.configure_sensitive_tools({"github": ["create_file"]})
+    node, _ = _guarded_graph(monkeypatch, SensitiveToolGuardMiddleware())
+    assert [t.name for t in node.get_filtered_tools()] == ["execute_code", "create_file"]
+    stubs = code_mode.stubs_for(node.tool_registry)
+    assert "gh_main.create_file" not in stubs.bridge_names
+    assert "create_file" not in stubs.all_stubs()
+    execute = node.get_filtered_tools()[0]
+    assert "Need approval, so not callable from programs: create_file" in execute.description
+    assert "Tools that need approval (call directly, not from programs): create_file" in node.get_tool_index()
+
+
+def test_directly_bound_sensitive_tool_still_asks_for_approval(monkeypatch):
+    from langgraph.errors import GraphInterrupt
+    from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+    security.configure_sensitive_tools({"github": ["create_file"]})
+    node, _ = _guarded_graph(monkeypatch, SensitiveToolGuardMiddleware())
+    direct = node.get_filtered_tools()[1]
+    with pytest.raises(GraphInterrupt):
+        # interrupt() needs a graph context; outside it LangGraph raises a GraphInterrupt-compatible error.
+        _invoke_inside_graph(direct, {"filename": "a", "filedata": "b"})
+
+
+def _invoke_inside_graph(tool, args):
+    from typing import TypedDict
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import StateGraph, START, END
+
+    class S(TypedDict):
+        out: str
+
+    builder = StateGraph(S)
+    builder.add_node("call", lambda state: {"out": str(tool.invoke(args))})
+    builder.add_edge(START, "call")
+    builder.add_edge("call", END)
+    graph = builder.compile(checkpointer=MemorySaver())
+    result = graph.invoke({"out": ""}, config={"configurable": {"thread_id": "t"}})
+    if "__interrupt__" in result:
+        raise GraphInterrupt(result["__interrupt__"])
+    return result
+
+
+@pytest.mark.parametrize("guard_kwargs", [{"auto_approve": True}, {"auto_approve": [("gh-main", "create_file")]},
+                                          {"auto_approve": [("gh-main", "*")]}, None])
+def test_approved_or_unguarded_sensitive_tool_stays_in_programs(monkeypatch, guard_kwargs):
+    from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+    security.configure_sensitive_tools({"github": ["create_file"]})
+    guard = None if guard_kwargs is None else SensitiveToolGuardMiddleware(**guard_kwargs)
+    node, _ = _guarded_graph(monkeypatch, guard)
+    assert [t.name for t in node.get_filtered_tools()] == ["execute_code"]
+    assert "gh_main.create_file" in code_mode.stubs_for(node.tool_registry).bridge_names
+
+
+def test_dispatcher_still_refuses_and_names_the_direct_tool():
+    from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+    security.configure_sensitive_tools({"github": ["create_file"]})
+    d = dispatcher_for(github_tools(), guard=SensitiveToolGuardMiddleware())
+    with pytest.raises(RuntimeError, match="Call the create_file tool directly instead"):
+        run(d("gh_main.create_file", json.dumps({"filename": "a", "filedata": "b"})))
+
+
+def test_requires_approval_for_is_per_tool():
+    from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+    security.configure_sensitive_tools({"github": ["create_file"]})
+    guard = SensitiveToolGuardMiddleware()
+    issues, create = github_tools()
+    assert guard.requires_approval_for(create) and not guard.requires_approval_for(issues)
+
+
+def test_only_sensitive_tools_left_disables_code_mode(monkeypatch):
+    from elitea_sdk.runtime.middleware.sensitive_tool_guard import SensitiveToolGuardMiddleware
+    security.configure_sensitive_tools({"github": ["get_issues", "create_file"]})
+    node, _ = _guarded_graph(monkeypatch, SensitiveToolGuardMiddleware())
+    assert not node.code_mode
+
+
+# --- fewer first-run failures (#7579 scope extension, part B) -----------------------------------------------
+
+class _ListWrapper(BaseModel):
+    def get_available_tools(self):
+        return [{"name": "get_issues", "ref": self.get_issues}]
+
+    def get_issues(self) -> List[dict]:
+        return []
+
+
+def _declared_list_tool(func):
+    tool = make_tool("get_issues", "gh", "github", func)
+    object.__setattr__(tool, "api_wrapper", _ListWrapper())
+    return tool
+
+
+def test_text_from_a_list_method_is_a_tool_error():
+    d = dispatcher_for([_declared_list_tool(lambda: "Something went wrong: 410 This issue was deleted")])
+    with pytest.raises(RuntimeError, match="gh.get_issues failed: Something went wrong: 410"):
+        run(d("gh.get_issues", "{}"))
+    assert d.call_log[0]["error_class"] == "tool_error"
+
+
+def test_json_text_from_a_list_method_is_still_data():
+    d = dispatcher_for([_declared_list_tool(lambda: '[{"n": 1}]')])
+    assert json.loads(run(d("gh.get_issues", "{}"))) == [{"n": 1}]
+
+
+def test_text_from_a_list_method_raises_tool_error_inside_the_program(fake_sandbox):
+    tool = _declared_list_tool(lambda: "Failed to get issues: 410 This issue was deleted")
+    report = execute([tool], textwrap.dedent('''
+        try:
+            await gh.get_issues()
+        except ToolError as e:
+            print("caught", e)
+    '''))
+    assert report["status"] == "success"
+    assert report["output"].startswith("caught gh.get_issues failed: Failed to get issues: 410")
+
+
+def test_get_tool_api_shows_the_declared_return_type():
+    tool = _declared_list_tool(lambda: [])
+    api = GetToolApiTool(stubs=CodeModeStubs(ToolRegistry.from_tools([tool])))
+    assert "async def get_issues() -> list:" in api.invoke({"toolkit": "gh"})
+
+
+def test_one_structured_log_line_per_run(fake_sandbox, caplog):
+    with caplog.at_level("INFO", logger="elitea_sdk.runtime.tools.code_mode"):
+        execute(github_tools(), "print(len(await gh_main.get_issues(repo='a/b')))")
+    lines = [r.getMessage() for r in caplog.records if "[CodeMode] run" in r.getMessage()]
+    assert lines and "ok=True error_class=- calls=1 failed_calls=0" in lines[0]

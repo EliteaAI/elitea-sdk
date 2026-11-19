@@ -68,6 +68,21 @@ def is_direct_bind_tool(tool: BaseTool) -> bool:
     return meta.get("toolkit_name") in DIRECT_BIND_INTERNAL_TOOLS
 
 
+def find_sensitive_guard(middleware_manager: Any) -> Any:
+    """The sensitive-action HITL guard among the manager's middleware, or None."""
+    return next((mw for mw in getattr(middleware_manager, "wrapping_middleware", None) or []
+                 if getattr(mw, "GUARDS_SENSITIVE_ACTIONS", False) and hasattr(mw, "requires_approval_for")), None)
+
+
+def split_sensitive(tools: List[BaseTool], guard: Any) -> tuple:
+    """(program tools, tools that need approval): the latter are bound directly so the approval card can show."""
+    if guard is None:
+        return list(tools), []
+    sensitive = [t for t in tools if guard.requires_approval_for(t)]
+    ids = {id(t) for t in sensitive}
+    return [t for t in tools if id(t) not in ids], sensitive
+
+
 def code_mode_eligible_tools(tools: List[BaseTool]) -> List[BaseTool]:
     """Indexer tools are long-running jobs, so programs can't call them; direct-bind tools stay outside too."""
     return [t for t in tools if isinstance(t, BaseTool) and t.name not in INDEX_TOOL_NAMES
@@ -353,7 +368,7 @@ class BridgeDispatcher:
         if action:
             self._refuse(entry, "approval_required",
                          f"{action} needs human approval, which is not available inside Code Mode programs. "
-                         f"Don't call it from execute_code.")
+                         f"Call the {tool.name} tool directly instead, outside execute_code.")
 
         schema = getattr(tool, "args_schema", None)
         if isinstance(schema, type) and issubclass(schema, BaseModel):
@@ -373,7 +388,7 @@ class BridgeDispatcher:
                 self._refuse(entry, "aborted", "The run is stopping.")
             self._refuse(entry, "tool_error", f"{name} failed: {exc}")
 
-        error_text = returned_error(result)
+        error_text = returned_error(result) or _undeclared_text(tool, result)
         if error_text:
             self._refuse(entry, "tool_error", f"{name} failed: {error_text}")
         limit = self.limits["max_result_bytes"]
@@ -408,6 +423,14 @@ def returned_error(result: Any) -> Optional[str]:
         if error or str(result.get("status", "")).lower() == "error":
             return str(error or result.get("message") or result)[:2000]
     return None
+
+
+def _undeclared_text(tool: BaseTool, result: Any) -> Optional[str]:
+    """Text from a method declared to return only list/dict is its error message (e.g. `return f"Failed: {e}"`)."""
+    hint = return_hint(tool)
+    if not isinstance(result, str) or not hint or "str" in hint or result.lstrip()[:1] in "[{":
+        return None
+    return result.strip()[:2000]
 
 
 def parse_json_text(result: Any) -> Any:
@@ -589,8 +612,9 @@ class ExecuteCodeTool(BaseTool):
         if dispatcher.abort is not None:
             raise dispatcher.abort
         report = build_run_report(result, dispatcher.call_log, self.limits["max_output_chars"])
-        logger.info("[CodeMode] execute_code %s (%s) calls=%d in %.1fs", report["status"],
-                    report.get("error_class", "-"), len(dispatcher.call_log), result.execution_time)
+        logger.info("[CodeMode] run ok=%s error_class=%s calls=%d failed_calls=%d seconds=%.1f",
+                    report["status"] == "success", report.get("error_class", "-"), len(dispatcher.call_log),
+                    sum(1 for c in dispatcher.call_log if not c["ok"]), result.execution_time)
         return json.dumps(report, ensure_ascii=False, indent=1)
 
 
@@ -615,15 +639,23 @@ class GetToolApiTool(BaseTool):
         return stub
 
 
-def create_code_mode_tools(registry: ToolRegistry, sensitive_guard: Any = None) -> List[BaseTool]:
+_APPROVAL_RULE = ("Do reads and preparation in a program. Print the planned write (tool and arguments), then make "
+                  "that write as a direct tool call; it asks the user for approval.")
+
+
+def create_code_mode_tools(registry: ToolRegistry, sensitive_guard: Any = None,
+                           direct_tool_names: Optional[List[str]] = None) -> List[BaseTool]:
     stubs = stubs_for(registry)
     execute = ExecuteCodeTool(stubs=stubs, sensitive_guard=sensitive_guard)
+    if direct_tool_names:
+        execute.description += (f"\n\nNeed approval, so not callable from programs: {', '.join(direct_tool_names)}. "
+                                + _APPROVAL_RULE)
     if stubs.tool_count <= execute.limits["inline_stubs_max"]:
         return [execute]
     return [execute, GetToolApiTool(stubs=stubs)]
 
 
-def generate_code_mode_index(registry: ToolRegistry) -> str:
+def generate_code_mode_index(registry: ToolRegistry, direct_tool_names: Optional[List[str]] = None) -> str:
     """System-prompt index: toolkit classes and tool names only; signatures come from get_tool_api."""
     stubs = stubs_for(registry)
     inline = stubs.tool_count <= read_code_mode_limits()["inline_stubs_max"]
@@ -636,4 +668,7 @@ def generate_code_mode_index(registry: ToolRegistry) -> str:
     for toolkit, ident in stubs.class_names.items():
         desc = _doc_line(registry.get_toolkit_description(toolkit) or "")[:120]
         lines.append(f"- {ident}{f' ({desc})' if desc else ''}: {', '.join(registry.get_toolkit_tools(toolkit))}")
+    if direct_tool_names:
+        lines += ["", "Tools that need approval (call directly, not from programs): " + ", ".join(direct_tool_names),
+                  _APPROVAL_RULE]
     return "\n".join(lines)
