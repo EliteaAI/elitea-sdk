@@ -49,6 +49,59 @@ from ...tools.utils.serialization import serialize_tool_result
 logger = logging.getLogger(__name__)
 
 
+def strip_null_args(arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """LLMs send explicit nulls for optional params; tools often mishandle them."""
+    return {k: v for k, v in (arguments or {}).items() if v is not None}
+
+
+def _blocked_message(tool: str) -> str:
+    return f"Tool '{tool}' is blocked by security policy and cannot be executed. Please choose a different tool."
+
+
+def resolve_registry_tool(registry: "ToolRegistry", toolkit: str, tool: str):
+    """Resolve toolkit.tool against the registry and the blocklist: (tool, toolkit, None) or (None, toolkit, error)."""
+    from ..toolkits.security import is_tool_blocked, normalize_tool_name
+    toolkit_type = registry.get_toolkit_type(toolkit) or toolkit
+    if is_tool_blocked(toolkit_type, normalize_tool_name(tool)):
+        logger.warning("[SECURITY] tool '%s' in toolkit '%s' (type '%s') blocked", tool, toolkit, toolkit_type)
+        return None, toolkit, _blocked_message(tool)
+
+    actual_tool = registry.get_tool(toolkit, tool)
+    if not actual_tool:
+        actual_tool = registry.get_tool_by_name(tool)
+        if not actual_tool:
+            available_toolkits = registry.get_toolkit_names()
+            if toolkit in available_toolkits:
+                available_tools = list(registry.get_toolkit_tools(toolkit).keys())
+                return None, toolkit, (
+                    f"Tool '{tool}' not found in toolkit '{toolkit}'. "
+                    f"Available tools in {toolkit}: {', '.join(available_tools[:20])}"
+                    f"{'...' if len(available_tools) > 20 else ''}"
+                )
+            return None, toolkit, f"Toolkit '{toolkit}' not found. Available toolkits: {', '.join(available_toolkits)}"
+        toolkit = registry.get_toolkit_for_tool(tool)
+
+    # Post-resolution: the by-name fallback must not bypass the blocklist.
+    metadata = getattr(actual_tool, "metadata", {}) or {}
+    resolved_tool_name = metadata.get(TOOL_NAME_META) or getattr(actual_tool, "name", None) or tool
+    resolved_type = metadata.get(TOOLKIT_TYPE_META) or registry.get_toolkit_type(toolkit) or toolkit
+    if is_tool_blocked(resolved_type, normalize_tool_name(resolved_tool_name)):
+        logger.warning("[SECURITY] tool '%s' (resolved '%s', type '%s') blocked post-resolution",
+                       tool, resolved_tool_name, resolved_type)
+        return None, toolkit, _blocked_message(tool)
+    return actual_tool, toolkit, None
+
+
+def reraise_control_flow(exc: BaseException) -> None:
+    """Re-raise what must stop the run (interrupts, MCP auth, guardrail, budget) instead of becoming a tool error."""
+    # McpAuthorizationRequired subclasses ToolException, so it is checked before any ToolException handling.
+    if isinstance(exc, (GraphBubbleUp, InputGuardrailBlocked, McpAuthorizationRequired)):
+        raise exc
+    budget_error = budget_exceeded_from(exc)
+    if budget_error is not None:
+        raise budget_error from exc
+
+
 class ToolRegistry:
     """
     Registry that organizes tools by toolkit for efficient lookup and lazy loading.
@@ -681,105 +734,20 @@ class InvokeToolTool(BaseTool):
         run_manager: Optional[CallbackManagerForToolRun] = None,
     ) -> str:
         """Invoke a tool from the registry."""
-        # Security gate: reject blocked tools before any lookup or execution
+        arguments = strip_null_args(arguments)
+        actual_tool, toolkit, error = resolve_registry_tool(self.registry, toolkit, tool)
+        if error:
+            return error
         try:
-            from ..toolkits.security import is_tool_blocked, normalize_tool_name
-            toolkit_type = self.registry.get_toolkit_type(toolkit) or toolkit
-            resolved_name = normalize_tool_name(tool)
-            if is_tool_blocked(toolkit_type, resolved_name):
-                logger.warning(
-                    "[SECURITY] invoke_tool blocked: tool '%s' in toolkit '%s' (type '%s')",
-                    tool, toolkit, toolkit_type,
-                )
-                return (
-                    f"Tool '{tool}' is blocked by security policy and cannot be executed. "
-                    f"Please choose a different tool."
-                )
-        except ImportError:
-            pass
-
-        # Strip None values — LLM often sends explicit nulls for optional params
-        # (because Pydantic schemas show "default": null), which can cause failures
-        # in tools that don't handle None gracefully, leading to retry loops
-        arguments = {k: v for k, v in (arguments or {}).items() if v is not None}
-
-        # Get the tool
-        actual_tool = self.registry.get_tool(toolkit, tool)
-
-        if not actual_tool:
-            # Try to find by tool name only
-            actual_tool = self.registry.get_tool_by_name(tool)
-            if actual_tool:
-                # Found it, update toolkit for the message
-                toolkit = self.registry.get_toolkit_for_tool(tool)
-            else:
-                # Not found - provide helpful error
-                available_toolkits = self.registry.get_toolkit_names()
-                if toolkit in available_toolkits:
-                    available_tools = list(self.registry.get_toolkit_tools(toolkit).keys())
-                    return (
-                        f"Tool '{tool}' not found in toolkit '{toolkit}'. "
-                        f"Available tools in {toolkit}: {', '.join(available_tools[:20])}"
-                        f"{'...' if len(available_tools) > 20 else ''}"
-                    )
-                else:
-                    return (
-                        f"Toolkit '{toolkit}' not found. "
-                        f"Available toolkits: {', '.join(available_toolkits)}"
-                    )
-
-        # Invoke the tool
-        try:
-            # Security gate (post-resolution): ensure the *actual* tool cannot bypass blocklist
-            try:
-                from ..toolkits.security import is_tool_blocked, normalize_tool_name
-                metadata = getattr(actual_tool, "metadata", {}) or {}
-                resolved_tool_name = (
-                    metadata.get(TOOL_NAME_META)
-                    or getattr(actual_tool, "name", None)
-                    or tool
-                )
-                resolved_toolkit_type = (
-                    metadata.get(TOOLKIT_TYPE_META)
-                    or self.registry.get_toolkit_type(toolkit)
-                    or toolkit
-                )
-                if is_tool_blocked(resolved_toolkit_type, normalize_tool_name(resolved_tool_name)):
-                    logger.warning(
-                        "[SECURITY] invoke_tool blocked (post-resolution): tool '%s' (resolved '%s') "
-                        "in toolkit '%s' (resolved type '%s')",
-                        tool, resolved_tool_name, toolkit, resolved_toolkit_type,
-                    )
-                    return (
-                        f"Tool '{tool}' is blocked by security policy and cannot be executed. "
-                        f"Please choose a different tool."
-                    )
-            except ImportError:
-                pass
-
             logger.info(f"[LazyTools] Invoking {toolkit}.{tool} with args: {arguments}")
             result = actual_tool.invoke(arguments)
             return serialize_tool_result(result) if result is not None \
                 else "Tool executed successfully (no output)"
-        except (GraphBubbleUp, InputGuardrailBlocked):
-            raise
-        except McpAuthorizationRequired:
-            # Must precede the ToolException clause, which this subclasses. Without
-            # it a lazily-invoked MCP tool never shows the Login button.
-            raise
-        except ToolException as e:
-            budget_error = budget_exceeded_from(e)
-            if budget_error is not None:
-                raise budget_error from e
-            # Even for ToolException, show the expected schema
-            return self._format_invocation_error(toolkit, tool, arguments, str(e))
         except Exception as e:
-            budget_error = budget_exceeded_from(e)
-            if budget_error is not None:
-                raise budget_error from e
-            error_msg = str(e)
-            logger.error(f"Error invoking {toolkit}.{tool}: {e}", exc_info=True)
-            return self._format_invocation_error(toolkit, tool, arguments, error_msg)
+            reraise_control_flow(e)
+            if not isinstance(e, ToolException):
+                logger.error(f"Error invoking {toolkit}.{tool}: {e}", exc_info=True)
+            return self._format_invocation_error(toolkit, tool, arguments, str(e))
 
     def _format_invocation_error(self, toolkit: str, tool: str, provided_args: Dict[str, Any], error_msg: str) -> str:
         """Format a helpful error message with expected schema details."""
@@ -880,49 +848,20 @@ class InvokeToolTool(BaseTool):
         run_manager: Optional[CallbackManagerForToolRun] = None,
     ) -> str:
         """Async version of invoke_tool."""
-        arguments = {k: v for k, v in (arguments or {}).items() if v is not None}
-
-        actual_tool = self.registry.get_tool(toolkit, tool)
-
-        if not actual_tool:
-            actual_tool = self.registry.get_tool_by_name(tool)
-            if not actual_tool:
-                available_toolkits = self.registry.get_toolkit_names()
-                if toolkit in available_toolkits:
-                    available_tools = list(self.registry.get_toolkit_tools(toolkit).keys())
-                    return (
-                        f"Tool '{tool}' not found in toolkit '{toolkit}'. "
-                        f"Available tools: {', '.join(available_tools[:20])}"
-                    )
-                else:
-                    return f"Toolkit '{toolkit}' not found. Available: {', '.join(available_toolkits)}"
-
+        arguments = strip_null_args(arguments)
+        actual_tool, toolkit, error = resolve_registry_tool(self.registry, toolkit, tool)
+        if error:
+            return error
         try:
             logger.info(f"[LazyTools] Async invoking {toolkit}.{tool} with args: {arguments}")
-            if hasattr(actual_tool, 'ainvoke'):
-                result = await actual_tool.ainvoke(arguments)
-            else:
-                result = actual_tool.invoke(arguments)
+            result = await actual_tool.ainvoke(arguments)
             return serialize_tool_result(result) if result is not None \
                 else "Tool executed successfully (no output)"
-        except (GraphBubbleUp, InputGuardrailBlocked):
-            raise
-        except McpAuthorizationRequired:
-            # Must precede the ToolException clause, which this subclasses. Without
-            # it a lazily-invoked MCP tool never shows the Login button.
-            raise
-        except ToolException as e:
-            budget_error = budget_exceeded_from(e)
-            if budget_error is not None:
-                raise budget_error from e
-            return self._format_invocation_error(toolkit, tool, arguments, str(e))
         except Exception as e:
-            budget_error = budget_exceeded_from(e)
-            if budget_error is not None:
-                raise budget_error from e
-            error_msg = str(e)
-            logger.error(f"Error invoking {toolkit}.{tool}: {e}", exc_info=True)
-            return self._format_invocation_error(toolkit, tool, arguments, error_msg)
+            reraise_control_flow(e)
+            if not isinstance(e, ToolException):
+                logger.error(f"Error invoking {toolkit}.{tool}: {e}", exc_info=True)
+            return self._format_invocation_error(toolkit, tool, arguments, str(e))
 
 
 def create_meta_tools(registry: ToolRegistry) -> List[BaseTool]:

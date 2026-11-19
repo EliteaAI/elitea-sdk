@@ -1156,6 +1156,24 @@ def find_mcp_auth_proxy(tools: list, toolkit_name: Optional[str]) -> Optional[Ba
     return legacy_matches[0] if len(legacy_identities) == 1 else None
 
 
+
+def _build_code_mode_registry(tools, always_bind_tool_names):
+    """(True, registry) when code mode can run here; it needs the local Deno sandbox, never the remote one."""
+    import shutil
+    from ..tools.code_mode import code_mode_eligible_tools
+    if not shutil.which("deno"):
+        logger.warning("[CodeMode] Ignored: no local Deno sandbox available")
+        return False, None
+    base_tools = code_mode_eligible_tools([t for t in tools if isinstance(t, BaseTool)
+                                           and t.name not in always_bind_tool_names])
+    if not base_tools:
+        logger.info("[CodeMode] Ignored: the agent has no toolkit tools")
+        return False, None
+    registry = ToolRegistry.from_tools(base_tools)
+    logger.info("[CodeMode] Enabled with %d toolkits, %d tools", len(registry.get_toolkit_names()), len(base_tools))
+    return True, registry
+
+
 def create_graph(
         client: Any,
         yaml_schema: str,
@@ -1166,6 +1184,7 @@ def create_graph(
         debug: bool = False,
         for_subgraph: bool = False,
         lazy_tools_mode: bool = False,
+        code_mode: bool = False,
         always_bind_tools: Optional[list[BaseTool]] = None,
         middleware_manager: Optional[Any] = None,
         child_dispatcher: Optional[Any] = None,
@@ -1222,6 +1241,12 @@ def create_graph(
 
     always_bind_tool_names = {t.name for t in always_bind_tools if hasattr(t, 'name')}
 
+    code_registry = None
+    if code_mode:
+        code_mode, code_registry = _build_code_mode_registry(tools, always_bind_tool_names)
+        if code_mode:
+            lazy_tools_mode = False
+
     if lazy_tools_mode:
         # Exclude always_bind_tools from the registry - they'll be bound directly
         base_tools = [
@@ -1252,6 +1277,13 @@ def create_graph(
 
     # Update lazy_tools_mode to effective value for use in LLMNode creation
     lazy_tools_mode = effective_lazy_mode
+
+    if code_mode:
+        from ..tools.code_mode import is_direct_bind_tool
+        tool_registry = code_registry
+        direct = [t for t in tools if isinstance(t, BaseTool) and is_direct_bind_tool(t)
+                  and t.name not in always_bind_tool_names]
+        always_bind_tools = list(always_bind_tools) + direct
 
     if for_subgraph:
         # Sanitization for sub-graphs
@@ -1526,6 +1558,7 @@ def create_graph(
                     tool_registry is not None and
                     not explicit_tool_selection
                 )
+                use_code_mode_for_node = code_mode and not explicit_tool_selection
 
                 if use_lazy_for_node:
                     logger.info(f"[LazyTools] LLM node '{node_id}' using lazy tools mode")
@@ -1546,7 +1579,8 @@ def create_graph(
                     steps_limit=kwargs.get('steps_limit', 25),
                     # Lazy tools mode parameters
                     lazy_tools_mode=use_lazy_for_node,
-                    tool_registry=tool_registry if use_lazy_for_node else None,
+                    code_mode=use_code_mode_for_node,
+                    tool_registry=tool_registry if (use_lazy_for_node or use_code_mode_for_node) else None,
                     # Always-bind tools (e.g., agent/pipeline tools, planning tools)
                     # These should ALWAYS be passed regardless of lazy mode - they need direct LLM access
                     # Fix for #3382: When lazy mode auto-disabled (tool_count < 20), agent tools were lost
@@ -1759,7 +1793,8 @@ def create_graph(
         interrupt_after_successors=interrupt_after_successors,
         state_class={state_class: None},
         output_variables=node.get('output', []),
-        tool_registry=tool_registry,
+        # Dynamic toolkit selection is a lazy-mode feature; in code mode it would bind toolkit tools directly.
+        tool_registry=None if code_mode else tool_registry,
         middleware_manager=middleware_manager,
         terminal_output_variables=collect_terminal_output_variables(schema),
         child_dispatcher=child_dispatcher,
