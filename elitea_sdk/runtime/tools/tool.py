@@ -20,11 +20,15 @@ from ...tools.utils.serialization import serialize_tool_result
 logger = logging.getLogger(__name__)
 
 
-def _is_closed_set_rejection(error: Exception) -> bool:
-    """Whether a structured-output failure only rejects values outside a field's fixed set."""
+def _closed_set_rejections(error: Exception) -> dict:
+    """The rejected values by field when a structured-output failure only rejects values outside a fixed set."""
     validation = error if isinstance(error, ValidationError) else error.__cause__
-    return isinstance(validation, ValidationError) and all(
-        item['type'] == 'literal_error' for item in validation.errors())
+    if not isinstance(validation, ValidationError):
+        return {}
+    errors = validation.errors()
+    if not all(item['type'] == 'literal_error' for item in errors):
+        return {}
+    return {'.'.join(map(str, item['loc'])): item['input'] for item in errors}
 
 
 class ToolNode(BaseTool):
@@ -102,9 +106,10 @@ Answer must be JSON only extractable by JSON.LOADS."""
             try:
                 completion = llm.invoke(input_, config=config)
             except (ValidationError, OutputParserException) as error:
-                if not _is_closed_set_rejection(error):
+                rejected = _closed_set_rejections(error)
+                if not rejected:
                     raise
-                return self._invalid_input_reply(error, params, input_)
+                return self._invalid_input_reply(rejected, params, input_)
             result = completion if isinstance(completion, dict) else completion.model_dump()
         else:
             input_[-1].content += self.unstructured_output

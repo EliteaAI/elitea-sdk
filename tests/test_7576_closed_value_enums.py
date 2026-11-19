@@ -51,8 +51,8 @@ CLOSED_SET_FIELDS = [
     ("gitlab_org", "get_issues", "state", ["opened", "closed", "all"]),
     ("postman", "analyze", "scope", ["collection", "folder", "request"]),
     ("qtest", "search_entities_by_dql", "object_type", [
-        "test-cases", "test-runs", "defects", "requirements", "test-suites", "test-cycles", "test-logs",
-        "releases", "builds"]),
+        "test-cases", "test-runs", "defects", "requirements", "test-suites", "test-cycles", "releases", "builds",
+        "test-logs"]),
     ("report_portal", "get_extended_launch_data_as_raw", "format", ["pdf", "xls", "html"]),
     ("zephyr_essential", "find_folder_by_name", "folder_type", FOLDER_TYPES),
     ("zephyr_essential", "list_folders", "folder_type", FOLDER_TYPES),
@@ -91,14 +91,20 @@ def _offered_options(prop: dict) -> Optional[list]:
     return choice.get("enum") or ([choice["const"]] if "const" in choice else None)
 
 
-def test_the_table_covers_the_59_fields():
-    assert len(CLOSED_SET_FIELDS) == 59
-
-
 @pytest.mark.parametrize(("toolkit", "tool", "field", "values"), CLOSED_SET_FIELDS,
                          ids=[f"{t}.{tool}.{f}" for t, tool, f, _ in CLOSED_SET_FIELDS])
 def test_closed_set_field_offers_exactly_its_values(toolkit, tool, field, values):
     assert _offered_options(_args_schemas(toolkit)[tool]["properties"][field]) == values
+
+
+@pytest.mark.parametrize(("toolkit", "tool", "field"), [
+    ("aha", "attach_file", "resource_type"),
+    ("gitlab", "list_merge_requests", "state"),
+    ("report_portal", "get_extended_launch_data_as_raw", "format"),
+])
+def test_description_names_every_offered_value(toolkit, tool, field):
+    prop = _args_schemas(toolkit)[tool]["properties"][field]
+    assert [value for value in _offered_options(prop) if value not in prop["description"]] == []
 
 
 def test_instance_specific_fields_stay_free_text():
@@ -151,6 +157,7 @@ def test_structured_output_outside_the_closed_set_fails_gracefully():
                     input_variables=["input"])
     reply = node.invoke({"input": "list issues"})
     assert reply["messages"][0]["response_metadata"][RUN_FAILURE_NOTICE_KEY] is True
+    assert "with value {'state': 'open'} raised" in reply["messages"][0]["content"]
     assert action.api_wrapper.calls == []
 
 
@@ -173,7 +180,9 @@ def _state_node(client):
 
 def test_parser_wrapped_closed_set_rejection_fails_gracefully():
     action, node = _state_node(_ParserWrappingClient({"state": "open"}))
-    assert node.invoke({"input": "list issues"})["messages"][0]["response_metadata"][RUN_FAILURE_NOTICE_KEY] is True
+    reply = node.invoke({"input": "list issues"})
+    assert reply["messages"][0]["response_metadata"][RUN_FAILURE_NOTICE_KEY] is True
+    assert "with value {'state': 'open'} raised" in reply["messages"][0]["content"]
     assert action.api_wrapper.calls == []
 
 

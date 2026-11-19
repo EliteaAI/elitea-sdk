@@ -159,13 +159,7 @@ getCase = create_model("getCase", testcase_id=(str, Field(description="Testcase 
 getCases = create_model(
     "getCases",
     project_id=(str, Field(description="Project id")),
-    output_format=(
-        Literal["json", "csv", "markdown"],
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
     keys=(
         Optional[List[str]],
         Field(

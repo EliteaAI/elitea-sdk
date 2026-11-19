@@ -142,7 +142,7 @@ ListMergeRequestsModel = create_model(
     "ListMergeRequestsModel",
     state=(
         Optional[Literal["opened", "closed", "locked", "merged", "all"]],
-        Field(default="all", description="Merge request state filter: opened | merged | closed | all"),
+        Field(default="all", description="Merge request state filter: opened | closed | locked | merged | all"),
     ),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when all=True)")),
@@ -935,7 +935,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         aging, rejection rate and self-merge calculations.
 
         Parameters:
-            state: opened | merged | closed | all
+            state: opened | closed | locked | merged | all
             page: Page number (ignored when all=True)
             per_page: Results per page (ignored when all=True)
             created_after: Inclusive ISO 8601 lower bound on created_at

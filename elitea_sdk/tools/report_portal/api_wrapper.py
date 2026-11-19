@@ -24,7 +24,7 @@ GetExtendedLaunchDataAsRaw = create_model(
     "GetExtendedLaunchDataAsRaw",
     launch_id=(str, Field(description="Launch ID of the launch to export.")),
     format=(Optional[Literal["pdf", "xls", "html"]], Field(default="html",
-                                 description="format of the exported data. may be one of 'pdf' or 'html'"))
+                                 description="format of the exported data. may be one of 'pdf', 'xls' or 'html'"))
 )
 GetLaunchDetails = create_model(
     "GetLaunchDetailsModel",
