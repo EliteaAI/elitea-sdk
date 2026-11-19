@@ -248,6 +248,10 @@ elitea_sdk = [
     "docs/faq/*.md",
     "docs/prompts/*.md",
     "runtime/guardrails/*.json",
+    "runtime/pipeline/*.yaml",
+    "runtime/pipeline/knowledge/*.md",
+    "runtime/pipeline/knowledge/node/*.md",
+    "runtime/pipeline/knowledge/pattern/*.md",
 ]
 
 [tool.setuptools.packages.find]
