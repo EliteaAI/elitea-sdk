@@ -27,7 +27,8 @@ CODE_MODE_META = {"toolkit_type": "internal", "toolkit_name": "code_mode", "disp
 _HINTS = {
     "result_too_large": "Request less data: fewer items, filter arguments, or pagination.",
     "out_of_memory": "Process items page by page and keep only the fields you need; don't hold all results at once.",
-    "timeout": "Do less per program; split the work into several execute_code calls.",
+    "timeout": ("The whole program, tool calls included, must finish within the time limit. Do less per program "
+                "and split the work into several execute_code calls; don't repeat calls that already completed."),
     "call_limit": "Batch the work or split it into several execute_code calls.",
     "python_exception": "Fix the error shown in the message and run the corrected program.",
     "sandbox_crashed": "The sandbox died, most likely out of memory. Split the work into smaller programs.",
@@ -46,8 +47,11 @@ def _env_int(name: str, default: int) -> int:
 
 
 def read_code_mode_limits() -> Dict[str, int]:
+    from .sandbox import _read_sandbox_limits_from_env
+    # The platform sandbox timeout is the ceiling for every sandbox run, Code Mode included.
+    sandbox_timeout = int(_read_sandbox_limits_from_env()["timeout_seconds"])
     return {
-        "timeout_seconds": _env_int("CODE_MODE_TIMEOUT_SECONDS", 120),
+        "timeout_seconds": max(1, min(_env_int("CODE_MODE_TIMEOUT_SECONDS", 120), sandbox_timeout)),
         "max_tool_calls": _env_int("CODE_MODE_MAX_TOOL_CALLS", 150),
         "max_result_bytes": _env_int("CODE_MODE_MAX_RESULT_BYTES", 1024 * 1024),
         "max_output_chars": _env_int("CODE_MODE_MAX_OUTPUT_CHARS", 25000),
@@ -518,7 +522,9 @@ after each run, so if unsure, print a small part first rather than guessing.
 - Only what you print() comes back to you, so print just what you need, compactly.
 - A failed call raises ToolError; catch it to continue.
 - No network or files; only toolkit methods reach the outside world.
-- At most {max_tool_calls} tool calls and {timeout_seconds} s per program; a result over {max_result_kb} KB is refused."""
+- Each program must finish within {timeout_seconds} s, tool calls included (they run one at a time), and make at most \
+{max_tool_calls} tool calls; a result over {max_result_kb} KB is refused. For many slow calls, split the work into \
+several programs."""
 
 
 class ExecuteCodeInput(BaseModel):
@@ -571,7 +577,6 @@ class ExecuteCodeTool(BaseTool):
         if run_manager is not None:
             child_config["callbacks"] = run_manager.get_child()
         dispatcher = BridgeDispatcher(self.stubs, child_config, self.limits, self.sensitive_guard)
-        # The platform sandbox timeout is the ceiling for every sandbox run, Code Mode included.
         timeout = min(self.limits["timeout_seconds"], sandbox_limits["timeout_seconds"])
         result = await build_offline_pyodide_sandbox().execute_with_bridge(
             PREAMBLE + self.stubs.all_stubs() + "\n\n\n" + self.stubs.strip_toolkit_imports(code),

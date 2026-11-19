@@ -663,3 +663,11 @@ def test_calls_cancelled_by_a_timeout_are_reported_as_indeterminate(fake_sandbox
     assert report["calls_indeterminate"][0].startswith("art.write_slow failed (indeterminate)")
     assert "may or may not have taken effect" in report["calls_indeterminate"][-1]
     assert report["calls_completed"] == []
+
+
+def test_description_states_the_effective_time_limit(monkeypatch):
+    monkeypatch.setenv("SANDBOX_TIMEOUT_SECONDS", "40")
+    monkeypatch.setenv("CODE_MODE_TIMEOUT_SECONDS", "120")
+    execute = create_code_mode_tools(ToolRegistry.from_tools(github_tools()))[0]
+    assert "finish within 40 s" in execute.description
+    assert read_code_mode_limits()["timeout_seconds"] == 40
