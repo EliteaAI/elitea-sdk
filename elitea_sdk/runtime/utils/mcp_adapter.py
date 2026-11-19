@@ -474,7 +474,7 @@ class UnifiedMcpClient:
             status=401,
             tool_name=self.tool_name or self.url,
             toolkit_type=self.toolkit_type or "mcp",
-            toolkit_name=self.toolkit_name or self.tool_name or self.url,
+            toolkit_name=self.toolkit_name or self.url,
         )
 
     @property
