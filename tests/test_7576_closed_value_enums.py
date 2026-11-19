@@ -30,8 +30,7 @@ FOLDER_TYPES = ["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]
 
 CLOSED_SET_FIELDS = [
     ("aha", "attach_file", "resource_type", [
-        "feature", "requirement", "idea", "release", "release_phase", "epic", "initiative", "product", "goal",
-        "page", "to_do"]),
+        "feature", "requirement", "idea", "release", "release_phase", "epic", "initiative", "goal", "page", "to_do"]),
     *[("aha", tool, "record_type", MANAGEABLE)
       for tool in ("create_record", "update_record", "delete_record", "manage_record")],
     ("aha", "manage_record", "action", ["create", "update", "delete"]),
@@ -64,6 +63,7 @@ CLOSED_SET_FIELDS = [
     ("zephyr_essential", "list_folders", "folder_type", FOLDER_TYPES),
     ("zephyr_scale", "get_folders", "folderType", FOLDER_TYPES),
     ("zephyr_scale", "add_test_steps", "tc_mode", ["APPEND", "OVERWRITE"]),
+    ("zephyr_scale", "search_test_cases", "order_direction", ["ASC", "DESC"]),
     ("ado", "create_test_case", "test_steps_format", ["json", "xml"]),
     ("ado", "modify_wiki_page", "version_type", ["branch", "tag", "commit"]),
     ("ado", "rename_wiki_page", "version_type", ["branch", "tag", "commit"]),

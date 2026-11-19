@@ -179,7 +179,7 @@ getPageTree = create_model(
 getPageIdByTitleInput = create_model(
     "getPageIdByTitleInput",
     title=(str, Field(description="Page title")),
-    type=(Optional[Literal["page", "blogpost"]], Field(description="Jira type of content: page or blogpost. Defaults to page", default="page")),
+    type=(Optional[Literal["page", "blogpost"]], Field(description="Confluence content type: page or blogpost. Defaults to page", default="page")),
     space=(Optional[str], Field(
         description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
         default=None)),

@@ -275,8 +275,8 @@ MAX_RECORDS_FIELD = (
     ),
 )
 RESOURCE_TYPE_FIELD = (
-    Literal[tuple(_RESOURCE_PLURAL)],
-    Field(description=f"Aha resource type: {_format_allowed_values(tuple(_RESOURCE_PLURAL))}."),
+    _CommentResourceType,
+    Field(description=f"Aha resource type: {_COMMENTABLE_RESOURCE_VALUES}."),
 )
 COMMENT_RESOURCE_TYPE_FIELD = (
     _CommentResourceType,

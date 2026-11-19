@@ -190,7 +190,7 @@ ZephyrSearchTestCases = create_model(
     max_results=(Optional[int], Field(description="Maximum number of results to query from the API", default=1000, gt=0)),
     start_at=(Optional[int], Field(description="Zero-indexed starting position", default=0)),
     order_by=(Optional[str], Field(description="Field to order results by", default="name")),
-    order_direction=(Optional[str], Field(description="Order direction", default="ASC")),
+    order_direction=(Optional[Literal["ASC", "DESC"]], Field(description="Order direction", default="ASC")),
     archived=(Optional[bool], Field(description="Include archived test cases", default=False)),
     fields=(Optional[List[str]], Field(description="Fields to include in the response (default: key, name). Regular fields include key, name, id, labels, folder, etc. Custom fields can be included in the following ways:Individual custom fields via customFields.field_name format, All custom fields via customFields in the fields list", default=["key", "name"])),
     limit_results=(Optional[int], Field(description="Maximum number of filtered results to return", default=10, gt=0)),
