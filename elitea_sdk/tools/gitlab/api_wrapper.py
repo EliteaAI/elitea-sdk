@@ -1,6 +1,6 @@
 # api_wrapper.py
 import fnmatch
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from gitlab import GitlabGetError
 from langchain_core.tools import ToolException
@@ -97,7 +97,10 @@ ListFoldersModel = create_model(
 )
 GetIssuesModel = create_model(
     "GetIssuesModel",
-    state=(Optional[str], Field(default="opened", description="Issue state filter: opened | closed | all")),
+    state=(
+        Optional[Literal["opened", "closed", "all"]],
+        Field(default="opened", description="Issue state filter: opened | closed | all"),
+    ),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when fetch_all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when fetch_all=True)")),
     created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
@@ -137,7 +140,10 @@ GetCommitsModel = create_model(
 # back to raw diff-only get_pr_changes.
 ListMergeRequestsModel = create_model(
     "ListMergeRequestsModel",
-    state=(Optional[str], Field(default="all", description="Merge request state filter: opened | merged | closed | all")),
+    state=(
+        Optional[Literal["opened", "closed", "locked", "merged", "all"]],
+        Field(default="all", description="Merge request state filter: opened | closed | locked | merged | all"),
+    ),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when all=True)")),
     created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
@@ -929,7 +935,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         aging, rejection rate and self-merge calculations.
 
         Parameters:
-            state: opened | merged | closed | all
+            state: opened | closed | locked | merged | all
             page: Page number (ignored when all=True)
             per_page: Results per page (ignored when all=True)
             created_after: Inclusive ISO 8601 lower bound on created_at

@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 def _output_format_field():
     """Shared schema field for the `output_format` argument (DRY across tools)."""
     return (
-        str,
+        Literal["json", "csv", "markdown"],
         Field(
             default="json",
             description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
@@ -159,13 +159,7 @@ getCase = create_model("getCase", testcase_id=(str, Field(description="Testcase 
 getCases = create_model(
     "getCases",
     project_id=(str, Field(description="Project id")),
-    output_format=(
-        str,
-        Field(
-            default="json",
-            description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",
-        ),
-    ),
+    output_format=_output_format_field(),
     keys=(
         Optional[List[str]],
         Field(
@@ -231,7 +225,7 @@ getCasesByFilter = create_model(
         ),
     ),
     output_format=(
-        str,
+        Literal["json", "csv", "markdown"],
         Field(
 
             description="Desired output format. Supported values: 'json', 'csv', 'markdown'. Defaults to 'json'.",

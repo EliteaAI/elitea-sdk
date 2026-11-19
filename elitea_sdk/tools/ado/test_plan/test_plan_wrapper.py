@@ -150,7 +150,7 @@ TestCaseCreateModel = create_model(
     title=(str, Field(description="Test case title")),
     description=(str, Field(description="Test case description")),
     test_steps=(str, Field(description=test_steps_description)),
-    test_steps_format=(Optional[str], Field(description="Format of provided test steps. Possible values: json, xml", default='json')),
+    test_steps_format=(Optional[Literal["json", "xml"]], Field(description="Format of provided test steps. Possible values: json, xml", default='json')),
     additional_fields=(Optional[str], Field(description="JSON string of additional custom fields as key-value pairs. Example: '{\"SDLC\": \"Development\", \"Priority\": \"High\"}'. Use get_all_test_case_fields_for_project to discover required fields.", default=None))
 )
 

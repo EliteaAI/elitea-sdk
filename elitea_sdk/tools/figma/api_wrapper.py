@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from enum import Enum
-from typing import Callable, ClassVar, Dict, List, Generator, Optional, Tuple, TypeVar, Union
+from typing import Callable, ClassVar, Dict, List, Generator, Literal, Optional, Tuple, TypeVar, Union
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -322,7 +322,7 @@ class ArgsSchema(Enum):
             ),
         ),
         output_format=(
-            Optional[str],
+            Optional[Literal["full", "compact", "summary", "style_guide"]],
             Field(
                 description=(
                     "Control output verbosity for LLM optimization: "

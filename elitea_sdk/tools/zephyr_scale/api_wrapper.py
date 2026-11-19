@@ -92,7 +92,7 @@ ZephyrTestStepsInputModel = create_model(
     "ZephyrTestStepsInputModel",
     test_case_key=(str, Field(
         description="The key of the test case. Test case keys are of the format [A-Z]+-T[0-9]+")),
-    tc_mode=(str, Field(
+    tc_mode=(Literal["APPEND", "OVERWRITE"], Field(
         description=("Valid values: 'APPEND', 'OVERWRITE'. "
                      "'OVERWRITE' deletes and recreates the test steps and associated custom field values using the provided input. "
                      "Attachments for existing steps are kept, but those for missing steps are deleted permanently. "
@@ -113,7 +113,7 @@ ZephyrGetFolders = create_model(
     projectKey=(Optional[str], Field(
         description="Jira project key filter. Must match the pattern [A-Z][A-Z_0-9]+.",
         default=None)),
-    folderType=(Optional[str], Field(
+    folderType=(Optional[Literal["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]], Field(
         description=("Folder type filter. Valid values are 'TEST_CASE', 'TEST_PLAN', or 'TEST_CYCLE'."),
         default=None))
 )
@@ -190,7 +190,7 @@ ZephyrSearchTestCases = create_model(
     max_results=(Optional[int], Field(description="Maximum number of results to query from the API", default=1000, gt=0)),
     start_at=(Optional[int], Field(description="Zero-indexed starting position", default=0)),
     order_by=(Optional[str], Field(description="Field to order results by", default="name")),
-    order_direction=(Optional[str], Field(description="Order direction", default="ASC")),
+    order_direction=(Optional[Literal["ASC", "DESC"]], Field(description="Order direction", default="ASC")),
     archived=(Optional[bool], Field(description="Include archived test cases", default=False)),
     fields=(Optional[List[str]], Field(description="Fields to include in the response (default: key, name). Regular fields include key, name, id, labels, folder, etc. Custom fields can be included in the following ways:Individual custom fields via customFields.field_name format, All custom fields via customFields in the fields list", default=["key", "name"])),
     limit_results=(Optional[int], Field(description="Maximum number of filtered results to return", default=10, gt=0)),
