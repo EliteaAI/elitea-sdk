@@ -362,11 +362,11 @@ SearchCode = create_model(
     query=(str, Field(
         description="Search query using GitHub's code search syntax. Examples: 'content:Skill language:Java org:github', 'NOT is:archived language:Python', 'repo:owner/repo class MyClass'. Supports: language:, repo:, org:, path:, filename:, extension:, content: filters."
     )),
-    sort=(Optional[str], Field(
+    sort=(Optional[Literal["indexed"]], Field(
         default=None,
         description="Sort field. Only 'indexed' is supported for code search (sorts by last indexed time)"
     )),
-    order=(Optional[str], Field(
+    order=(Optional[Literal["asc", "desc"]], Field(
         default=None,
         description="Sort order: 'asc' or 'desc'. Default is 'desc'"
     )),

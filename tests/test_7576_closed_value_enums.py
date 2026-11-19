@@ -50,6 +50,12 @@ CLOSED_SET_FIELDS = [
     ("gitlab", "list_merge_requests", "state", ["opened", "closed", "locked", "merged", "all"]),
     ("gitlab_org", "get_issues", "state", ["opened", "closed", "all"]),
     ("postman", "analyze", "scope", ["collection", "folder", "request"]),
+    ("postman", "get_request_script", "script_type", ["test", "prerequest"]),
+    ("confluence", "get_page_id_by_title", "type", ["page", "blogpost"]),
+    ("confluence", "add_file_to_page", "position", ["append", "prepend"]),
+    ("github", "search_code", "sort", ["indexed"]),
+    ("github", "search_code", "order", ["asc", "desc"]),
+    ("figma", "extract_design_tokens_batch", "output_format", ["full", "compact", "summary", "style_guide"]),
     ("qtest", "search_entities_by_dql", "object_type", [
         "test-cases", "test-runs", "defects", "requirements", "test-suites", "test-cycles", "releases", "builds",
         "test-logs"]),

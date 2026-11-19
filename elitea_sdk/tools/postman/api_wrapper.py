@@ -290,7 +290,7 @@ PostmanGetRequestById = create_model(
 PostmanGetRequestScript = create_model(
     "PostmanGetRequestScript",
     request_path=(str, Field(description="Path to the request (folder/requestName)")),
-    script_type=(str, Field(description="The type of script to retrieve: 'test' or 'prerequest'", default="prerequest"))
+    script_type=(Literal["test", "prerequest"], Field(description="The type of script to retrieve: 'test' or 'prerequest'", default="prerequest"))
 )
 
 PostmanExecuteRequest = create_model(
