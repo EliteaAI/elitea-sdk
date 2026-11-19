@@ -2,7 +2,7 @@ import copy
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from traceback import format_exc
 
 import requests
@@ -59,7 +59,7 @@ PostmanSearchRequests = create_model(
 
 PostmanAnalyze = create_model(
     "PostmanAnalyze",
-    scope=(str, Field(
+    scope=(Literal["collection", "folder", "request"], Field(
         description="The scope of analysis: 'collection', 'folder', or 'request'", 
         default="collection")),
     target_path=(Optional[str], Field(

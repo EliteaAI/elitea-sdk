@@ -350,7 +350,10 @@ UploadAttachmentToTestRun = _project_model(
 # Generic search model for any entity type
 GenericDqlSearch = _project_model(
     "GenericDqlSearch",
-    object_type=(str, Field(description="Entity type to search: 'test-cases', 'test-runs', 'defects', 'requirements', 'test-suites', 'test-cycles', 'test-logs', 'releases', or 'builds'. Note: test-logs only support date queries; modules are NOT searchable - use get_modules tool.")),
+    object_type=(Literal[
+        "test-cases", "test-runs", "defects", "requirements", "test-suites", "test-cycles", "test-logs", "releases",
+        "builds",
+    ], Field(description="Entity type to search: 'test-cases', 'test-runs', 'defects', 'requirements', 'test-suites', 'test-cycles', 'test-logs', 'releases', or 'builds'. Note: test-logs only support date queries; modules are NOT searchable - use get_modules tool.")),
     dql=(str, Field(description="QTest Data Query Language (DQL) query string")),
 )
 

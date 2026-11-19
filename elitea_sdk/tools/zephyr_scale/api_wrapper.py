@@ -92,7 +92,7 @@ ZephyrTestStepsInputModel = create_model(
     "ZephyrTestStepsInputModel",
     test_case_key=(str, Field(
         description="The key of the test case. Test case keys are of the format [A-Z]+-T[0-9]+")),
-    tc_mode=(str, Field(
+    tc_mode=(Literal["APPEND", "OVERWRITE"], Field(
         description=("Valid values: 'APPEND', 'OVERWRITE'. "
                      "'OVERWRITE' deletes and recreates the test steps and associated custom field values using the provided input. "
                      "Attachments for existing steps are kept, but those for missing steps are deleted permanently. "
@@ -113,7 +113,7 @@ ZephyrGetFolders = create_model(
     projectKey=(Optional[str], Field(
         description="Jira project key filter. Must match the pattern [A-Z][A-Z_0-9]+.",
         default=None)),
-    folderType=(Optional[str], Field(
+    folderType=(Optional[Literal["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]], Field(
         description=("Folder type filter. Valid values are 'TEST_CASE', 'TEST_PLAN', or 'TEST_CYCLE'."),
         default=None))
 )

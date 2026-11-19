@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Literal, Optional, Any
 from pydantic import BaseModel, Field, SecretStr, create_model
 
 from elitea_sdk.tools.utils.tool_prompts import UPDATE_FILE_PROMPT_WITH_PATH
@@ -206,7 +206,7 @@ UpdateIssue = create_model(
         description="Replace all assignees with this list. Example: ['octocat']. Pass empty list [] to unassign everyone.",
         default=None
     )),
-    state=(Optional[str], Field(
+    state=(Optional[Literal["open", "closed"]], Field(
         description="Set issue state. Must be 'open' or 'closed'. Example: 'closed' to close the issue.",
         default=None
     )),
@@ -326,7 +326,10 @@ GetWorkflowRuns = create_model(
     "GetWorkflowRuns",
     workflow_id=(Optional[str], Field(description="Optional workflow ID or file name (e.g., 'build.yml', '1234567') to list runs of. If None, lists runs of all workflows in the repository.", default=None)),
     branch=(Optional[str], Field(description="Only return runs for this branch.", default=None)),
-    status=(Optional[str], Field(description="Only return runs with this status or conclusion (e.g., 'queued', 'in_progress', 'completed', 'success', 'failure', 'cancelled').", default=None)),
+    status=(Optional[Literal[
+        "completed", "action_required", "cancelled", "failure", "neutral", "skipped", "stale", "success",
+        "timed_out", "in_progress", "queued", "requested", "waiting", "pending",
+    ]], Field(description="Only return runs with this status or conclusion (e.g., 'queued', 'in_progress', 'completed', 'success', 'failure', 'cancelled').", default=None)),
     event=(Optional[str], Field(description="Only return runs triggered by this event (e.g., 'push', 'pull_request', 'workflow_dispatch', 'schedule').", default=None)),
     limit=(int, Field(description="Maximum number of runs to return (1-100). Most recent first.", default=10, ge=1, le=100)),
     repo_name=(Optional[str], Field(default=None, description="Name of the repository (e.g., 'owner/repo'). If None, uses the default repository."))

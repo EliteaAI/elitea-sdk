@@ -96,7 +96,7 @@ createPage = create_model(
         default=None)),
     title=(str, Field(description="Title of the page")),
     body=(str, Field(description="Body of the page")),
-    status=(Optional[str],
+    status=(Optional[Literal["current", "draft"]],
             Field(description="Page publishing option: 'current' for publish page, 'draft' to create draft.",
                   default='current')),
     parent_id=(Optional[str], Field(description="Page parent id (optional)", default=None)),
@@ -115,7 +115,7 @@ createPages = create_model(
     pages_info=(str, Field(
         description="""JSON string containing information about page name and its content per syntax: [{"page1_name": "page1_content"}, {"page2_name": "page2_content"}]""")),
     parent_id=(Optional[str], Field(description="Page parent id (optional)", default=None)),
-    status=(Optional[str],
+    status=(Optional[Literal["current", "draft"]],
             Field(description="Page publishing option: 'current' for publish page, 'draft' to create draft.",
                   default='current')),
 )

@@ -1149,7 +1149,7 @@ GetProject = create_model(
 ListFolders = create_model(
     "ListFolders",
     project_key=(Optional[str], Field(default=None, description="Project key to filter folders.")),
-    folder_type=(Optional[str], Field(default=None, description="Folder type to filter folders.")),
+    folder_type=(Optional[Literal["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]], Field(default=None, description="Folder type to filter folders.")),
     max_results=(Optional[int], Field(default=None, description="Maximum number of results to return.")),
     start_at=(Optional[int], Field(default=None, description="Starting index of the results."))
 )
@@ -1179,7 +1179,7 @@ FindFolderByName = create_model(
     "GetFolder",
     name=(str, Field(description="Name of the folder to retrieve.")),
     project_key=(Optional[str], Field(description="Project key", default=None)),
-    folder_type=(Optional[str], Field(description="""Folder type. Possible values: "TEST_CASE", "TEST_PLAN", "TEST_CYCLE" """,
+    folder_type=(Optional[Literal["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]], Field(description="""Folder type. Possible values: "TEST_CASE", "TEST_PLAN", "TEST_CYCLE" """,
                                       default=None)),
 )
 

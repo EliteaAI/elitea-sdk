@@ -127,7 +127,7 @@ ModifyPageInput = create_model(
     page_name=(str, Field(description="Wiki page name")),
     page_content=(str, Field(description="Wiki page content")),
     version_identifier=(str, Field(description="Version string identifier (name of tag/branch, SHA1 of commit). Usually for wiki the branch is 'wikiMaster'")),
-    version_type=(Optional[str], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch")),
+    version_type=(Optional[Literal["branch", "tag", "commit"]], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch")),
     expanded=(Optional[bool], Field(description="Whether to return the full page object or just its simplified version.", default=False))
 )
 
@@ -137,7 +137,7 @@ RenamePageInput = create_model(
     old_page_name=(str, Field(description="Old Wiki page name to be renamed", examples= ["/TestPageName"])),
     new_page_name=(str, Field(description="New Wiki page name", examples= ["/RenamedName"])),
     version_identifier=(str, Field(description="Version string identifier (name of tag/branch, SHA1 of commit)")),
-    version_type=(Optional[str], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch"))
+    version_type=(Optional[Literal["branch", "tag", "commit"]], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch"))
 )
 
 
