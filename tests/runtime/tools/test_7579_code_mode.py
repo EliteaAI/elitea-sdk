@@ -824,3 +824,79 @@ def test_one_structured_log_line_per_run(fake_sandbox, caplog):
         execute(github_tools(), "print(len(await gh_main.get_issues(repo='a/b')))")
     lines = [r.getMessage() for r in caplog.records if "[CodeMode] run" in r.getMessage()]
     assert lines and "ok=True error_class=- calls=1 failed_calls=0" in lines[0]
+
+
+# --- review round 3 -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", ['Repo tools for the "id"', "x" * 299 + "\\abc", 'ends with quote"', 'a """ b',
+                                  "trailing backslash \\"])
+def test_toolkit_description_never_breaks_the_stubs(text):
+    tool = make_tool("read", "fs", "fs", lambda: 1, description=text)
+    registry = ToolRegistry.from_tools([tool])
+    registry._toolkit_descriptions["fs"] = text
+    compile(code_mode.PREAMBLE + CodeModeStubs(registry).all_stubs(), "<stubs>", "exec")
+
+
+def test_long_descriptions_are_cut_before_escaping():
+    class A(BaseModel):
+        x: str = Field(description="y" * 299 + "\\" * 3)
+    tool = make_tool("read", "fs", "fs", lambda x: x, A, description="z" * 599 + '"' * 4)
+    compile(code_mode.PREAMBLE + CodeModeStubs(ToolRegistry.from_tools([tool])).all_stubs(), "<stubs>", "exec")
+
+
+def test_bridged_calls_get_the_runs_config(fake_sandbox):
+    seen = {}
+
+    def get(config: dict = None):  # the RunnableConfig LangChain passes to the tool
+        return "ok"
+
+    from langchain_core.runnables import RunnableConfig
+
+    def capture(config: RunnableConfig):
+        seen["configurable"] = dict(config.get("configurable") or {})
+        seen["tags"] = list(config.get("tags") or [])
+        return "ok"
+
+    tool = StructuredTool.from_function(func=capture, name="get", description="get",
+                                        metadata={"toolkit_name": "gh", "toolkit_type": "github"})
+    execute_tool = ExecuteCodeTool(stubs=CodeModeStubs(ToolRegistry.from_tools([tool])))
+    execute_tool.invoke({"code": "await gh.get()"},
+                        config={"configurable": {"thread_id": "t1", "project_id": 3}, "tags": ["run-tag"]})
+    assert seen["configurable"]["thread_id"] == "t1" and seen["configurable"]["project_id"] == 3
+    assert "run-tag" in seen["tags"]
+
+
+def test_sync_run_inside_a_loop_keeps_contextvars(fake_sandbox):
+    import contextvars as cv
+    marker = cv.ContextVar("marker", default="MISSING")
+    seen = {}
+    tool = make_tool("get", "gh", "github", lambda: seen.setdefault("v", marker.get()) or "ok")
+    execute_tool = ExecuteCodeTool(stubs=CodeModeStubs(ToolRegistry.from_tools([tool])))
+
+    async def caller():
+        marker.set("SET")
+        return execute_tool.invoke({"code": "await gh.get()"})
+
+    asyncio.run(caller())
+    assert seen["v"] == "SET"
+
+
+def test_code_mode_node_does_not_run_unbound_toolkit_tools(monkeypatch):
+    import yaml
+    from langgraph.checkpoint.memory import MemorySaver
+    from elitea_sdk.runtime.langchain.langraph_agent import create_graph
+    from elitea_sdk.runtime.langchain.constants import DEAULT_AGENT_NAME
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/deno")
+    schema = yaml.safe_dump({
+        "name": DEAULT_AGENT_NAME, "state": {"messages": {"type": "list"}},
+        "nodes": [{"id": "agent", "type": "llm", "transition": "END"}], "entry_point": "agent",
+    })
+    node = create_graph(client=None, yaml_schema=schema, tools=github_tools(), memory=MemorySaver(),
+                        code_mode=True).get_graph().nodes["agent"].data
+    assert node._resolve_tool_to_execute("create_file", {}) is None
+    assert node._resolve_tool_to_execute("execute_code", {}).name == "execute_code"
+
+
+def test_non_code_mode_node_still_resolves_available_tools():
+    node = llm_node(github_tools(), code_mode=False, lazy_tools_mode=False)
+    assert node._resolve_tool_to_execute("create_file", {}).name == "create_file"

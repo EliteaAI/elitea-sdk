@@ -1,6 +1,7 @@
 """Code Mode (#7579): the LLM writes one Python program; toolkit calls go through the sandbox bridge."""
 
 import asyncio
+import contextvars
 import json
 import inspect
 import keyword
@@ -155,16 +156,17 @@ def return_hint(tool: BaseTool) -> Optional[str]:
 
 def returns_doc(tool: BaseTool) -> Optional[str]:
     match = re.search(r"Returns?:\s*(.+?)(?:\n\s*\n|\Z)", tool.description or "", re.S | re.I)
-    return _doc_line(match.group(1))[:300] if match else None
+    return _doc_line(match.group(1), 300) if match else None
 
 
 # Names the preamble defines; a toolkit class named like one would shadow it.
 _RESERVED_NAMES = {"ToolError", "Any", "_call", "_bridge", "_json", "json", "asyncio"}
 
 
-def _doc_line(text: str) -> str:
-    # Stub docstrings are not raw strings, so backslashes in descriptions must not form escapes.
-    return " ".join(str(text or "").split()).replace("\\", "\\\\").replace('"""', "'''")
+def _doc_line(text: str, limit: int = 600) -> str:
+    """One line of docstring text: cut before escaping, so no cut splits an escape; `"` becomes `'`."""
+    line = " ".join(str(text or "").split())[:limit]
+    return line.replace("\\", "\\\\").replace('"', "'")
 
 
 def stubs_for(registry: ToolRegistry) -> "CodeModeStubs":
@@ -221,14 +223,14 @@ class CodeModeStubs:
                 params.append(f"{ident}: {hint}")
             else:
                 params.append(f"{ident}: {hint} = {repr(prop.get('default'))}")
-            doc = _doc_line(prop.get("description", ""))
+            doc = " ".join(str(prop.get("description", "") or "").split())
             if prop.get("enum"):
                 doc = f"{doc.rstrip('.')}. One of {prop['enum']}.".lstrip(". ")
             if doc:
-                arg_docs.append(f"            {ident}: {doc[:300]}")
+                arg_docs.append(f"            {ident}: {_doc_line(doc, 300)}")
         signature = ", ".join(["*"] + params) if params else ""
         mapping = ", ".join(f"{json.dumps(n)}: {_identifier(n)}" for n in props)
-        doc = _doc_line(tool.description)[:600]
+        doc = _doc_line(tool.description, 600)
         method = self.method_names[(toolkit, tool.name)]
         bridge_name = f"{self.class_names[toolkit]}.{method}"
         returns = return_hint(tool)
@@ -278,7 +280,7 @@ class CodeModeStubs:
         tools = self.registry.get_toolkit_tools(toolkit)
         selected = [tools[n] for n in tools if not tool_names or n in tool_names]
         body = [self.tool_stub(toolkit, t) for t in selected] or ["    pass"]
-        description = _doc_line(self.registry.get_toolkit_description(toolkit) or toolkit)[:300]
+        description = _doc_line(self.registry.get_toolkit_description(toolkit) or toolkit, 300)
         return f'class {self.class_names[toolkit]}:\n    """{description}"""\n\n' + "\n\n".join(body)
 
     def all_stubs(self) -> str:
@@ -579,24 +581,26 @@ class ExecuteCodeTool(BaseTool):
                 self.description += ("\n\nAvailable methods (call get_tool_api only when you need argument docs):\n"
                                      + self.stubs.signature_index())
 
-    def _run(self, code: str, run_manager: Optional[CallbackManagerForToolRun] = None,
-             config: Optional[RunnableConfig] = None) -> str:
-        # Bridged calls must stay children of this run, so the callbacks travel into the async path.
-        coro = self._arun(code, run_manager=run_manager, config=config)
+    # A bare RunnableConfig annotation is what LangChain injects; Optional[...] would leave config None.
+    def _run(self, code: str, config: RunnableConfig, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        coro = self._arun(code, config=config, run_manager=run_manager)
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(coro)
         import concurrent.futures
+        # A new thread starts with an empty context; copy it so run-scoped contextvars reach the tools.
+        ctx = contextvars.copy_context()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            return executor.submit(asyncio.run, coro).result()
+            return executor.submit(ctx.run, asyncio.run, coro).result()
 
-    async def _arun(self, code: str, run_manager: Any = None, config: Optional[RunnableConfig] = None) -> str:
+    async def _arun(self, code: str, config: RunnableConfig, run_manager: Any = None) -> str:
         from .sandbox import _read_sandbox_limits_from_env, build_offline_pyodide_sandbox, enforce_sandbox_admission
         sandbox_limits = _read_sandbox_limits_from_env()
         enforce_sandbox_admission(sandbox_limits)
-        # Bridged calls run as children of this tool run, so they show up as tool steps and are metered.
+        # Bridged calls inherit this run's config (configurable, tags, metadata) and run as its children.
         child_config: Dict[str, Any] = dict(config or {})
+        child_config.pop("run_id", None)
         if run_manager is not None:
             child_config["callbacks"] = run_manager.get_child()
         dispatcher = BridgeDispatcher(self.stubs, child_config, self.limits, self.sensitive_guard)

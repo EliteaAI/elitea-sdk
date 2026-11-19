@@ -2340,6 +2340,10 @@ class LLMNode(BaseTool):
         filtered_tool = filtered_plan.resolve(tool_name)
         if filtered_tool is not None:
             return filtered_tool
+        # In code mode toolkit tools run only through execute_code; a guessed name must not bypass the dispatcher.
+        if self.code_mode and self.tool_registry is not None:
+            logger.warning("[CodeMode] Refused direct call to unbound tool '%s'", tool_name)
+            return None
 
         available_plan = build_tool_binding_plan(self.available_tools or [])
         available_tool = available_plan.resolve(tool_name)
