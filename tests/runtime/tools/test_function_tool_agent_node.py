@@ -67,14 +67,60 @@ def _base_state(extra: dict | None = None) -> dict:
     return state
 
 
-def _invoke(ft: FunctionTool, state: dict) -> dict:
+def _invoke(ft: FunctionTool, state: dict, config=None) -> dict:
     """Invoke FunctionTool with standard patches applied."""
     with patch(
         "elitea_sdk.runtime.tools.function.propagate_the_input_mapping",
         return_value={"task": "hi"},
     ):
         with patch("elitea_sdk.runtime.tools.function.dispatch_custom_event"):
-            return ft.invoke(state)
+            return ft.invoke(state, config=config)
+
+
+def test_direct_application_uses_its_own_invocation_id_without_mutating_caller_metadata():
+    tool = _make_application_tool(is_subgraph=True, invoke_return={"messages": []})
+    ft = _make_function_tool(tool, output_variables=["messages"])
+
+    for namespace in ("Delegate:first-task", "Delegate:second-task"):
+        config = {"metadata": {
+            "langgraph_checkpoint_ns": namespace,
+            "parent_agent_call_id": "enclosing-application",
+        }}
+        _invoke(ft, _base_state(), config=config)
+
+        assert tool.invoke.call_args.args[1]["metadata"]["parent_agent_call_id"] == f"node:{namespace}"
+        assert config["metadata"]["parent_agent_call_id"] == "enclosing-application"
+
+
+def test_direct_application_keeps_the_same_invocation_id_when_a_node_is_replayed():
+    # A HITL resume re-runs the node under the same checkpoint namespace; the timeline
+    # must keep showing it as one group instead of starting a second one.
+    tool = _make_application_tool(is_subgraph=True, invoke_return={"messages": []})
+    ft = _make_function_tool(tool, output_variables=["messages"])
+    config = {"metadata": {"langgraph_checkpoint_ns": "Delegate:task-1"}}
+
+    _invoke(ft, _base_state(), config=config)
+    first = tool.invoke.call_args.args[1]["metadata"]["parent_agent_call_id"]
+    _invoke(ft, _base_state(), config=config)
+    second = tool.invoke.call_args.args[1]["metadata"]["parent_agent_call_id"]
+
+    assert first == second == "node:Delegate:task-1"
+
+
+def test_direct_application_without_a_namespace_gets_a_distinct_id_per_call():
+    # Outside a graph there is no stable source for an id, so each call must at least
+    # get its own and must not inherit the enclosing application's.
+    tool = _make_application_tool(is_subgraph=True, invoke_return={"messages": []})
+    ft = _make_function_tool(tool, output_variables=["messages"])
+    ids = []
+
+    for config in (None, {"metadata": {"parent_agent_call_id": "enclosing-application"}}):
+        _invoke(ft, _base_state(), config=config)
+        ids.append(tool.invoke.call_args.args[1]["metadata"]["parent_agent_call_id"])
+
+    assert all(ids) and not any(call_id.startswith("node:") for call_id in ids)
+    assert ids[0] != ids[1]
+    assert "enclosing-application" not in ids
 
 
 # ---------------------------------------------------------------------------
