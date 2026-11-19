@@ -193,7 +193,54 @@ def test_parser_wrapped_closed_set_rejection_fails_gracefully():
 
 
 @pytest.mark.parametrize("client_type", [_StructuredClient, _ParserWrappingClient])
-def test_other_structured_output_failures_still_propagate(client_type):
-    _, node = _state_node(client_type({}))
-    with pytest.raises((ValidationError, OutputParserException)):
+def test_missing_field_in_structured_output_fails_gracefully(client_type):
+    action, node = _state_node(client_type({}))
+    reply = node.invoke({"input": "list issues"})
+    assert reply["messages"][0]["response_metadata"][RUN_FAILURE_NOTICE_KEY] is True
+    assert "with value {'state': 'missing'} raised" in reply["messages"][0]["content"]
+    assert action.api_wrapper.calls == []
+
+
+def test_mixed_value_and_type_errors_in_structured_output_fail_gracefully():
+    action = _action(create_model("A", state=(Literal["opened", "closed"], Field()), per_page=(int, Field())))
+    node = ToolNode(tool=action, client=_StructuredClient({"state": "Closed", "per_page": "twenty"}),
+                    structured_output=True, input_variables=["input"])
+    reply = node.invoke({"input": "list issues"})
+    assert "with value {'state': 'Closed', 'per_page': 'twenty'} raised" in reply["messages"][0]["content"]
+    assert action.api_wrapper.calls == []
+
+
+class _RaisingClient:
+    """Chat model whose structured-output call fails with a fixed error."""
+
+    def __init__(self, error: Exception):
+        self.error = error
+
+    def with_structured_output(self, schema):
+        def fail(_):
+            raise self.error
+        return RunnableLambda(fail)
+
+
+def _unrelated_validation_error() -> ValidationError:
+    try:
+        create_model("ClientSettings", timeout=(int, Field()))(timeout="soon")
+    except ValidationError as error:
+        return error
+
+
+def _parser_error_caused_by(cause) -> OutputParserException:
+    error = OutputParserException("Failed to parse")
+    error.__cause__ = cause
+    return error
+
+
+@pytest.mark.parametrize("error", [
+    _unrelated_validation_error(),
+    _parser_error_caused_by(_unrelated_validation_error()),
+    _parser_error_caused_by(None),
+], ids=["validation error of another model", "parser error caused by another model", "parser error without cause"])
+def test_failures_outside_the_tool_schema_still_propagate(error):
+    _, node = _state_node(_RaisingClient(error))
+    with pytest.raises(type(error)):
         node.invoke({"input": "list issues"})

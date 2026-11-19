@@ -20,15 +20,13 @@ from ...tools.utils.serialization import serialize_tool_result
 logger = logging.getLogger(__name__)
 
 
-def _closed_set_rejections(error: Exception) -> dict:
-    """The rejected values by field when a structured-output failure only rejects values outside a fixed set."""
+def _schema_rejections(error: Exception, schema_name: Optional[str]) -> dict:
+    """What the LLM sent for each failing field when its structured output does not fit the tool's schema."""
     validation = error if isinstance(error, ValidationError) else error.__cause__
-    if not isinstance(validation, ValidationError):
+    if not isinstance(validation, ValidationError) or validation.title != schema_name:
         return {}
-    errors = validation.errors()
-    if not all(item['type'] == 'literal_error' for item in errors):
-        return {}
-    return {'.'.join(map(str, item['loc'])): item['input'] for item in errors}
+    return {'.'.join(map(str, item['loc'])): 'missing' if item['type'] == 'missing' else item['input']
+            for item in validation.errors()}
 
 
 class ToolNode(BaseTool):
@@ -102,11 +100,12 @@ Answer must be JSON only extractable by JSON.LOADS."""
             ))
         ]
         if self.structured_output:
-            llm = self.client.with_structured_output(self._structured_output_schema())
+            output_schema = self._structured_output_schema()
+            llm = self.client.with_structured_output(output_schema)
             try:
                 completion = llm.invoke(input_, config=config)
             except (ValidationError, OutputParserException) as error:
-                rejected = _closed_set_rejections(error)
+                rejected = _schema_rejections(error, getattr(output_schema, '__name__', None))
                 if not rejected:
                     raise
                 return self._invalid_input_reply(rejected, params, input_)
