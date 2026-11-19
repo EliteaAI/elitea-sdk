@@ -270,6 +270,20 @@ class SensitiveToolGuardMiddleware(Middleware):
         tool_name = sensitive_tool_context['tool_name']
         return (toolkit, tool_name) in self._approved_pairs or (toolkit, '*') in self._approved_pairs
 
+    def requires_approval_for(self, tool: BaseTool) -> bool:
+        """True when calls to this tool stop for a human review; decided per tool, not per call."""
+        if self._auto_approve or not has_sensitive_tools_config() or not self._could_be_sensitive(tool):
+            return False
+        ctx = self._build_sensitive_tool_context(tool, {})
+        return ctx is None or not self._is_approved_pair(ctx)
+
+    def approval_needed(self, tool: BaseTool, tool_input: Any) -> Optional[str]:
+        """The action label when this call would stop for a human review, else None."""
+        ctx = self._build_sensitive_tool_context(tool, tool_input)
+        if not ctx or self._auto_approve or self._is_approved_pair(ctx):
+            return None
+        return ctx['action_label']
+
     def _review_sensitive_tool_call(self, sensitive_tool_context: dict[str, Any]) -> dict[str, str]:
         # Auto-approve when the project secret allows it (API-only flows).
         if self._auto_approve or self._is_approved_pair(sensitive_tool_context):

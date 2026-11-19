@@ -63,6 +63,7 @@ INTERNAL_TOOL_DISPLAY_NAMES: dict = {
     'ask_user':        'Ask User',              # AskUserTool — clarifying question
     'swarm':           'Swarm Mode',            # mode flag; no chip event
     'lazy_tools_mode': 'Smart Tools Selection', # mode flag; no chip event
+    'code_mode': 'Code Mode',  # mode flag; no chip event
 }
 from .security import is_toolkit_blocked, is_tool_blocked, get_blocked_tools_for_toolkit
 

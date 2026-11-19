@@ -312,6 +312,14 @@ class LLMNode(BaseTool):
                     'are bound to the LLM. The model uses these to discover and invoke any tool from the registry. '
                     'This dramatically reduces token usage for agents with many toolkits (30-100+).'
     )
+    code_mode: Optional[bool] = Field(
+        default=False,
+        description='Code Mode (#7579): bind execute_code/get_tool_api; registry tools are called from the program.'
+    )
+    code_mode_direct_tools: List[str] = Field(
+        default_factory=list,
+        description='Code Mode: tools that need approval, bound directly instead of being called from programs.'
+    )
     tool_registry: Optional[Any] = Field(
         default=None,
         exclude=True,
@@ -359,6 +367,7 @@ class LLMNode(BaseTool):
                     'when the independent parallel HITL supervisor is enabled.'
     )
     _meta_tools: Optional[List[BaseTool]] = None  # Cached meta-tools
+    _code_mode_tools: Optional[List[BaseTool]] = None
 
     def _prepare_structured_output_params(self) -> dict:
         """
@@ -825,6 +834,9 @@ class LLMNode(BaseTool):
             # Smart Tools Selection finds matching toolkits.
             return merge_skill_tools(list(selected_tools) + list(self.always_bind_tools or []))
 
+        if self.code_mode and self.tool_registry is not None:
+            return merge_skill_tools(self._get_code_mode_tools() + list(self.always_bind_tools or []))
+
         # Check if lazy tools mode is enabled and we have a registry
         if self.lazy_tools_mode and self.tool_registry is not None:
             meta_tools = self._get_meta_tools()
@@ -907,6 +919,26 @@ class LLMNode(BaseTool):
             )
         return self._meta_tools
 
+    def _get_code_mode_tools(self) -> List[BaseTool]:
+        if self._code_mode_tools is None:
+            from .code_mode import create_code_mode_tools, find_sensitive_guard
+            tools = create_code_mode_tools(self.tool_registry, sensitive_guard=find_sensitive_guard(self.middleware_manager),
+                                           direct_tool_names=self.code_mode_direct_tools)
+            # The dispatcher refuses sensitive calls itself, so the HITL guard is skipped like for meta-tools.
+            if self.middleware_manager is not None:
+                tools = [self.middleware_manager.wrap_tool(t, skip_sensitive_guard=True) for t in tools]
+            self._code_mode_tools = tools
+        return list(self._code_mode_tools)
+
+    def _uses_tool_index(self) -> bool:
+        return bool((self.lazy_tools_mode or self.code_mode) and self.tool_registry is not None)
+
+    def _registry_index(self) -> str:
+        if self.code_mode:
+            from .code_mode import generate_code_mode_index
+            return generate_code_mode_index(self.tool_registry, self.code_mode_direct_tools)
+        return self.tool_registry.generate_index()
+
     def get_tool_index(self) -> str:
         """
         Generate a compressed tool index for inclusion in system prompt.
@@ -917,7 +949,7 @@ class LLMNode(BaseTool):
             Formatted string with toolkit/tool index, or empty string if not applicable
         """
         if self.tool_registry is not None:
-            return self.tool_registry.generate_index()
+            return self._registry_index()
         return ""
 
     def _inject_tool_index_into_messages(self, messages: List) -> List:
@@ -936,7 +968,7 @@ class LLMNode(BaseTool):
         if not self.tool_registry:
             return messages
 
-        tool_index = self.tool_registry.generate_index()
+        tool_index = self._registry_index()
 
         # Find and modify the system message
         modified_messages = []
@@ -1113,7 +1145,7 @@ class LLMNode(BaseTool):
     def _should_bind_tools(self, configurable: dict) -> bool:
         return (
             len(self.tool_names or []) > 0 or
-            (self.lazy_tools_mode and self.tool_registry is not None) or
+            self._uses_tool_index() or
             bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
             bool(configurable.get('attached_skills')) or  # Bind search_skills + load_skill for on-demand disclosure
             bool(configurable.get('project_skills'))
@@ -1137,8 +1169,8 @@ class LLMNode(BaseTool):
             )
             if 'system' in func_args:
                 system_content = str(func_args.get('system') or '')
-                if self.lazy_tools_mode and self.tool_registry is not None and not configurable.get('selected_tools'):
-                    system_content = f"{system_content}\n\n{self.tool_registry.generate_index()}"
+                if self._uses_tool_index() and not configurable.get('selected_tools'):
+                    system_content = f"{system_content}\n\n{self._registry_index()}"
             else:
                 system_content = next(
                     (m.content for m in state.get('messages', []) if isinstance(m, SystemMessage)), None
@@ -1527,8 +1559,8 @@ class LLMNode(BaseTool):
 
             # Inject tool index into system prompt if lazy tools mode is enabled
             # Skip injection if dynamic tool selection provided actual tools
-            if self.lazy_tools_mode and self.tool_registry is not None and not has_selected_tools:
-                tool_index = self.tool_registry.generate_index()
+            if self._uses_tool_index() and not has_selected_tools:
+                tool_index = self._registry_index()
                 system_content = f"{system_content}\n\n{tool_index}"
                 logger.debug("[LazyTools] Injected tool index into system prompt")
 
@@ -1666,7 +1698,7 @@ class LLMNode(BaseTool):
 
                 # Inject tool index into system message if lazy tools mode is enabled
                 # Skip injection if dynamic tool selection provided actual tools
-                if self.lazy_tools_mode and self.tool_registry is not None and not has_selected_tools:
+                if self._uses_tool_index() and not has_selected_tools:
                     messages = self._inject_tool_index_into_messages(messages)
             else:
                 raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
@@ -2308,6 +2340,10 @@ class LLMNode(BaseTool):
         filtered_tool = filtered_plan.resolve(tool_name)
         if filtered_tool is not None:
             return filtered_tool
+        # In code mode toolkit tools run only through execute_code; a guessed name must not bypass the dispatcher.
+        if self.code_mode and self.tool_registry is not None:
+            logger.warning("[CodeMode] Refused direct call to unbound tool '%s'", tool_name)
+            return None
 
         available_plan = build_tool_binding_plan(self.available_tools or [])
         available_tool = available_plan.resolve(tool_name)
