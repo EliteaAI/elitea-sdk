@@ -30,6 +30,7 @@ from ..middleware.tool_exception_handler import (
     swarm_wrap_tool_call,
 )
 from ..middleware.base import Middleware, MiddlewareManager
+from ..middleware.builder import BuilderMiddleware, builder_action
 from ..models.agent_response import AgentResponse
 from ..tools.tool_binding import build_tool_binding_plan
 
@@ -564,6 +565,14 @@ class Assistant:
             self._always_bind_tools = [
                 self.middleware_manager.wrap_tool(tool) for tool in self._always_bind_tools
             ]
+            # Elitea Builder (#7383): its five tools are always bound (never hidden by lazy mode), and the
+            # middleware applies an approved changeset through the fully wrapped builder_apply
+            builder_mw = next((mw for mw in middleware if isinstance(mw, BuilderMiddleware)), None)
+            if builder_mw is not None:
+                builder_tools = [tool for tool in self.tools if builder_action(tool.name)]
+                builder_mw.bind_tools(builder_tools)
+                bound = {id(tool) for tool in self._always_bind_tools}
+                self._always_bind_tools += [tool for tool in builder_tools if id(tool) not in bound]
 
         logger.debug(f"Tools initialized: {len(self.tools)} tools (lazy_mode={self.lazy_tools_mode})")
 
