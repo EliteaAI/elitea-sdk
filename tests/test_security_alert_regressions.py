@@ -38,7 +38,7 @@ def test_critical_and_high_dependency_pins_stay_at_patched_versions():
     assert requirements["statsmodels"] == "==0.14.5"
     assert requirements["pdfminer-six"] == "==20251230"
     assert requirements["pdf2image"] == "==1.17.0"
-    assert requirements["pypdf"] == "==6.21.2"
+    assert requirements["pypdf"] == "==6.21.4"
     assert requirements["gitpython"] == "==3.2.1"
     assert requirements["dulwich"] == "==1.2.9"
     assert requirements["langgraph-checkpoint"] == "==4.3.0"
