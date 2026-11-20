@@ -335,6 +335,7 @@ class Assistant:
                  persona: Optional[str] = "generic",
                  is_subgraph: bool = False,
                  lazy_tools_mode: Optional[bool] = None,
+                 code_mode: Optional[bool] = None,
                  middleware: Optional[list[Middleware]] = None,
                  child_dispatcher: Optional[Any] = None,
                  independent_parallel_hitl: bool = True,
@@ -374,6 +375,12 @@ class Assistant:
             self.lazy_tools_mode = lazy_tools_mode
         else:
             self.lazy_tools_mode = data.get('meta', {}).get('lazy_tools_mode', False)
+        if code_mode is None:
+            code_mode = 'code_mode' in conversation_internal_tools or 'code_mode' in version_internal_tools
+        self.code_mode = bool(code_mode) and app_type != 'pipeline'
+        if self.code_mode and self.lazy_tools_mode:
+            # create_graph turns lazy mode off only when code mode actually starts, so it stays the fallback.
+            logger.warning("[CodeMode] Both code_mode and lazy_tools_mode are set; code mode wins when available")
 
         # Log only the payload's top-level keys — the full dict carries
         # instructions and variable *values* that may include secrets.
@@ -431,7 +438,7 @@ class Assistant:
         internal_tools_list = data.get('internal_tools', []) or meta.get('internal_tools', [])
 
         # Filter out mode flags that aren't actual tools
-        mode_flags = {'lazy_tools_mode'}
+        mode_flags = {'lazy_tools_mode', 'code_mode'}
         actual_internal_tools = [t for t in internal_tools_list if t not in mode_flags]
 
         if actual_internal_tools:
@@ -795,6 +802,8 @@ class Assistant:
             agent_tools = [t for t in simple_tools if self._is_agent_tool(t)]
             if agent_tools:
                 logger.info(f"Swarm mode enabled with {len(agent_tools)} child agents")
+                if self.code_mode:
+                    logger.warning("[CodeMode] Ignored: swarm mode builds its own agents and binds tools directly")
                 return self._create_swarm_agent(simple_tools, agent_tools)
             else:
                 logger.info("Swarm mode enabled but no agent tools found, using standard agent")
@@ -886,7 +895,7 @@ class Assistant:
         
         # Add tool-specific parameters only if tools exist and NOT in lazy mode
         # In lazy mode, we don't bind tool_names so the LLMNode uses meta-tools instead
-        if simple_tools and not self.lazy_tools_mode:
+        if simple_tools and not self.lazy_tools_mode and not self.code_mode:
             schema_dict['nodes'][0]['tool_names'] = tool_names
         
         # Convert to YAML string
@@ -904,6 +913,7 @@ class Assistant:
             debug=False,
             for_subgraph=self.is_subgraph,
             lazy_tools_mode=self.lazy_tools_mode,
+            code_mode=self.code_mode,
             elitea_client=self.elitea_client,
             steps_limit=self.max_iterations,
             always_bind_tools=self._always_bind_tools,  # Middleware tools always bound directly

@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import pymupdf
 from pydantic import BaseModel, Field, PrivateAttr, create_model, model_validator, SecretStr
@@ -23,8 +23,8 @@ GetExtendedLaunchData = create_model(
 GetExtendedLaunchDataAsRaw = create_model(
     "GetExtendedLaunchDataAsRaw",
     launch_id=(str, Field(description="Launch ID of the launch to export.")),
-    format=(Optional[str], Field(default="html",
-                                 description="format of the exported data. may be one of 'pdf' or 'html'"))
+    format=(Optional[Literal["pdf", "xls", "html"]], Field(default="html",
+                                 description="format of the exported data. may be one of 'pdf', 'xls' or 'html'"))
 )
 GetLaunchDetails = create_model(
     "GetLaunchDetailsModel",

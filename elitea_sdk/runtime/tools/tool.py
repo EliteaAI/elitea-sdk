@@ -4,6 +4,7 @@ from traceback import format_exc
 from typing import Any, Optional, Union
 
 from langchain_core.callbacks import dispatch_custom_event
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, ToolCall
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
@@ -17,6 +18,15 @@ from ..tool_outcome import run_failure_message
 from ...tools.utils.serialization import serialize_tool_result
 
 logger = logging.getLogger(__name__)
+
+
+def _schema_rejections(error: Exception, schema_name: Optional[str]) -> dict:
+    """What the LLM sent for each failing field when its structured output does not fit the tool's schema."""
+    validation = error if isinstance(error, ValidationError) else error.__cause__
+    if not isinstance(validation, ValidationError) or validation.title != schema_name:
+        return {}
+    return {'.'.join(map(str, item['loc'])): 'missing' if item['type'] == 'missing' else item['input']
+            for item in validation.errors()}
 
 
 class ToolNode(BaseTool):
@@ -90,8 +100,15 @@ Answer must be JSON only extractable by JSON.LOADS."""
             ))
         ]
         if self.structured_output:
-            llm = self.client.with_structured_output(self._structured_output_schema())
-            completion = llm.invoke(input_, config=config)
+            output_schema = self._structured_output_schema()
+            llm = self.client.with_structured_output(output_schema)
+            try:
+                completion = llm.invoke(input_, config=config)
+            except (ValidationError, OutputParserException) as error:
+                rejected = _schema_rejections(error, getattr(output_schema, '__name__', None))
+                if not rejected:
+                    raise
+                return self._invalid_input_reply(rejected, params, input_)
             result = completion if isinstance(completion, dict) else completion.model_dump()
         else:
             input_[-1].content += self.unstructured_output
@@ -124,9 +141,13 @@ Answer must be JSON only extractable by JSON.LOADS."""
                 return {self.output_variables[0]: tool_result,
                         "messages": [{"role": "assistant", "content": message_result}]}
         except ValidationError:
-            logger.error(f"ValidationError: {format_exc()}")
-            return {
-                "messages": [run_failure_message(f"""Tool input to the {self.tool.name} with value {result} raised ValidationError. 
+            return self._invalid_input_reply(result, params, input_)
+
+    def _invalid_input_reply(self, value: Any, params: dict, input_: list) -> dict:
+        """Graceful node reply when the tool input fails validation."""
+        logger.error(f"ValidationError: {format_exc()}")
+        return {
+            "messages": [run_failure_message(f"""Tool input to the {self.tool.name} with value {value} raised ValidationError. 
         \n\nTool schema is {dumps(params)} \n\nand the input to LLM was 
         {input_[-1].content}""")]}
 

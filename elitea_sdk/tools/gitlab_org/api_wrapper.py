@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Any, ClassVar, List, Dict
+from typing import Optional, Any, ClassVar, List, Literal, Dict
 import fnmatch
 
 from gitlab import GitlabGetError
@@ -38,7 +38,10 @@ GitlabSetActiveBranch = create_model(
 GitLabGetIssues = create_model(
     "GitLabGetIssuesModel",
     repository=(Optional[str], Field(description="Name of the repository", default=None)),
-    state=(Optional[str], Field(default="opened", description="Issue state filter: opened | closed | all")),
+    state=(
+        Optional[Literal["opened", "closed", "all"]],
+        Field(default="opened", description="Issue state filter: opened | closed | all"),
+    ),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when fetch_all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when fetch_all=True)")),
     created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),

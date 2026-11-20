@@ -175,7 +175,7 @@ nodes:
           1. Does result indicate a match was found?
           2. Is the match line identified (line 3)?
           3. Are context lines included (lines 2 and 4)?
-          4. Is the pattern "TARGET" highlighted in the context?
+          4. Does the line containing "TARGET" have the match marker ">"? The marker identifies the matching line; the word itself does not need separate highlighting.
           5. Is there any error or empty result?
           
           Return a JSON object with:

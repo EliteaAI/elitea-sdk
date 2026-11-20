@@ -1728,6 +1728,7 @@ class EliteAClient:
         # Extract lazy_tools_mode from internal_tools (it's a mode flag, not an actual tool)
         # UI stores it in meta.internal_tools array, not as meta.lazy_tools_mode boolean
         lazy_tools_mode = 'lazy_tools_mode' in internal_tools
+        code_mode = 'code_mode' in internal_tools
 
         # LangChainAssistant constructor calls get_tools() which may raise McpAuthorizationRequired
         # The exception will propagate naturally to the indexer worker's outer handler
@@ -1738,6 +1739,7 @@ class EliteAClient:
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
+                                      code_mode=code_mode,
                                       child_dispatcher=child_dispatcher,
                                       independent_parallel_hitl=independent_parallel_hitl,
                                       parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
@@ -1751,6 +1753,7 @@ class EliteAClient:
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
+                                      code_mode=code_mode,
                                       child_dispatcher=child_dispatcher,
                                       independent_parallel_hitl=independent_parallel_hitl,
                                       parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
@@ -2085,6 +2088,7 @@ class EliteAClient:
                       mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None,
                       ignored_mcp_servers: Optional[list] = None, persona: Optional[str] = "generic",
                       lazy_tools_mode: Optional[bool] = False, internal_tools: Optional[list] = None,
+                      code_mode: Optional[bool] = None,
                       context_settings: Optional[dict] = None,
                       step_limit: Optional[int] = None, auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
                       child_dispatcher: Optional[Any] = None,
@@ -2192,6 +2196,7 @@ class EliteAClient:
             persona=persona,
             middleware=middleware_list if middleware_list else None,
             lazy_tools_mode=lazy_tools_mode,
+            code_mode=code_mode if code_mode is not None else 'code_mode' in internal_tools,
             child_dispatcher=child_dispatcher,
             independent_parallel_hitl=independent_parallel_hitl,
             parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,

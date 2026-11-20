@@ -96,7 +96,7 @@ createPage = create_model(
         default=None)),
     title=(str, Field(description="Title of the page")),
     body=(str, Field(description="Body of the page")),
-    status=(Optional[str],
+    status=(Optional[Literal["current", "draft"]],
             Field(description="Page publishing option: 'current' for publish page, 'draft' to create draft.",
                   default='current')),
     parent_id=(Optional[str], Field(description="Page parent id (optional)", default=None)),
@@ -115,7 +115,7 @@ createPages = create_model(
     pages_info=(str, Field(
         description="""JSON string containing information about page name and its content per syntax: [{"page1_name": "page1_content"}, {"page2_name": "page2_content"}]""")),
     parent_id=(Optional[str], Field(description="Page parent id (optional)", default=None)),
-    status=(Optional[str],
+    status=(Optional[Literal["current", "draft"]],
             Field(description="Page publishing option: 'current' for publish page, 'draft' to create draft.",
                   default='current')),
 )
@@ -179,7 +179,7 @@ getPageTree = create_model(
 getPageIdByTitleInput = create_model(
     "getPageIdByTitleInput",
     title=(str, Field(description="Page title")),
-    type=(Optional[str], Field(description="Jira type of content: Page or Blogpost. Defaults to page", default="page")),
+    type=(Optional[Literal["page", "blogpost"]], Field(description="Confluence content type: page or blogpost. Defaults to page", default="page")),
     space=(Optional[str], Field(
         description="Optional Confluence space key to narrow this operation. Leave empty to use the toolkit's space, or all accessible spaces when the toolkit has none.",
         default=None)),
@@ -273,7 +273,7 @@ AddFileToPage = create_model(
     filepath=(str, Field(description="File path in format /{bucket}/{filename} from artifact storage")),
     filename=(Optional[str], Field(description="Filename to use for the upload. If not provided, uses the original filename from artifact.", default=None)),
     caption=(Optional[str], Field(description="Visible caption displayed below image attachments. Not applicable for other file types.", default=None)),
-    position=(Optional[str], Field(description="Position to add file reference: 'append' or 'prepend'", default="append")),
+    position=(Optional[Literal["append", "prepend"]], Field(description="Position to add file reference: 'append' or 'prepend'", default="append")),
 )
 
 

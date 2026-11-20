@@ -21,6 +21,11 @@ from .base_wrapper import BaseSharepointWrapper
 from .graph_wrapper import SharepointGraphWrapper
 from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
+from .library_metadata import (
+    CATEGORY_MAPPING_HINT, LIBRARY_LISTING_LIMIT, STATUS_AMBIGUOUS, STATUS_OK, JoinCounts, LibraryIndex,
+    LibraryMetadataError, LibrarySettings, apply_library_metadata, build_index, category_values,
+    has_categories, report_label,
+)
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.file_metadata import bound_read_result, describe_requested_range
 from .read_guidance import build_excel_over_limit_response
@@ -77,6 +82,15 @@ ReadList = create_model(
     limit=(Optional[int], Field(
         description="Limit (maximum number) of list items to be returned",
         default=1000, gt=0))
+)
+
+ListLibraryCategories = create_model(
+    "ListLibraryCategories",
+    library_lists=(List[str], Field(
+        description="Names of the library lists (usually the document libraries) to read.")),
+    metadata_fields=(Optional[List[str]], Field(
+        description="Optional field mapping, as for index_data, e.g. `[\"*\", \"area=category\"]`.",
+        default=[])),
 )
 
 GetFiles = create_model(
@@ -1051,6 +1065,22 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                             "OneNote page attachments (when include_attachments is enabled). "
                             'i.e. `["*.exe", "*.zip"]`',
                 default=[])),
+            # Document-library mode (#7352): per index, so one toolkit can serve several sources
+            'library_lists': (Optional[List[str]], Field(
+                description="SharePoint lists (usually the document libraries themselves) whose items describe "
+                            "the indexed files. When set, each file gets its list fields as metadata.",
+                default=[])),
+            'metadata_fields': (Optional[List[str]], Field(
+                description="List fields to copy when library_lists is set. Empty: all simple fields under "
+                            "readable snake_case names. Name a field as list_library_categories shows it; "
+                            "Field=name chooses the metadata name and * keeps all other fields, e.g. "
+                            '`["*", "area=category"]`. A field whose default name is taken by a mapping keeps '
+                            "its value as <name>_original.",
+                default=[])),
+            'categories': (Optional[List[str]], Field(
+                description="Index only files whose category (the list field stored as category) is one of "
+                            "these values. list_library_categories returns the values used on the site.",
+                default=[])),
             'path': (Optional[str], Field(
                 description="Folder path. "
                             "Accepts either a full server-relative path "
@@ -1119,11 +1149,18 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         form_name = kwargs.get('form_name') or None
 
         if limit_files > 0:
+            library = self._library_join_context(
+                kwargs.get('library_lists'), kwargs.get('metadata_fields'), kwargs.get('categories'))
+            # The categories filter drops files after listing: list up to the library bound and keep
+            # limit_files of the files that pass, so selected files beyond the first limit_files listed
+            # are not lost.
+            list_limit = (max(limit_files, LIBRARY_LISTING_LIMIT)
+                          if library is not None and library[0].categories else limit_files)
             self._log_tool_event(
                 message="Starting SharePoint files extraction", tool_name="loader")
             try:
                 all_files = self.get_files_list(
-                    kwargs.get('path'), limit_files,
+                    kwargs.get('path'), list_limit,
                     form_name=form_name,
                     include_extensions=include_extensions,
                     skip_extensions=skip_extensions,
@@ -1132,14 +1169,25 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     message="List of the files has been extracted", tool_name="loader")
             except Exception as e:
                 raise ToolException(f"Unable to extract files: {e}")
+            if list_limit > limit_files and len(all_files) >= list_limit:
+                raise LibraryMetadataError(
+                    f"The categories filter looks at most {list_limit} files and the library has more. "
+                    "Narrow the scope with Path or Form Name.")
 
+            kept = 0
             for file in all_files:
-
+                if kept >= limit_files:
+                    break
                 metadata = {
                     ("updated_on" if k == "Modified" else k): str(v)
                     for k, v in file.items()
                 }
+                if library is not None and not self._apply_library_metadata(metadata, *library):
+                    continue
+                kept += 1
                 yield Document(page_content="", metadata=metadata)
+            if library is not None:
+                logging.info("[SP-library] join: %s", library[2].as_dict())
 
         # ── OneNote pages ─────────────────────────────────────────────
         if kwargs.get('include_onenote'):
@@ -1149,6 +1197,67 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     #  OneNote helpers                                                     #
     # ------------------------------------------------------------------ #
 
+
+    def _library_join_context(self, library_lists=None, metadata_fields=None, categories=None):
+        """(settings, index, counts) when the index_data call sets library_lists, else None.
+        The lists are read once per run."""
+        settings = LibrarySettings.from_settings(library_lists, metadata_fields, categories)
+        if not settings.enabled:
+            return None
+        self._log_tool_event(message="Reading the library lists", tool_name="loader")
+        index = build_index(self._backend.library_list_client(), settings)
+        counts = JoinCounts(list_items=len(index.entries), unresolved_fields=len(index.unresolved_fields))
+        if index.unresolved_fields:
+            logging.warning("[SP-library] %d metadata field setting(s) match no field of the lists",
+                            len(index.unresolved_fields))
+        if settings.categories and not has_categories(index):
+            raise LibraryMetadataError(
+                "The categories filter needs a list field stored as `category`, and none of the library lists "
+                f"has one. {CATEGORY_MAPPING_HINT}")
+        self._log_tool_event(
+            message=f"Library lists read: {len(index.entries)} items", tool_name="loader")
+        return settings, index, counts
+
+    def _apply_library_metadata(self, metadata: dict, settings: LibrarySettings,
+                                index: LibraryIndex, counts: JoinCounts) -> bool:
+        name = report_label(metadata)
+        if not apply_library_metadata(metadata, index, settings, counts):
+            self._track_skipped_document(name, reason="filtered")
+            return False
+        status = metadata.get('metadata_status')
+        if status != STATUS_OK:
+            stats = self.get_indexing_stats() or self._init_indexing_stats()
+            target = (stats.documents_metadata_ambiguous if status == STATUS_AMBIGUOUS
+                      else stats.documents_without_metadata)
+            target.add(name)
+        return True
+
+    @tool_group('read')
+    def list_library_categories(self, library_lists: List[str], metadata_fields: Optional[List[str]] = None):
+        """Lists the category values used in the library lists, with the number of items in each.
+
+        Reads the items of the given library lists and returns the distinct values of the field
+        stored as `category`, most used first. Use these values for index_data's categories
+        parameter. Also returns the metadata field names each list provides, so index_data's
+        metadata_fields parameter can map them (e.g. `["*", "area=category"]`).
+        """
+        self._sync_backend_context()
+        settings = LibrarySettings.from_settings(library_lists, metadata_fields)
+        if not settings.enabled:
+            raise ToolException("Pass the names of the library lists to read (library_lists).")
+        index = build_index(self._backend.library_list_client(), settings)
+        fields = sorted({key for entry in index.entries for key in entry.metadata})
+        result = {
+            "lists": list(settings.lists),
+            "items": len(index.entries),
+            "metadata_fields": fields,
+            "categories": category_values(index),
+        }
+        if index.unresolved_fields:
+            result["unresolved_metadata_fields"] = sorted(index.unresolved_fields)
+        if 'category' not in fields:
+            result["note"] = f"No field is stored as `category`. {CATEGORY_MAPPING_HINT}"
+        return result
 
     def _onenote_base_loader(
         self,
@@ -1527,6 +1636,12 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 "description": self.create_list_item.__doc__,
                 "args_schema": CreateListItem,
                 "ref": self.create_list_item,
+            },
+            {
+                "name": "list_library_categories",
+                "description": self.list_library_categories.__doc__,
+                "args_schema": ListLibraryCategories,
+                "ref": self.list_library_categories,
             },
             {
                 "name": "get_files_list",
