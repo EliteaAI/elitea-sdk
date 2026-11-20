@@ -15,7 +15,7 @@ def mcp_tool(name, responses, calls):
     def run(**kwargs):
         calls.append((name, kwargs))
         return json.dumps(responses[name](kwargs))
-    schema = {'type': 'object', 'properties': {k: {} for k in ('type', 'op', 'id', 'changeset_id')}}
+    schema = {'type': 'object', 'properties': {k: {} for k in ('type', 'op', 'id', 'changeset_id', 'changes')}}
     return StructuredTool.from_function(func=run, name=name, description=name, args_schema=schema,
                                         metadata={'toolkit_type': 'mcp', 'toolkit_name': 'Elitea Builder'})
 
@@ -100,6 +100,34 @@ def test_needs_confirmation_apply_calls_builder_apply(middleware, interrupts):
     assert payload['summary'] == 'Delete agent "Old"'
     assert calls[-1] == ('builder_apply', {'changeset_id': 'c9'})
     assert out['status'] == 'applied'
+
+
+def test_the_card_gets_masked_args_and_the_resume_keeps_the_raw_ones(middleware, interrupts):
+    """Review fix: the model's own propose arguments may carry a value; the transport never sees ``changes``."""
+    calls = []
+    responses = {'builder_propose': lambda a: {'status': 'needs_confirmation', 'changeset_id': 'c5', 'diff': []},
+                 'builder_apply': lambda a: {'status': 'applied'}}
+    middleware.bind_tools([mcp_tool('builder_apply', responses, calls)])
+    interrupts['answers'].append({'action': 'cancel'})
+    args = {'type': 'operation', 'op': 'call', 'id': 'post_secrets_secret',
+            'changes': {'name': 'jira', 'value': 'made-up-1', 'api_key': 'made-up-2'}}
+    middleware.wrap_tool(mcp_tool('builder_propose', responses, calls)).invoke(args)
+    [card] = interrupts['payloads']
+    assert card['tool_args'] == {'type': 'operation', 'op': 'call', 'id': 'post_secrets_secret'}
+    assert 'made-up' not in json.dumps({k: v for k, v in card.items() if k != 'tool_args_raw'})
+    assert card['tool_args_raw'] == args
+
+
+def test_an_apply_result_that_echoes_a_secret_reaches_the_model_masked(middleware, interrupts):
+    calls = []
+    responses = {
+        'builder_propose': lambda a: {'status': 'needs_confirmation', 'changeset_id': 'c6', 'diff': []},
+        'builder_apply': lambda a: {'status': 'applied', 'result': {'data': {'api_key': 'echoed-value', 'url': 'x'}}},
+    }
+    middleware.bind_tools([mcp_tool('builder_apply', responses, calls)])
+    interrupts['answers'].append({'action': 'apply'})
+    out = middleware.wrap_tool(mcp_tool('builder_propose', responses, calls)).invoke({'type': 'agent', 'op': 'delete'})
+    assert 'echoed-value' not in out and json.loads(out)['result']['data']['url'] == 'x'
 
 
 def test_needs_confirmation_cancel_applies_nothing(middleware, interrupts):

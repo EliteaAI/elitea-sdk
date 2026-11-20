@@ -22,6 +22,7 @@ from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 
 from .base import Middleware
+from .sensitive_tool_guard import SensitiveToolGuardMiddleware
 from .tool_exception_handler import ToolExceptionHandlerMiddleware
 from .tool_patching import rebind_invoke_after_copy
 from ..tools.ask_user import ASK_USER_ANSWER_ACTION, CLARIFYING_QUESTION_GUARDRAIL
@@ -34,6 +35,9 @@ CANCEL_ACTION = "cancel"
 _ACTION_RE = re.compile(r"(?:^|_)builder_(find|read|propose|apply|ref|reference)(?:_|$)")
 _NON_INTERACTIVE = ("The user is not available to confirm in this non-interactive run, so nothing was changed. "
                     "Tell the user the change needs their confirmation in an interactive chat.")
+
+
+_mask = SensitiveToolGuardMiddleware._mask_sensitive_tool_args  # pylint: disable=W0212
 
 
 def builder_action(tool_name: str) -> Optional[str]:
@@ -177,7 +181,11 @@ class BuilderMiddleware(Middleware):
     @staticmethod
     def _resume_fields(tool_name: str, tool_args: dict) -> dict:
         """What the graph resume needs to re-issue this same Builder call without a new LLM turn."""
-        fields = {"builder_tool_name": tool_name, "tool_args": dict(tool_args or {})}
+        # The transport sees no ``changes`` (the card shows the platform's masked ``arguments`` and ``diff``) and the
+        # rest masked; the resume re-issues the call with the raw args, which never leave the SDK (``tool_args_raw``)
+        raw = dict(tool_args or {})
+        public = _mask({k: v for k, v in raw.items() if k != "changes"})
+        fields = {"builder_tool_name": tool_name, "tool_args": public, "tool_args_raw": raw}
         pending = _capture_pending_messages()
         if pending:
             fields["_pending_messages"] = pending
@@ -220,4 +228,6 @@ class BuilderMiddleware(Middleware):
                                "message": "The user cancelled the change; nothing was changed."})
         if self._apply_tool is None:
             return json.dumps({"status": "error", "message": "builder_apply is not available in this chat."})
-        return self._apply_tool.invoke({"changeset_id": changeset_id})
+        result = self._apply_tool.invoke({"changeset_id": changeset_id})
+        parsed_result = _parse(result)
+        return json.dumps(_mask(parsed_result)) if parsed_result is not None else result

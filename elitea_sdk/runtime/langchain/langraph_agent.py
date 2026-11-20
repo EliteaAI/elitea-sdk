@@ -2428,23 +2428,13 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                         resume_ctx = {
                             'tool_name': hitl_interrupt.get('builder_tool_name') or hitl_interrupt.get('tool_name', ''),
                             'toolkit_name': '',
-                            'tool_args': hitl_interrupt.get('tool_args', {}) or {},
+                            'tool_args': hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args') or {},
                             'tool_call_id': hitl_interrupt.get('tool_call_id') or f"call_{uuid4().hex[:24]}",
                             'action': hitl_resume_value.get('action', default_action),
                             'value': hitl_resume_value.get('value', ''),
                         }
                         config['configurable']['_hitl_resume_context'] = resume_ctx
-                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
-                        if pending_msgs_dicts:
-                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
-                            if trimmed:
-                                resume_ctx['pending_messages'] = trimmed
-                            original_ai_dict = self._extract_original_ai_message(
-                                pending_msgs_dicts, tool_name=resume_ctx['tool_name'],
-                                tool_args=resume_ctx['tool_args'] if isinstance(resume_ctx['tool_args'], dict) else {},
-                            )
-                            if original_ai_dict is not None:
-                                resume_ctx['original_ai_message'] = original_ai_dict
+                        self._restore_pending_for_resume(resume_ctx, hitl_interrupt)
                         hitl_resume_ctx = resume_ctx
                         logger.info("[HITL] Prepared Elitea Builder resume (%s)", guardrail_type)
                     elif guardrail_type == 'clarifying_question':
@@ -2470,19 +2460,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
                         # Restore intermediate tool messages captured before the
                         # pause so completed sibling tools are not re-executed.
-                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
-                        if pending_msgs_dicts:
-                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
-                            if trimmed:
-                                resume_ctx['pending_messages'] = trimmed
-                            original_ai_dict = self._extract_original_ai_message(
-                                pending_msgs_dicts,
-                                tool_name='ask_user',
-                                tool_args=resume_ctx['tool_args']
-                                if isinstance(resume_ctx['tool_args'], dict) else {},
-                            )
-                            if original_ai_dict is not None:
-                                resume_ctx['original_ai_message'] = original_ai_dict
+                        self._restore_pending_for_resume(resume_ctx, hitl_interrupt)
                         hitl_resume_ctx = resume_ctx
                         logger.info("[HITL] Prepared clarifying-question resume for ask_user")
                     elif guardrail_type in {
@@ -3393,6 +3371,24 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         interrupt_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args') or {}
         resumed_args = hitl_resume_ctx.get('tool_args') or {}
         return args_match_normalized(interrupt_args, resumed_args)
+
+    @classmethod
+    def _restore_pending_for_resume(cls, resume_ctx: dict, hitl_interrupt: dict) -> None:
+        """Put the sibling tool messages captured before the pause, and the AIMessage that issued the paused call,
+        on ``resume_ctx`` so the LLM node re-issues that call without a new LLM turn."""
+        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+        if not pending_msgs_dicts:
+            return
+        trimmed = cls._trim_pending_messages(pending_msgs_dicts)
+        if trimmed:
+            resume_ctx['pending_messages'] = trimmed
+        tool_args = resume_ctx.get('tool_args')
+        original_ai_dict = cls._extract_original_ai_message(
+            pending_msgs_dicts, tool_name=resume_ctx.get('tool_name', ''),
+            tool_args=tool_args if isinstance(tool_args, dict) else {},
+        )
+        if original_ai_dict is not None:
+            resume_ctx['original_ai_message'] = original_ai_dict
 
     @staticmethod
     def _trim_pending_messages(pending_msgs_dicts: list[dict]) -> list[dict]:
