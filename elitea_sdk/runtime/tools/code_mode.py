@@ -601,6 +601,8 @@ class ExecuteCodeTool(BaseTool):
         # Bridged calls inherit this run's config (configurable, tags, metadata) and run as its children.
         child_config: Dict[str, Any] = dict(config or {})
         child_config.pop("run_id", None)
+        # #7580: the UI marks chips of calls made from a program
+        child_config["metadata"] = {**(child_config.get("metadata") or {}), "via_code_mode": True}
         if run_manager is not None:
             child_config["callbacks"] = run_manager.get_child()
         dispatcher = BridgeDispatcher(self.stubs, child_config, self.limits, self.sensitive_guard)
