@@ -855,15 +855,19 @@ def test_bridged_calls_get_the_runs_config(fake_sandbox):
     def capture(config: RunnableConfig):
         seen["configurable"] = dict(config.get("configurable") or {})
         seen["tags"] = list(config.get("tags") or [])
+        seen["metadata"] = dict(config.get("metadata") or {})
         return "ok"
 
     tool = StructuredTool.from_function(func=capture, name="get", description="get",
                                         metadata={"toolkit_name": "gh", "toolkit_type": "github"})
     execute_tool = ExecuteCodeTool(stubs=CodeModeStubs(ToolRegistry.from_tools([tool])))
     execute_tool.invoke({"code": "await gh.get()"},
-                        config={"configurable": {"thread_id": "t1", "project_id": 3}, "tags": ["run-tag"]})
+                        config={"configurable": {"thread_id": "t1", "project_id": 3}, "tags": ["run-tag"],
+                                "metadata": {"run_meta": "x"}})
     assert seen["configurable"]["thread_id"] == "t1" and seen["configurable"]["project_id"] == 3
     assert "run-tag" in seen["tags"]
+    # #7580: bridged calls are stamped so the UI can mark their chips; run metadata is kept
+    assert seen["metadata"]["via_code_mode"] is True and seen["metadata"]["run_meta"] == "x"
 
 
 def test_sync_run_inside_a_loop_keeps_contextvars(fake_sandbox):
