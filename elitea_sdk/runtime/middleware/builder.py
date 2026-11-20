@@ -163,7 +163,8 @@ class BuilderMiddleware(Middleware):
         if playbook:
             if playbook in self._seen_playbooks:
                 parsed = {k: v for k, v in parsed.items() if k != "playbook"}
-                result = json.dumps(parsed)
+                stripped = json.dumps(parsed)
+                result = (stripped, *result[1:]) if isinstance(result, tuple) else stripped
             else:
                 self._seen_playbooks.add(playbook)
         status = parsed.get("status")

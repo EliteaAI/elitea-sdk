@@ -186,6 +186,14 @@ def test_a_playbook_reaches_the_model_once_per_conversation(middleware, interrup
     assert 'playbook' not in second
 
 
+
+def test_a_repeated_playbook_keeps_a_content_and_artifact_result(middleware):
+    """A (content, artifact) tool result stays a two-tuple when the repeated playbook is stripped (review fix)."""
+    first = middleware._handle((json.dumps({'status': 'ok', 'playbook': 'p'}), {'a': 1}), 'builder_read', {})
+    second = middleware._handle((json.dumps({'status': 'ok', 'playbook': 'p'}), {'a': 2}), 'builder_read', {})
+    assert isinstance(first, tuple) and 'playbook' in json.loads(first[0])
+    assert isinstance(second, tuple) and second[1] == {'a': 2} and 'playbook' not in json.loads(second[0])
+
 @pytest.mark.parametrize('builder, auto, interactive', [
     ({'core_prompt': 'x'}, False, True),
     ({'core_prompt': 'x', 'interactive': False}, False, False),
