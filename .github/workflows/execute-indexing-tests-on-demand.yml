@@ -79,6 +79,8 @@ on:
 jobs:
   configure-matrix:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       loader_matrix: ${{ steps.set-matrix.outputs.loader_matrix }}
       has-tests: ${{ steps.set-matrix.outputs.has-tests }}

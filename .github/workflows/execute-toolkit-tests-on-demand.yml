@@ -74,6 +74,8 @@ on:
 jobs:
   configure-matrix:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       test_matrix: ${{ steps.set-matrix.outputs.test_matrix }}
       has-tests: ${{ steps.set-matrix.outputs.has-tests }}
@@ -104,6 +106,10 @@ jobs:
       matrix:
         data: ${{ fromJson(needs.configure-matrix.outputs.test_matrix) }}
     uses: ./.github/workflows/test-runner-reusable.yml
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
     with:
       test_cases_dir: ${{ matrix.data.suite }}
       tests_to_run: ${{ matrix.data.tests_to_run }}
