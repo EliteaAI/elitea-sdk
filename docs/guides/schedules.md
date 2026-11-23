@@ -285,7 +285,7 @@ Every refusal of the Schedules API has the same `body`:
 |---|---|
 | 400 | A field is not valid: `code` is `invalid_input` and `field` names the field, for example a bad `cron` or a `run_mode` rule. |
 | 403 | The caller lacks the right for this action, for example a user without the `schedules.run` permission. A caller who is not the schedule owner of the run and approves, rejects or answers a sign-in (Authorize or Skip) also gets 403, a project admin included. After Change owner, the new owner gets 403 on a run that started under the old owner. The REST decision route answers with `code` `not_owner`. The chat answer has `error` and `status`, but no `code`. |
-| 404 | The schedule does not exist, or it belongs to another user and the caller does not have the `schedules.admin` permission: `code` is `not_found`, for a run too, and `error` is the same for every 404, so it does not say which item is missing. This includes Run now, approve and reject. |
+| 404 | The schedule does not exist, or it belongs to another user and the caller does not have the `schedules.admin` permission. Create, check and Test Run answer 404 too when the agent, pipeline or toolkit does not exist or is in a folder the caller cannot see. `code` is `not_found`, for a run too, and `error` is the same for every 404, so it does not say which item is missing. This includes Run now, approve and reject. |
 | 409 | Run now: a run of this schedule is still active. `code` is `run_active`, and `body["active_run_id"]` is the id of the active run. It is null when that run belongs to another user or is an index run that has no run row. Resume: the project has its maximum number of active schedules. |
 
 `update_schedule` with `enabled` raises `ValueError` before any request.
