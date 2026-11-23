@@ -112,6 +112,22 @@ class TestPdfPages:
         assert all(d.metadata["page_number_from"] == d.metadata["page_number_to"] == d.metadata["page_number"]
                    for d in docs)
 
+    def test_fifth_viewer_page_has_page_number_five(self, tmp_path):
+        path = _pdf(tmp_path / "six.pdf", [_wrap(BODY)] * 6)
+        by_page = {d.metadata["page"]: d.metadata for d in _load_pdf(path)}
+        assert sorted(by_page) == [0, 1, 2, 3, 4, 5]
+        assert by_page[4]["page_number"] == 5
+        assert by_page[4]["page_number_from"] == 5
+        assert by_page[4]["page_number_to"] == 5
+
+    def test_split_chunks_keep_the_range_of_their_page(self, tmp_path):
+        path = _pdf(tmp_path / "split.pdf", [_wrap(BODY * 2)] * 2)
+        docs = _load_pdf(path, max_tokens=40)
+        assert len(docs) > 2
+        assert {d.metadata["page_number"] for d in docs} == {1, 2}
+        assert all(d.metadata["page_number_from"] == d.metadata["page_number_to"] == d.metadata["page_number"]
+                   for d in docs)
+
     def test_printed_page_labels_do_not_change_page_number(self, outline_pdf):
         docs = _load_pdf(outline_pdf)
         assert "Page 5 of 10" in docs[2].page_content
@@ -173,6 +189,8 @@ class TestPdfHeadings:
     def test_production_path_carries_the_fields(self, outline_pdf):
         docs = list(process_content_by_type(outline_pdf.read_bytes(), "handbook.pdf"))
         assert [d.metadata["page_number"] for d in docs] == [1, 2, 3, 4]
+        assert [d.metadata["page_number_from"] for d in docs] == [1, 2, 3, 4]
+        assert [d.metadata["page_number_to"] for d in docs] == [1, 2, 3, 4]
         assert docs[3].metadata["section_title"] == "Access review"
 
 

@@ -103,3 +103,29 @@ Set _max_tokens_ to `-1` to index each sheet as one chunk (the pre-R-2.0.9 defau
 
 `read_file` is not affected: it still returns each sheet as one chunk.
 
+---
+
+## Page and section fields of PDF and Word chunks
+
+Chunks of PDF and Word files carry these metadata fields. Search results return them as stored.
+
+| Field | Files | Value |
+|---|---|---|
+| `page` | PDF | Zero-based page index (unchanged). |
+| `page_number` | PDF | `page + 1`: the page number a PDF viewer shows. Page labels printed in the text do not change it. |
+| `page_number_from`, `page_number_to` | PDF | First and last page of the chunk. The loader makes one chunk per page, and splits a page by _max_tokens_ into parts, so both fields equal `page_number`. |
+| `section_number`, `section_title` | PDF, Word | The closest heading above the start of the chunk. |
+
+How the section is found:
+
+- PDF: bookmarks (the outline) first. Without bookmarks, numbered headings in the text.
+- Word: heading styles and numbering.
+- When several headings are above the chunk, the deepest one is used (for example `2.1`, not `2`).
+- A field is absent when it is unknown. A chunk before the first heading has the page fields only. Word files have no page fields.
+
+### Existing indexes
+
+An index run without `clean_index` skips files that did not change (see step 3). Their old chunks keep the fields they had when they were indexed: chunks from before these fields have `page` only. Nothing breaks, because a reader gets a chunk with fewer fields.
+
+To add the new fields to old chunks, run the index with `clean_index` set to _true_ (Clean index in the UI). It removes the old chunks and indexes every file again. A reader of these fields must handle a missing key.
+
