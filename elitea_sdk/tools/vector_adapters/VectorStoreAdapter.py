@@ -18,6 +18,7 @@ from tenacity import (
 
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.retry import is_transient_db_error
+from ..utils.source_info import SOURCE_TARGET_KEYS
 
 logger = getLogger(__name__)
 
@@ -105,6 +106,10 @@ class VectorStoreAdapter(ABC):
 
     def stamp_code_identity(self, vectorstore_wrapper, identity_by_row_id: Dict[str, str]) -> int:
         """Write blob_sha onto already indexed rows that predate it"""
+        return 0
+
+    def stamp_source_target(self, vectorstore_wrapper, row_ids: List[str], source_target: Dict[str, str]) -> int:
+        """Merge the repository and branch of the current run into already indexed rows."""
         return 0
 
     @abstractmethod
@@ -417,10 +422,13 @@ class PGVectorAdapter(VectorStoreAdapter):
                         'metadata': meta,
                         'commit_hashes': [],
                         'blob_shas': [],
+                        'source_targets': [],
                         'ids': []
                     }
                 result[filename]['commit_hashes'].append(commit_hash)
                 result[filename]['blob_shas'].append(blob_sha)
+                result[filename]['source_targets'].append(
+                    {key: meta[key] for key in SOURCE_TARGET_KEYS if meta.get(key)})
                 result[filename]['ids'].append(db_id)
         except Exception as e:
             # Same polarity as get_indexed_data: a failed read that reports an
@@ -493,6 +501,41 @@ class PGVectorAdapter(VectorStoreAdapter):
             )
         logger.info(f"Stamped a content identity onto {stamped} already indexed rows")
         return stamped
+
+    def stamp_source_target(self, vectorstore_wrapper, row_ids: List[str], source_target: Dict[str, str]) -> int:
+        """Merge the repository and branch of the current run into already indexed rows."""
+        if not row_ids or not source_target:
+            return 0
+        store = vectorstore_wrapper.vectorstore
+        stamped = 0
+        for start in range(0, len(row_ids), IDENTITY_STAMP_BATCH_SIZE):
+            batch = row_ids[start:start + IDENTITY_STAMP_BATCH_SIZE]
+            try:
+                stamped += self._stamp_source_target_batch(store, batch, source_target)
+            except Exception as e:
+                logger.warning(f"Could not stamp the repository and branch onto a batch of rows: {e}")
+        logger.info(f"Stamped the repository and branch onto {stamped} already indexed rows")
+        return stamped
+
+    @retry(
+        retry=retry_if_exception(is_transient_db_error),
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(2),
+        before_sleep=before_sleep_log(logger, WARNING),
+        reraise=True,
+    )
+    def _stamp_source_target_batch(self, store, batch: List[str], source_target: Dict[str, str]) -> int:
+        statement = (
+            update(store.EmbeddingStore)
+            .where(store.EmbeddingStore.id.in_(batch))
+            .values(cmetadata=func.coalesce(store.EmbeddingStore.cmetadata, EMPTY_JSONB).op("||")(
+                cast(source_target, JSONB)))
+            .execution_options(synchronize_session=False)
+        )
+        with Session(store.session_maker.bind) as session:
+            written = session.execute(statement).rowcount
+            session.commit()
+            return written
 
     def add_to_collection(self, vectorstore_wrapper, entry_id, new_collection_value):
         """Add a new collection name to the `collection` key in the `metadata` column."""

@@ -523,6 +523,7 @@ SUPPORTED_KEYS = {
 
 
 class TestrailAPIWrapper(NonCodeIndexerToolkit):
+    index_source_type = "testrail"
     index_item_labels = ('test case', 'test cases')
     url: str
     password: Optional[SecretStr] = None,

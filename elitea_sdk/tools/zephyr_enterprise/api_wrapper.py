@@ -27,6 +27,7 @@ zql_description = """
                     """
 
 class ZephyrApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "zephyr_enterprise"
     index_item_labels = ('test case', 'test cases')
     base_url: str
     token: SecretStr

@@ -175,6 +175,7 @@ GetAllTestCaseFieldsModel = create_model(
 )
 
 class TestPlanApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
+    index_source_type = "azure_devops_plans"
     index_item_labels = ('test case', 'test cases')
     # TODO use ado_configuration instead of organization_url, project and token
     __test__ = False

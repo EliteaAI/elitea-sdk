@@ -11,7 +11,7 @@ Authentication precedence (evaluated in order):
 import logging
 import os
 import re
-from typing import Callable, Optional, Generator, List, Any
+from typing import Callable, Dict, Optional, Generator, List, Any
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -33,6 +33,7 @@ from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLim
 from ...runtime.utils.utils import IndexerKeywords
 from ..base_indexer_toolkit import DEPENDENT_DOC_META_KEY
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import reuse_url, web_base
 
 # ------------------------------------------------------------------ #
 #  Read-safety: block executable / binary files (read_document only)  #
@@ -463,6 +464,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     3. ``token`` only  → :class:`SharepointRestWrapper`
        (REST token without Graph scopes — legacy behaviour)
     """
+    index_source_type = "sharepoint"
 
     index_item_labels = ('file', 'files')
 
@@ -1128,8 +1130,19 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 default=None)),
         }
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('Path')
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return reuse_url(metadata.get('Link'), self.site_url, kept_query=('sourcedoc', 'file', 'action'))
+
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._sync_backend_context()
+        site = web_base(self.site_url)
+        self._record_index_source(
+            location=" / ".join(part for part in (site and site.split("://", 1)[1], kwargs.get('path')) if part),
+            url=site,
+        )
 
         # Normalise onenote_filter (already a dict or None) and inject top-level
         # extension filters so include_extensions / skip_extensions apply uniformly

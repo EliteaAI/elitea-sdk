@@ -136,6 +136,7 @@ def _parse_tests(test_results) -> List[Any]:
 
 
 class XrayApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "xray_cloud"
     index_item_labels = ('test case', 'test cases')
     _default_base_url: str = 'https://xray.cloud.getxray.app'
     base_url: str = ""

@@ -34,6 +34,7 @@ from .utils.content_parser import file_extension_by_chunker, process_document_by
 from .utils.retry import is_server_error_retriable, retry_on_server_error
 from .utils.tool_groups import tool_group, with_tool_groups
 from .utils.serialization import serialize_tool_result
+from .utils.source_info import SOURCE_INFO_KEY, build_source_info
 from ..runtime.langchain.document_loaders.constants import (
     image_loaders_map,
     image_loaders_map_converted,
@@ -418,6 +419,7 @@ class IndexingStats:
         item_labels: Tuple[str, str],
         dependent_labels: Tuple[str, str],
         errors: Optional[List[str]] = None,
+        source_info: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Build the canonical indexing report for this run.
 
@@ -493,7 +495,7 @@ class IndexingStats:
         )
 
         sampled_errors, errors_total = normalize_report_errors(errors)
-        return {
+        report = {
             "version": REPORT_VERSION,
             "status": status.value,
             "item_labels": {"singular": item_labels[0], "plural": item_labels[1]},
@@ -503,6 +505,9 @@ class IndexingStats:
             "errors": sampled_errors,
             "errors_total": errors_total,
         }
+        if source_info:
+            report[SOURCE_INFO_KEY] = source_info
+        return report
 
 
 _REPORT_GROUP_SPECS: Tuple[Tuple[ReportKind, str, str, Tuple[str, ...]], ...] = (
@@ -671,6 +676,7 @@ def build_error_report(
     indexed_count: int = 0,
     failure: Optional[BaseException] = None,
     retriable: Optional[bool] = None,
+    source_info: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Report for a run that aborted before producing a result.
 
@@ -684,6 +690,7 @@ def build_error_report(
         item_labels=item_labels,
         dependent_labels=dependent_labels,
         errors=[error_message],
+        source_info=source_info,
     )
     if failure is not None:
         report.update(describe_failure_cause(failure))
@@ -741,6 +748,10 @@ def render_report_text(report: Dict[str, Any]) -> str:
     else:
         lines = ["No new documents to index."]
 
+    source_info = report.get(SOURCE_INFO_KEY)
+    if source_info:
+        lines.append(_render_source_line(source_info))
+
     for category in report.get("categories", []):
         lines.extend(_render_category_lines(category, item_labels))
 
@@ -763,6 +774,11 @@ def render_report_text(report: Dict[str, Any]) -> str:
             lines.append(f"    ... and {hidden_errors} more distinct errors")
 
     return "\n".join(lines)
+
+
+def _render_source_line(source_info: Dict[str, str]) -> str:
+    location = source_info.get("location")
+    return f'Source: {source_info["type"]} "{location}"' if location else f'Source: {source_info["type"]}'
 
 
 def is_up_to_date_run(totals: Dict[str, int]) -> bool:
@@ -932,6 +948,8 @@ class _IndexRunState:
     explicitly_failed_keys: Set[str] = field(default_factory=set)
     seen_keys: Set[str] = field(default_factory=set)
     preskipped_keys: Set[str] = field(default_factory=set)
+    source_info: Dict[str, str] = field(default_factory=dict)
+    source_target: Dict[str, str] = field(default_factory=dict)
     unchanged_skip_enabled: bool = False
     indexed_data: Optional[Dict[str, Dict[str, Any]]] = None
     identity_backfill: Dict[str, str] = field(default_factory=dict)
@@ -1094,6 +1112,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     # Travel inside the report so no consumer holds a toolkit-to-noun mapping.
     index_item_labels: ClassVar[Tuple[str, str]] = ("document", "documents")
     index_dependent_labels: ClassVar[Tuple[str, str]] = ("attachment", "attachments")
+    index_source_type: ClassVar[str] = ""
 
     # When true the document count comes from the stats, not from the chunk count.
     loader_yields_chunks: ClassVar[bool] = False
@@ -1381,7 +1400,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         else:
             self._index_meta_config.pop("initiator", None)
 
-        self._index_run = _IndexRunState(run_id=uuid4().hex[:12], clean_index=bool(clean_index))
+        self._index_run = _IndexRunState(run_id=uuid4().hex[:12], clean_index=bool(clean_index),
+                                         source_info=build_source_info(self.index_source_type))
 
         result = {"count": 0, "failed_count": 0, "docs_count": 0, "failed_docs": 0}
         #
@@ -1506,6 +1526,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 item_labels=self.index_item_labels,
                 dependent_labels=self.index_dependent_labels,
                 errors=errors,
+                source_info=self._index_run.source_info,
             )
             if staging and final_state != IndexerKeywords.INDEX_META_FAILED.value:
                 self._append_retained_orphan_warning(report)
@@ -1585,6 +1606,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         stats=self.get_indexing_stats(),
                         failure=e,
                         retriable=None if resumable_quota else False,
+                        source_info=self._index_run.source_info,
                     )
                     self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, result["count"],
                                            error=msg, report=error_report)
@@ -2018,6 +2040,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             item_labels=self.index_item_labels,
             dependent_labels=self.index_dependent_labels,
             stats=self.get_indexing_stats(),
+            source_info=self._index_run.source_info,
         )
         self.index_meta_update(index_name, IndexerKeywords.INDEX_META_FAILED.value, 0,
                                error=message, report=report)
@@ -2043,6 +2066,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             item_labels=self.index_item_labels,
             dependent_labels=self.index_dependent_labels,
             stats=self.get_indexing_stats(),
+            source_info=self._index_run.source_info,
         )
         return {"status": IndexingStatus.ERROR.value, "message": message, "report": report}
 
@@ -2826,6 +2850,39 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         finally:
             run.identity_backfill = {}
 
+    def _record_index_source(self, location: Optional[str] = None, url: Optional[str] = None):
+        """Record the target this run resolved, for its report."""
+        run = getattr(self, "_index_run", None)
+        if run is not None:
+            run.source_info = build_source_info(self.index_source_type, location=location, url=url)
+
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return None
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return None
+
+    def _chunk_source_id(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('id')
+
+    def _with_source_info(self, docs: Any) -> Any:
+        """Attach where each found chunk came from, built from the chunk's own metadata."""
+        if not isinstance(docs, list):
+            return docs
+        for doc in docs:
+            metadata = doc.get('metadata') if isinstance(doc, dict) else None
+            if isinstance(metadata, dict):
+                doc['metadata'] = {**metadata, SOURCE_INFO_KEY: build_source_info(
+                    self.index_source_type,
+                    location=self._chunk_source_location(metadata),
+                    url=self._chunk_source_url(metadata),
+                    item_id=self._chunk_source_id(metadata),
+                )}
+        return docs
+
+    def _backfill_unchanged_rows(self, indexed_data: Dict[str, Dict[str, Any]], unchanged_keys: Set[str]):
+        return
+
     def _adopt_preskipped_keys(self):
         run = getattr(self, "_index_run", None)
         if run is None:
@@ -2858,6 +2915,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return
 
         docs_to_remove = set()
+        unchanged_keys = set()
         # clean_index means the unchanged-skip is disabled — every visited doc is
         # nominated for a full rebuild — while the dedup pass itself still runs:
         # nomination and the seen-keys record only exist at visit time.
@@ -2870,6 +2928,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 run.seen_keys.add(key)
             if key in indexed_keys and index_name == indexed_data[key]['metadata'].get('collection'):
                 if skip_unchanged and self.compare_fn(document, indexed_data[key]):
+                    unchanged_keys.add(key)
                     self._note_identity_backfill(document, indexed_data[key])
                     self._flush_identity_backfill(only_when_full=True)
                     if hasattr(self, '_track_document_unchanged'):
@@ -2896,6 +2955,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
         self._adopt_preskipped_keys()
         self._flush_identity_backfill()
+        if run is not None:
+            unchanged_keys |= run.preskipped_keys - run.resumed_files
+        self._backfill_unchanged_rows(indexed_data, unchanged_keys)
 
         if staging:
             run.orphan_candidate_ids, run.orphan_candidate_doc_count = (
@@ -3030,6 +3092,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             extended_search=extended_search
         )
 
+        found_docs = self._with_source_info(found_docs)
         # Apply field filtering if specified (non-empty list)
         if output_fields and isinstance(found_docs, list):
             found_docs = self._filter_result_fields(found_docs, output_fields)
@@ -3138,6 +3201,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             reranking_config=reranking_config,
             extended_search=extended_search
         )
+        found_docs = self._with_source_info(found_docs)
         return f"Found {len(found_docs)} documents matching the query\n{json.dumps(found_docs, indent=4)}" if found_docs else "No documents found matching the query."
 
     @tool_group('read')

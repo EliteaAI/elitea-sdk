@@ -243,6 +243,7 @@ ADOAttachFileToWorkItem = create_model(
 )
 
 class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
+    index_source_type = "ado_boards"
     index_item_labels = ('work item', 'work items')
     # TODO use ado_configuration instead of organization_url, project and token
     organization_url: str

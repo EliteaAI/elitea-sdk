@@ -24,6 +24,7 @@ def _is_content_absent(error: ToolException, absent_status: re.Pattern) -> bool:
 
 
 class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "zephyr_essential"
     index_item_labels = ('test case', 'test cases')
     token: SecretStr
     _client: ZephyrEssentialAPI = PrivateAttr()

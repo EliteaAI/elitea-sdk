@@ -259,6 +259,7 @@ def _format_wiki_response(wiki_response):
 
 
 class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
+    index_source_type = "azure_devops_wiki"
     index_item_labels = ('page', 'pages')
     # TODO use ado_configuration instead of organization_url, project and token
     organization_url: str

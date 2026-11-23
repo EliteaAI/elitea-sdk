@@ -265,6 +265,7 @@ ZephyrUpdateTestSteps = create_model(
 
 
 class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "zephyr_scale"
     index_item_labels = ('test case', 'test cases')
     # url for a Zephyr server
     base_url: Optional[str] = ""

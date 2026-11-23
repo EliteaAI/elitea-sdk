@@ -2,7 +2,7 @@ import ast
 import fnmatch
 import json
 import logging
-from typing import Dict, Optional, List, Generator, Set
+from typing import Any, Dict, Optional, List, Generator, Set
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -107,6 +107,64 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         """The branch an index run reads when none is given."""
         return self.__get_branch(branch)
 
+    def _code_web_url(self, repository: str, branch: str, path: str = "") -> Optional[str]:
+        """Browser link to a file, or to the branch when no path is given."""
+        return None
+
+    @staticmethod
+    def _code_location(repository: Optional[str], branch: Optional[str], path: Optional[str] = None) -> Optional[str]:
+        head = f"{repository}@{branch}" if repository and branch else repository
+        if head and path:
+            return f"{head}:{path}"
+        return head or path
+
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return self._code_location(metadata.get('repository'), metadata.get('branch'),
+                                   metadata.get('file_path') or metadata.get('filename'))
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        repository, branch = metadata.get('repository'), metadata.get('branch')
+        path = metadata.get('file_path') or metadata.get('filename')
+        if not (repository and branch and path):
+            return None
+        return self._code_web_url(repository, branch, path)
+
+    def _chunk_source_id(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('file_path') or metadata.get('filename')
+
+    def _record_code_target(self, target_metadata: Dict[str, str], branch: Optional[str]) -> Dict[str, str]:
+        """The repository and branch this run reads, stamped on its chunks and named in its report."""
+        source_target = {**target_metadata, 'branch': branch} if branch else dict(target_metadata)
+        repository = target_metadata.get('repository')
+        run = getattr(self, "_index_run", None)
+        if run is not None:
+            run.source_target = source_target
+        self._record_index_source(
+            location=self._code_location(repository, branch),
+            url=self._code_web_url(repository, branch) if repository and branch else None,
+        )
+        return source_target
+
+    def _backfill_unchanged_rows(self, indexed_data: Dict[str, Dict[str, Any]], unchanged_keys: Set[str]):
+        """Stamp this run's repository and branch onto unchanged rows, which are never rewritten."""
+        run = getattr(self, "_index_run", None)
+        source_target = getattr(run, "source_target", None)
+        if not source_target:
+            return
+        row_ids = [
+            str(row_id)
+            for key in unchanged_keys if key in indexed_data
+            for row_id, row_target in zip(indexed_data[key].get('ids') or [],
+                                          indexed_data[key].get('source_targets') or [])
+            if row_target != source_target
+        ]
+        if not row_ids:
+            return
+        try:
+            self.vector_adapter.stamp_source_target(self, row_ids, source_target)
+        except Exception as e:
+            logger.error(f"Could not stamp the repository and branch onto unchanged rows: {e}")
+
     def _base_loader(
             self,
             branch: Optional[str] = None,
@@ -209,8 +267,8 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         self._init_indexing_stats()
 
         target = target or {}
-        target_metadata = self._index_target_metadata(target)
         branch = self._index_branch(branch, target)
+        source_target = self._record_code_target(self._index_target_metadata(target), branch)
         listing = self.__list_files("", branch, target)
         file_identities = listing if isinstance(listing, dict) else None
         _files = list(file_identities) if file_identities is not None \
@@ -349,7 +407,7 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
                     'filename': file,
                     'source': file,
                     'commit_hash': file_hash,
-                    **target_metadata,
+                    **source_target,
                 }
                 blob_sha = identity_confirmed_by(file, file_content)
                 if blob_sha:

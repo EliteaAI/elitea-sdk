@@ -338,6 +338,7 @@ class ArgsSchema(Enum):
 
 
 class FigmaApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "figma"
     index_item_labels = ('file', 'files')
     index_dependent_labels = ('image', 'images')
     # Threshold for subframe extraction: frames larger than this will have their

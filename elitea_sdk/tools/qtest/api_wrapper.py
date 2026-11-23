@@ -436,6 +436,7 @@ class _TimeoutApiClient(swagger_client.ApiClient):
 
 
 class QtestApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "qtest"
     index_item_labels = ('test case', 'test cases')
     base_url: str
     qtest_project_id: Optional[int] = None

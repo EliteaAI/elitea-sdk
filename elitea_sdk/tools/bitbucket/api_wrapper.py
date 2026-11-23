@@ -6,6 +6,7 @@ import re
 import threading
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 import fnmatch
+from urllib.parse import urlsplit
 
 from langchain_core.tools import ToolException
 from pydantic import model_validator, SecretStr, create_model, Field
@@ -21,6 +22,7 @@ from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_NO_PA
 from ..utils.text_operations import apply_line_slice
 from ..utils.file_metadata import guard_text_read, capped_read_multiple_files
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import encode_path, encode_ref, web_base, web_url
 
 logger = logging.getLogger(__name__)
 
@@ -203,8 +205,18 @@ CommentOnIssueModel = create_model(
 )
 
 
+def bitbucket_cloud_web_base(configured_url: Optional[str]) -> Optional[str]:
+    """The browser host of Bitbucket Cloud, whether the API host or the site was configured."""
+    base = web_base(configured_url)
+    if base is None:
+        return None
+    parts = urlsplit(base)
+    return f"{parts.scheme}://bitbucket.org" if parts.netloc in ("bitbucket.org", "api.bitbucket.org") else None
+
+
 class BitbucketAPIWrapper(CodeIndexerToolkit):
     """Wrapper for Bitbucket API."""
+    index_source_type = "bitbucket"
 
     # The client and branch of the configured repository, per instance: two toolkits
     # in one process must never share them.
@@ -883,6 +895,18 @@ class BitbucketAPIWrapper(CodeIndexerToolkit):
         if target.get('project') and target.get('repository'):
             return {'repository': f"{target['project']}/{target['repository']}"}
         return {}
+
+    def _code_web_url(self, repository: str, branch: str, path: str = "") -> Optional[str]:
+        project, _, slug = repository.partition('/')
+        if not (project and slug):
+            return None
+        file_path = encode_path(path) if path else ""
+        if self.cloud:
+            return web_url(bitbucket_cloud_web_base(self.url), encode_ref(project), encode_ref(slug),
+                           "src", encode_ref(branch), file_path)
+        owner_kind, owner = ("users", project[1:]) if project.startswith("~") else ("projects", project)
+        return web_url(web_base(self.url), owner_kind, encode_ref(owner), "repos", encode_ref(slug),
+                       "browse", file_path, query={"at": f"refs/heads/{branch}"})
 
     def _index_branch(self, branch: Optional[str], target: Dict[str, str]) -> Optional[str]:
         # The toolkit's branches belong to its own repository; another one is read on its default branch.
