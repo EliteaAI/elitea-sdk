@@ -145,25 +145,19 @@ class CodeIndexerToolkit(BaseIndexerToolkit):
         )
         return source_target
 
-    def _backfill_unchanged_rows(self, indexed_data: Dict[str, Dict[str, Any]], unchanged_keys: Set[str]):
-        """Stamp this run's repository and branch onto unchanged rows, which are never rewritten."""
+    def _queue_unchanged_restamp(self, indexed_data: Dict[str, Dict[str, Any]], unchanged_keys: Set[str]):
+        """Queue the unchanged rows, which are never rewritten, whose stored repository or branch differ from this run's."""
         run = getattr(self, "_index_run", None)
         source_target = getattr(run, "source_target", None)
         if not source_target:
             return
-        row_ids = [
+        run.source_restamp_ids = [
             str(row_id)
             for key in unchanged_keys if key in indexed_data
             for row_id, row_target in zip(indexed_data[key].get('ids') or [],
                                           indexed_data[key].get('source_targets') or [])
             if row_target != source_target
         ]
-        if not row_ids:
-            return
-        try:
-            self.vector_adapter.stamp_source_target(self, row_ids, source_target)
-        except Exception as e:
-            logger.error(f"Could not stamp the repository and branch onto unchanged rows: {e}")
 
     def _base_loader(
             self,

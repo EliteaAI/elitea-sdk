@@ -2,7 +2,7 @@ import hashlib
 import json
 import logging
 import re
-from typing import Optional, Generator, Literal
+from typing import Any, Dict, Optional, Generator, Literal
 from pydantic import model_validator, create_model, Field, SecretStr, PrivateAttr
 
 from .client import ZephyrEssentialAPI
@@ -336,6 +336,9 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
         return {
             'chunking_tool':(Literal['json', ''], Field(description="Name of chunking tool", default='json'))
         }
+
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('key')
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._chunking_tool = kwargs.get('chunking_tool', None)

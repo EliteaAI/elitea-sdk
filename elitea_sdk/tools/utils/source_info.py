@@ -26,6 +26,11 @@ def build_source_info(source_type: str, location: Optional[str] = None, url: Opt
     return {key: value for key, value in fields.items() if value}
 
 
+def join_location(*parts: object) -> Optional[str]:
+    """The known parts of a location, broadest first, joined with " / "."""
+    return " / ".join(str(part) for part in parts if part not in (None, "")) or None
+
+
 def _web_parts(url: Optional[str]) -> Optional[SplitResult]:
     try:
         parts = urlsplit(str(url or "").strip())

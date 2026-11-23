@@ -18,10 +18,12 @@ import importlib
 import json
 import re
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from elitea_sdk.runtime.langchain.interfaces import llm_processor
 from elitea_sdk.runtime.tools.artifact import ArtifactWrapper
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.tools.ado.repos.repos_wrapper import ReposApiWrapper
@@ -30,6 +32,7 @@ from elitea_sdk.tools.ado.wiki.ado_wrapper import AzureDevOpsApiWrapper as AdoWi
 from elitea_sdk.tools.ado.work_item.ado_wrapper import AzureDevOpsApiWrapper as AdoBoardsWrapper
 from elitea_sdk.tools.base_indexer_toolkit import (
     BaseIndexerToolkit,
+    _IndexRunState,
     IndexingStats,
     IndexingStatus,
     render_report_text,
@@ -43,6 +46,7 @@ from elitea_sdk.tools.jira.api_wrapper import JiraApiWrapper
 from elitea_sdk.tools.qtest.api_wrapper import QtestApiWrapper
 from elitea_sdk.tools.sharepoint.api_wrapper import SharepointApiWrapper
 from elitea_sdk.tools.testrail.api_wrapper import TestrailAPIWrapper
+from elitea_sdk.tools.vector_adapters.VectorStoreAdapter import PGVectorAdapter
 from elitea_sdk.tools.utils.source_info import build_source_info, reuse_url, single_line, web_base
 from elitea_sdk.tools.xray.api_wrapper import XrayApiWrapper
 from elitea_sdk.tools.zephyr_enterprise.api_wrapper import ZephyrApiWrapper
@@ -165,6 +169,18 @@ class TestCodeLinks:
         github = wrapper(EliteAGitHubAPIWrapper, github_base_url="https://user:tok@ghe.corp/api/v3")
         assert github._code_web_url("org/repo", "main") == "https://ghe.corp/org/repo/tree/main"
 
+    def test_github_data_residency_drops_the_api_label(self):
+        github = wrapper(EliteAGitHubAPIWrapper, github_base_url="https://api.acme.ghe.com")
+        assert github._code_web_url("org/repo", "main", "a.py") == "https://acme.ghe.com/org/repo/blob/main/a.py"
+
+    def test_an_enterprise_host_named_api_keeps_its_name(self):
+        github = wrapper(EliteAGitHubAPIWrapper, github_base_url="https://api.corp.example/api/v3")
+        assert github._code_web_url("org/repo", "main") == "https://api.corp.example/org/repo/tree/main"
+
+    def test_the_bare_ghe_api_host_is_not_a_tenant(self):
+        github = wrapper(EliteAGitHubAPIWrapper, github_base_url="https://api.ghe.com")
+        assert github._code_web_url("org/repo", "main") == "https://api.ghe.com/org/repo/tree/main"
+
     def test_gitlab(self):
         gitlab = wrapper(GitLabAPIWrapper, url="https://gitlab.corp/")
         assert gitlab._code_web_url("grp/sub/proj", "feature/x", "docs/read me.md") == \
@@ -264,7 +280,8 @@ class TestDocumentLinks:
         assert info == {"type": "artifact", "location": "b/a.txt", "id": "a.txt"}
 
     def test_a_connector_without_a_template_has_no_link(self):
-        assert source_info_of(wrapper(TestrailAPIWrapper), {"id": "C1", "title": "x"}) == {"type": "testrail", "id": "C1"}
+        assert source_info_of(wrapper(TestrailAPIWrapper), {"id": "17", "title": "x"}) == \
+            {"type": "testrail", "location": "C17", "id": "17"}
 
 
 class TestSearchResults:
@@ -400,3 +417,189 @@ class TestCodeRuns:
         toolkit = code_toolkit(monkeypatch, {"a.py": "sha-a"}, indexed)
         run_index(toolkit)
         assert toolkit.vector_adapter.target_stamps == []
+
+
+class FailingPromoteAdapter(StampingAdapter):
+    def promote_run(self, wrapper, index_name, run_id, superseded_ids, orphan_ids, damaged_ids):
+        raise RuntimeError("promote failed")
+
+
+class OrderedStampingAdapter(StampingAdapter):
+    def stamp_source_target(self, wrapper, row_ids, source_target):
+        self.calls.append("stamp")
+        return super().stamp_source_target(wrapper, row_ids, source_target)
+
+
+class TestUnchangedRowsAreRestampedOnlyWhenTheRunPublishes:
+    def unchanged_on_main(self):
+        return {"a.py": stored_entry("a.py", [("r1", "h", "sha-a", {"repository": "org/repo", "branch": "main"})])}
+
+    def test_the_restamp_follows_the_promote(self, monkeypatch):
+        toolkit = code_toolkit(monkeypatch, {"a.py": "sha-a"}, self.unchanged_on_main())
+        object.__setattr__(toolkit, "vector_adapter", OrderedStampingAdapter())
+        run_index(toolkit, branch="feature")
+        assert toolkit.vector_adapter.calls == ["promote", "stamp"]
+
+    def test_a_failed_promote_leaves_the_published_rows_alone(self, monkeypatch):
+        toolkit = code_toolkit(monkeypatch, {"a.py": "sha-a"}, self.unchanged_on_main())
+        object.__setattr__(toolkit, "vector_adapter", FailingPromoteAdapter())
+        with pytest.raises(RuntimeError):
+            run_index(toolkit, branch="feature")
+        assert toolkit.vector_adapter.target_stamps == []
+
+    def test_a_failed_flush_leaves_the_published_rows_alone(self, monkeypatch):
+        toolkit = code_toolkit(monkeypatch, {"a.py": "sha-a", "b.py": "sha-new"}, self.unchanged_on_main())
+        write_meta = llm_processor.add_documents
+
+        def add_documents_failing_on_chunks(vectorstore=None, documents=None, ids=None):
+            if any(document.metadata.get("file_path") == "b.py" for document in documents):
+                raise RuntimeError("flush failed")
+            return write_meta(vectorstore=vectorstore, documents=documents, ids=ids)
+
+        monkeypatch.setattr(llm_processor, "add_documents", add_documents_failing_on_chunks)
+        result = run_index(toolkit, branch="feature")
+        assert result["status"] == IndexingStatus.ERROR.value
+        assert toolkit.vector_adapter.target_stamps == []
+
+
+def recorded_source(instance, load, **kwargs):
+    """The run source an index loader records before it reaches its provider."""
+    object.__setattr__(instance, "_index_run", _IndexRunState(run_id="r"))
+    try:
+        next(iter(load(**kwargs)))
+    except Exception:
+        pass
+    return instance._index_run.source_info
+
+
+class TestEveryIndexerRecordsItsScope:
+    def test_sharepoint_names_the_library(self, monkeypatch):
+        sharepoint = wrapper(SharepointApiWrapper, site_url="https://tenant.sharepoint.com/sites/team")
+        monkeypatch.setattr(SharepointApiWrapper, "_sync_backend_context", lambda self: None)
+        info = recorded_source(sharepoint, sharepoint._base_loader, form_name="private_docs", path="Reports")
+        assert info["location"] == "tenant.sharepoint.com/sites/team / private_docs / Reports"
+
+    def test_jira_names_the_query(self, monkeypatch):
+        jira = wrapper(JiraApiWrapper, base_url="https://jira.corp")
+        monkeypatch.setattr(JiraApiWrapper, "_get_client", lambda self: None)
+        assert recorded_source(jira, jira._base_loader, jql="project = AB")["location"] == \
+            "jira.corp / JQL: project = AB"
+
+    def test_ado_wiki_names_project_and_wiki(self):
+        wiki = wrapper(AdoWikiWrapper, organization_url="https://dev.azure.com/org", project="Proj",
+                       default_wiki_identifier=None)
+        assert recorded_source(wiki, wiki._base_loader, wiki_identifier="OpsWiki")["location"] == \
+            "dev.azure.com / Proj / OpsWiki"
+
+    def test_ado_boards_names_the_query(self):
+        boards = wrapper(AdoBoardsWrapper, organization_url="https://dev.azure.com/org", project="Proj")
+        assert recorded_source(boards, boards._base_loader, wiql="SELECT 1")["location"] == \
+            "dev.azure.com / Proj / WIQL: SELECT 1"
+
+    def test_ado_test_plans_names_plan_and_suites(self):
+        plans = wrapper(TestPlanApiWrapper, organization_url="https://dev.azure.com/org", project="Proj")
+        assert recorded_source(plans, plans._base_loader, plan_id=4, suite_ids=[5, 6])["location"] == \
+            "dev.azure.com / Proj / plan 4 / suites 5, 6"
+
+    def test_figma_names_the_files(self):
+        figma = wrapper(FigmaApiWrapper, llm=None)
+        info = recorded_source(figma, figma._base_loader,
+                               urls_or_file_keys="https://www.figma.com/design/KEY1/Name, KEY2")
+        assert info["location"] == "KEY1, KEY2"
+
+    def test_qtest_names_project_and_module(self):
+        qtest = wrapper(QtestApiWrapper, base_url="https://qtest.corp", qtest_project_id=None)
+        info = recorded_source(qtest, qtest._base_loader, qtest_project_id=7, indexing_mode="module",
+                               module_name="Login")
+        assert info["location"] == "qtest.corp / project 7 / module Login"
+
+    def test_testrail_names_project_and_suite(self):
+        testrail = wrapper(TestrailAPIWrapper, url="https://tr.corp")
+        assert recorded_source(testrail, testrail._base_loader, project_id="3", suite_id="9")["location"] == \
+            "tr.corp / project 3 / suite 9"
+
+    def test_xray_names_the_query(self):
+        xray = wrapper(XrayApiWrapper, base_url="https://xray.cloud.getxray.app")
+        assert recorded_source(xray, xray._base_loader, jql="project = CALC")["location"] == \
+            "xray.cloud.getxray.app / JQL: project = CALC"
+
+    def test_zephyr_enterprise_names_the_query(self):
+        zephyr = wrapper(ZephyrApiWrapper, base_url="https://zephyr.corp")
+        assert recorded_source(zephyr, zephyr._base_loader, zql="project=1")["location"] == \
+            "zephyr.corp / ZQL: project=1"
+
+    def test_zephyr_scale_names_project_and_query(self):
+        zephyr = wrapper(ZephyrScaleApiWrapper, base_url="")
+        assert recorded_source(zephyr, zephyr._base_loader, project_key="CALC", jql="status = Done")["location"] == \
+            "CALC / JQL: status = Done"
+
+
+class TestEveryIndexerLocatesItsItems:
+    @pytest.mark.parametrize("instance, metadata, location", [
+        (wrapper(AdoWikiWrapper), {"id": "1", "project": "Proj", "wiki": "OpsWiki", "path": "/Runbooks/Deploy"},
+         "Proj / OpsWiki / /Runbooks/Deploy"),
+        (wrapper(AdoBoardsWrapper, organization_url="https://dev.azure.com/org"), {"id": "12", "project": "Proj", "type": "Bug"}, "Proj / Bug #12"),
+        (wrapper(AdoBoardsWrapper, organization_url="https://dev.azure.com/org"), {"id": "9f3c-guid", "parent_id": "12", "project": "Proj"},
+         "Proj / #12 / attachment"),
+        (wrapper(TestrailAPIWrapper), {"id": "55", "parent_id": "17", "project_id": "3", "filename": "a.png",
+                                       "entity_type": "test_case_attachment"}, "project 3 / C17 / a.png"),
+        (wrapper(TestPlanApiWrapper), {"id": 8, "project": "Proj", "plan_id": 4, "suite_id": 5},
+         "Proj / plan 4 / suite 5 / case 8"),
+        (wrapper(FigmaApiWrapper), {"id": "n", "file_key": "KEY1", "page_name": "Home", "node_name": "Hero"},
+         "KEY1 / Home / Hero"),
+        (wrapper(QtestApiWrapper), {"id": "1", "project_id": 7, "module_name": "Login", "qtest_id": "TC-3"},
+         "project 7 / Login / TC-3"),
+        (wrapper(TestrailAPIWrapper), {"id": "17", "project_id": "3", "suite_id": "9"}, "project 3 / suite 9 / C17"),
+        (wrapper(XrayApiWrapper), {"id": "100", "key": "CALC-1"}, "CALC-1"),
+        (wrapper(ZephyrApiWrapper), {"id": "5", "projectName": "Calc", "testcaseId": "77"}, "Calc / 77"),
+        (wrapper(ZephyrEssentialApiWrapper), {"id": "5", "key": "CALC-T1"}, "CALC-T1"),
+        (wrapper(ZephyrScaleApiWrapper), {"id": "5", "key": "CALC-T1", "type": "TEST_CASE"}, "CALC-T1"),
+        (wrapper(ZephyrScaleApiWrapper), {"id": "6", "name": "Smoke", "type": "FOLDER"}, "folder Smoke"),
+    ])
+    def test_the_location_names_the_item(self, instance, metadata, location):
+        assert source_info_of(instance, metadata)["location"] == location
+
+
+class TestStoredTargetsAreReadBackCompactly:
+    def test_rows_with_one_target_share_it(self, monkeypatch):
+        rows = [(f"r{n}", {"filename": f"f{n % 2}.py", "repository": "org/repo", "branch": "main"}) for n in range(4)]
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.query.return_value.filter.return_value.all.return_value = rows
+        monkeypatch.setattr("sqlalchemy.orm.Session", lambda *a, **kw: session)
+        monkeypatch.setattr(PGVectorAdapter, "get_pending_run_ids", lambda self, wrapper, name: [])
+        indexed = PGVectorAdapter().get_code_indexed_data(MagicMock(), "x")
+        targets = [target for entry in indexed.values() for target in entry["source_targets"]]
+        assert targets == [{"repository": "org/repo", "branch": "main"}] * 4
+        assert len({id(target) for target in targets}) == 1
+
+
+class TestAdoWikiPagesNameTheirWiki:
+    def test_a_page_carries_the_wiki_it_was_read_from(self, monkeypatch):
+        wiki = wrapper(AdoWikiWrapper, organization_url="https://dev.azure.com/org", project="Proj",
+                       default_wiki_identifier=None, _client=SimpleNamespace(get_page_by_id=lambda **kw:
+                                                                           SimpleNamespace(page=SimpleNamespace(content="Body"))))
+        monkeypatch.setattr(AdoWikiWrapper, "_iter_wiki_pages",
+                            lambda self, wiki_identifier: iter([SimpleNamespace(id=1, path="/Runbooks/Deploy")]))
+        object.__setattr__(wiki, "_index_run", _IndexRunState(run_id="r"))
+        wiki._init_indexing_stats()
+        page = next(iter(wiki._base_loader(wiki_identifier="OpsWiki")))
+        assert source_info_of(wiki, page.metadata)["location"] == "Proj / OpsWiki / /Runbooks/Deploy"
+
+
+class TestAdoBoardsLinks:
+    @pytest.mark.parametrize("metadata", [{"id": "12"}, {"id": "9f3c-guid", "parent_id": "12"}])
+    def test_items_and_their_attachments_link_to_the_work_item(self, metadata):
+        boards = wrapper(AdoBoardsWrapper, organization_url="https://user:pat@dev.azure.com/org/")
+        assert source_info_of(boards, metadata)["url"] == "https://dev.azure.com/org/_workitems/edit/12"
+
+
+class TestZephyrEnterpriseMissingTestcaseId:
+    def test_a_missing_testcase_id_is_not_stored_as_text(self, monkeypatch):
+        zephyr = wrapper(ZephyrApiWrapper, base_url="https://zephyr.corp")
+        monkeypatch.setattr(ZephyrApiWrapper, "get_testcases_by_zql",
+                            lambda self, zql: [{"id": 1, "testcaseId": None, "projectName": "Calc"}])
+        object.__setattr__(zephyr, "_index_run", _IndexRunState(run_id="r"))
+        case = next(iter(zephyr._base_loader(zql="project=1")))
+        assert case.metadata["testcaseId"] is None
+        assert source_info_of(zephyr, case.metadata)["location"] == "Calc"

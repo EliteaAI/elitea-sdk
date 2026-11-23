@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Optional, List, Generator, Literal
+from typing import Any, Dict, Optional, List, Generator, Literal
 
 from langchain_core.tools import ToolException
 from pydantic import create_model, model_validator, PrivateAttr, Field, SecretStr
@@ -10,6 +10,7 @@ from .zephyr_enterprise import ZephyrClient
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker
+from ..utils.source_info import join_location, web_host
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
 
@@ -160,15 +161,19 @@ class ZephyrApiWrapper(NonCodeIndexerToolkit):
 
         }
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return join_location(metadata.get('projectName'), metadata.get('testcaseId'))
+
     def _base_loader(self, zql: str, **kwargs) -> Generator[Document, None, None]:
         self._chunking_tool = kwargs.get('chunking_tool', None)
+        self._record_index_source(location=join_location(web_host(self.base_url), f"ZQL: {zql}"))
         test_cases = self.get_testcases_by_zql(zql=zql)
         for test_case in test_cases:
             metadata = {
                 "updated_on": str(test_case.get("lastModifiedOn")),
                 "id": str(test_case.get("id")),
                 "name": test_case.get("name"),
-                "testcaseId": str(test_case.get("testcaseId")),
+                "testcaseId": str(test_case["testcaseId"]) if test_case.get("testcaseId") is not None else None,
                 "projectId": test_case.get("projectId"),
                 "projectName": test_case.get("projectName"),
                 "testcaseType": test_case.get("testcaseType"),

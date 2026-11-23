@@ -18,6 +18,7 @@ from ..utils import AdoProjectScope, with_project_argument
 from ..work_item import AzureDevOpsApiWrapper
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils import normalize_base_url
+from ...utils.source_info import join_location, web_host
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ....runtime.utils.utils import IndexerKeywords
 from ...utils.tool_groups import tool_group, with_tool_groups
@@ -567,7 +568,15 @@ class TestPlanApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
     def _base_loader(self, *args, project: Optional[str] = None, **kwargs) -> Generator[Document, None, None]:
         return self._load_in_project(lambda: self._load_test_cases(*args, **kwargs))
 
+    def _chunk_source_location(self, metadata: Dict) -> Optional[str]:
+        return join_location(metadata.get('project'),
+                             *(f"{label} {metadata[key]}" for label, key in
+                               (("plan", 'plan_id'), ("suite", 'suite_id'), ("case", 'id')) if metadata.get(key)))
+
     def _load_test_cases(self, plan_id: int, suite_ids: Optional[List[int]] = [], chunking_tool: str = None, **kwargs) -> Generator[Document, None, None]:
+        self._record_index_source(location=join_location(
+            web_host(self.organization_url), self._project(), f"plan {plan_id}",
+            f"suites {', '.join(map(str, suite_ids))}" if suite_ids else None))
         cases = []
         if not suite_ids:
             suites = self.get_suites_in_plan(plan_id)

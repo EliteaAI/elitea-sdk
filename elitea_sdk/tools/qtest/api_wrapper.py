@@ -28,6 +28,7 @@ from swagger_client.rest import ApiException
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import parse_file_content, file_extension_by_chunker
+from ..utils.source_info import join_location, web_host
 from ...runtime.utils.utils import IndexerKeywords
 from ...runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
 from ..utils.tool_groups import tool_group, with_tool_groups
@@ -3226,6 +3227,20 @@ Examples:
                 json_schema_extra={'visible_when': {'field': 'extract_images', 'value': True}})),
         }
 
+    @staticmethod
+    def _index_mode_scope(index_kwargs: dict) -> Optional[str]:
+        mode = index_kwargs.get('indexing_mode', 'full')
+        if mode == 'module':
+            return f"module {index_kwargs.get('module_name')}"
+        if mode == 'dql':
+            return f"DQL: {index_kwargs.get('dql')}"
+        return None
+
+    def _chunk_source_location(self, metadata: dict) -> Optional[str]:
+        project_id = metadata.get('project_id')
+        return join_location(f"project {project_id}" if project_id else None,
+                             metadata.get('module_name'), metadata.get('qtest_id'))
+
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         """
         Base loader for QTest test cases. Supports three indexing modes:
@@ -3239,6 +3254,8 @@ Examples:
         
         # Resolved before the first document, so a missing project fails the index up front.
         project_id = self._resolve_project_id(kwargs.get('qtest_project_id'))
+        self._record_index_source(location=join_location(
+            web_host(self.base_url), f"project {project_id}", self._index_mode_scope(kwargs)))
         yield from self._iterate_in_project(project_id, lambda: self._load_test_cases(**kwargs))
 
     def _iterate_in_project(self, project_id: int, make_generator) -> Generator[Document, None, None]:

@@ -26,6 +26,7 @@ from ..repos import ReposApiWrapper
 from ..utils import AdoProjectScope, in_caller_context, with_project_argument
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils import normalize_base_url
+from ...utils.source_info import join_location, web_host
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.content_parser import parse_file_content
 from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
@@ -853,6 +854,9 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
     # LLM rate limits, and pgvector pool exhaustion.
     _MAX_WORKERS = 10
 
+    def _chunk_source_location(self, metadata: dict) -> Optional[str]:
+        return join_location(metadata.get('project'), metadata.get('wiki'), metadata.get('path'))
+
     def _base_loader(self, *args, project=None, **kwargs) -> Generator[Document, None, None]:
         # run() already put the call's project in scope; it only rides along to be recorded
         return self._load_in_project(lambda: self._load_pages(*args, **kwargs))
@@ -867,6 +871,8 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
                      workers: Optional[int] = None,
                      **kwargs) -> Generator[Document, None, None]:
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
+        self._record_index_source(
+            location=join_location(web_host(self.organization_url), self._project(), wiki_identifier))
 
         # Stash indexing-time flags on the instance so _process_document (called
         # later by the base indexer, without kwargs) can read them.
@@ -971,6 +977,7 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
 
                 metadata = {
                     'id': str(page.id),
+                    'wiki': wiki_identifier,
                     'path': page.path,
                     'title': title,
                     'updated_on': content_hash,

@@ -33,7 +33,7 @@ from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLim
 from ...runtime.utils.utils import IndexerKeywords
 from ..base_indexer_toolkit import DEPENDENT_DOC_META_KEY
 from ..utils.tool_groups import tool_group, with_tool_groups
-from ..utils.source_info import reuse_url, web_base
+from ..utils.source_info import join_location, reuse_url, web_base
 
 # ------------------------------------------------------------------ #
 #  Read-safety: block executable / binary files (read_document only)  #
@@ -1140,7 +1140,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         site = web_base(self.site_url)
         self._record_index_source(
-            location=" / ".join(part for part in (site and site.split("://", 1)[1], kwargs.get('path')) if part),
+            location=join_location(site and site.split("://", 1)[1], kwargs.get('form_name'), kwargs.get('path')),
             url=site,
         )
 

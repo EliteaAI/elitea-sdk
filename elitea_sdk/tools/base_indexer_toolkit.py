@@ -950,6 +950,7 @@ class _IndexRunState:
     preskipped_keys: Set[str] = field(default_factory=set)
     source_info: Dict[str, str] = field(default_factory=dict)
     source_target: Dict[str, str] = field(default_factory=dict)
+    source_restamp_ids: List[str] = field(default_factory=list)
     unchanged_skip_enabled: bool = False
     indexed_data: Optional[Dict[str, Dict[str, Any]]] = None
     identity_backfill: Dict[str, str] = field(default_factory=dict)
@@ -1544,6 +1545,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                         return self._build_aborted_result(promote_outcome, index_name)
                 else:
                     self._discard_index_run(index_name)
+            if final_state != IndexerKeywords.INDEX_META_FAILED.value:
+                self._restamp_unchanged_rows()
 
             # Final update should always be forced (pass chunks count for indexed_chunks field).
             # Include unchanged docs in the indexed count so the UI reflects total items
@@ -2880,8 +2883,20 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 )}
         return docs
 
-    def _backfill_unchanged_rows(self, indexed_data: Dict[str, Dict[str, Any]], unchanged_keys: Set[str]):
+    def _queue_unchanged_restamp(self, indexed_data: Dict[str, Dict[str, Any]], unchanged_keys: Set[str]):
         return
+
+    def _restamp_unchanged_rows(self):
+        """Write this run's source target onto its unchanged rows, once the run's corpus is published."""
+        run = getattr(self, "_index_run", None)
+        if run is None or not run.source_restamp_ids:
+            return
+        try:
+            self.vector_adapter.stamp_source_target(self, run.source_restamp_ids, run.source_target)
+        except Exception as e:
+            logger.error(f"Could not stamp the repository and branch onto unchanged rows: {e}")
+        finally:
+            run.source_restamp_ids = []
 
     def _adopt_preskipped_keys(self):
         run = getattr(self, "_index_run", None)
@@ -2957,7 +2972,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         self._flush_identity_backfill()
         if run is not None:
             unchanged_keys |= run.preskipped_keys - run.resumed_files
-        self._backfill_unchanged_rows(indexed_data, unchanged_keys)
+        self._queue_unchanged_restamp(indexed_data, unchanged_keys)
 
         if staging:
             run.orphan_candidate_ids, run.orphan_candidate_doc_count = (

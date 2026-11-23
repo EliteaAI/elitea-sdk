@@ -35,6 +35,7 @@ from ..utils import (
 )
 from ...utils import get_file_bytes_from_artifact, detect_mime_type, normalize_base_url
 from ...utils.content_parser import parse_file_content
+from ...utils.source_info import encode_ref, join_location, web_base, web_host, web_url
 from ....runtime.langchain.document_loaders.EliteAImageLoader import EliteAImageLoader, MAX_IMAGE_READ_BYTES
 from ....runtime.langchain.document_loaders.constants import image_loaders_map, image_loaders_map_converted
 from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
@@ -1376,6 +1377,23 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
     # LLM rate limits, and pgvector pool exhaustion.
     _MAX_WORKERS = 10
 
+    @staticmethod
+    def _work_item_id(metadata: Dict[str, Any]) -> Optional[str]:
+        """The work item a chunk belongs to: its own id, or its parent's for an attachment."""
+        return metadata.get(IndexerKeywords.PARENT.value) or metadata.get('id')
+
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        if metadata.get(IndexerKeywords.PARENT.value):
+            return join_location(metadata.get('project'), f"#{metadata[IndexerKeywords.PARENT.value]}", "attachment")
+        item = " ".join(part for part in (metadata.get('type'), f"#{metadata['id']}" if metadata.get('id') else None)
+                        if part)
+        return join_location(metadata.get('project'), item)
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        work_item_id = self._work_item_id(metadata)
+        return web_url(web_base(self.organization_url), "_workitems", "edit", encode_ref(str(work_item_id))) \
+            if work_item_id else None
+
     def _base_loader(self, *args, project=None, **kwargs) -> Generator[Document, None, None]:
         # run() already put the call's project in scope; it only rides along to be recorded
         return self._load_in_project(lambda: self._load_work_items(*args, **kwargs))
@@ -1394,6 +1412,8 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
         skip_extensions: Optional[List[str]] = None,
         **kwargs,
     ) -> Generator[Document, None, None]:
+        self._record_index_source(
+            location=join_location(web_host(self.organization_url), self._project(), f"WIQL: {wiql}"))
         # Expose worker count to _save_index_generator (base-doc executor) and
         # any downstream per-doc work. Defaults to _DEFAULT_WORKERS so the tool
         # works out of the box; pass workers=1 to force serial.

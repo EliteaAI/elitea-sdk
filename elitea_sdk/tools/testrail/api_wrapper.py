@@ -17,6 +17,7 @@ from testrail_api import StatusCodeError, TestRailAPI
 from ..chunkers.code.constants import get_file_extension, image_extensions
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import normalize_base_url
+from ..utils.source_info import join_location, web_host
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.serialization import serialize_tool_result
 from ...runtime.utils.utils import IndexerKeywords
@@ -1325,6 +1326,15 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
             result_filter, output_format,
         )
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        if metadata.get('entity_type') == 'test_case_attachment':
+            parent_id = metadata.get(IndexerKeywords.PARENT.value)
+            return join_location(f"project {metadata['project_id']}" if metadata.get('project_id') else None,
+                                 f"C{parent_id}" if parent_id else None, metadata.get('filename'))
+        return join_location(*(f"{label}{metadata[key]}" for label, key in
+                               (("project ", 'project_id'), ("suite ", 'suite_id'), ("C", 'id'))
+                               if metadata.get(key) not in (None, "", -1)))
+
     def _base_loader(self, project_id: str,
                      suite_id: Optional[str] = None,
                      section_id: Optional[int] = None,
@@ -1334,6 +1344,9 @@ class TestrailAPIWrapper(NonCodeIndexerToolkit):
                      ) -> Generator[Document, None, None]:
         self._include_attachments = kwargs.get('include_attachments', False)
         self._skip_attachment_extensions = kwargs.get('skip_attachment_extensions', [])
+        self._record_index_source(location=join_location(
+            web_host(self.url), f"project {project_id}", f"suite {suite_id}" if suite_id else None,
+            f"section {section_id}" if section_id is not None else None))
 
         try:
             # Use unified suite handling method

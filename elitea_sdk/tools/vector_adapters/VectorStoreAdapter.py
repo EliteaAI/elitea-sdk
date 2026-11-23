@@ -397,6 +397,7 @@ class PGVectorAdapter(VectorStoreAdapter):
         from ...runtime.tools.index_runs_model import is_undefined_table_error
 
         result = {}
+        shared_targets = {}
         try:
             vectorstore_wrapper._log_tool_event(message="Retrieving already indexed code data from PGVector vectorstore",
                            tool_name="index_code_data")
@@ -427,8 +428,9 @@ class PGVectorAdapter(VectorStoreAdapter):
                     }
                 result[filename]['commit_hashes'].append(commit_hash)
                 result[filename]['blob_shas'].append(blob_sha)
+                row_target = tuple((key, str(meta[key])) for key in SOURCE_TARGET_KEYS if meta.get(key))
                 result[filename]['source_targets'].append(
-                    {key: meta[key] for key in SOURCE_TARGET_KEYS if meta.get(key)})
+                    shared_targets.setdefault(row_target, dict(row_target)))
                 result[filename]['ids'].append(db_id)
         except Exception as e:
             # Same polarity as get_indexed_data: a failed read that reports an
@@ -528,8 +530,7 @@ class PGVectorAdapter(VectorStoreAdapter):
         statement = (
             update(store.EmbeddingStore)
             .where(store.EmbeddingStore.id.in_(batch))
-            .values(cmetadata=func.coalesce(store.EmbeddingStore.cmetadata, EMPTY_JSONB).op("||")(
-                cast(source_target, JSONB)))
+            .values(cmetadata=_merge_cmetadata(store.EmbeddingStore, source_target))
             .execution_options(synchronize_session=False)
         )
         with Session(store.session_maker.bind) as session:

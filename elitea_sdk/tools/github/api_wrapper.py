@@ -24,13 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 def github_web_base(api_url: Optional[str]) -> Optional[str]:
-    """The browser host behind a GitHub API URL: api.github.com, or an Enterprise host's /api/v3."""
+    """The browser host behind a GitHub API URL: api.github.com, api.<tenant>.ghe.com, or an Enterprise host's /api/v3."""
     base = web_base(api_url)
     if base is None:
         return None
     parts = urlsplit(base)
     if parts.hostname == "api.github.com":
         return urlunsplit((parts.scheme, "github.com", "", "", ""))
+    if parts.hostname.startswith("api.") and parts.hostname.endswith(".ghe.com") and parts.hostname.count(".") >= 3:
+        return urlunsplit((parts.scheme, parts.netloc[len("api."):], "", "", ""))
     path = parts.path[:-len("/api/v3")] if parts.path.endswith("/api/v3") else parts.path
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
