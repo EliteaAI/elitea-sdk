@@ -998,6 +998,32 @@ def get_tools(tools_list: list, elitea_client=None, llm=None, memory_store: Base
                         **settings).get_tools()
                 except McpAuthorizationRequired as auth_err:
                     _annotate_mcp_auth_error(auth_err, tool)
+                    fallback_token = token_data.get('fallback_access_token') if isinstance(token_data, dict) else None
+                    if fallback_token and not has_configured_authorization(headers):
+                        # The browser token was rejected; the team's saved login (added by Main) gets one try
+                        fallback_settings = dict(settings)
+                        fallback_headers, fallback_injected = merge_oauth_authorization(
+                            as_header_mapping(headers), fallback_token
+                        )
+                        fallback_settings.pop("session_id", None)
+                        fallback_settings["headers"] = fallback_headers
+                        fallback_settings["_oauth_token_injected"] = fallback_injected
+                        try:
+                            mcp_tools = McpToolkit.get_toolkit(
+                                toolkit_name=resolved_toolkit_name,
+                                toolkit_type=resolved_toolkit_type,
+                                client=elitea_client,
+                                **fallback_settings,
+                            ).get_tools()
+                        except McpAuthorizationRequired as fallback_auth_err:
+                            auth_err = fallback_auth_err
+                            _annotate_mcp_auth_error(auth_err, tool)
+                        else:
+                            logger.info("[MCP Auth] Browser token rejected; used the saved login for toolkit '%s'",
+                                        resolved_toolkit_name)
+                            _inject_display_metadata(tool, mcp_tools)
+                            tools.extend(mcp_tools)
+                            continue
                     family_token = (
                         None
                         if has_configured_authorization(headers)
