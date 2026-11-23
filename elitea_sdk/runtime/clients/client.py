@@ -1389,7 +1389,11 @@ class EliteAClient:
     def unsecret(self, secret_name: str):
         from elitea_sdk.runtime.utils.logging import mask_sensitive_value
         url = f"{self.secrets_url}/{secret_name}"
-        data = self._request('get', url, headers=self.headers, verify=False).json()
+        response = self._request('get', url, headers=self.headers, verify=False)
+        data = response.json()
+        if data is None:
+            logger.warning("Secret '%s' not available from project vault (HTTP %s)", secret_name, response.status_code)
+            return None
         logger.debug(f"Unsecret response for '{secret_name}': value={mask_sensitive_value(data.get('value', ''))}")
         return data.get('value', None)
 
