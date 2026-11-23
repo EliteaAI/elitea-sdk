@@ -23,12 +23,18 @@ def make_response(status_code, body):
 def test_missing_secret_is_none_and_named_in_the_log(caplog):
     with patch("requests.Session.request", return_value=make_response(404, b"null\n")):
         assert make_client().unsecret("mcp_token") is None
-    assert "Secret 'mcp_token' not found in project vault" in caplog.text
+    assert "Secret 'mcp_token' not available from project vault (HTTP 404)" in caplog.text
 
 
 def test_existing_secret_returns_value():
     with patch("requests.Session.request", return_value=make_response(200, b'{"value": "postgresql://x"}')):
         assert make_client().unsecret("pgvector_project_connstr") == "postgresql://x"
+
+
+def test_a_default_key_the_api_withholds_is_none():
+    # ignore_default_secret_api answers a default key such as pgvector_project_connstr with `None, 400`
+    with patch("requests.Session.request", return_value=make_response(400, b"null\n")):
+        assert make_client().unsecret("pgvector_project_connstr") is None
 
 
 def test_a_route_level_404_still_raises():
