@@ -1039,12 +1039,6 @@ class EliteAClient:
             routing_reasoning_fields = model_config['routing_reasoning_fields']
             if not isinstance(routing_reasoning_fields, dict) or routing_reasoning_fields != expected_fields:
                 raise ValueError('Auto reasoning fields differ from its measured contract')
-        # Models needing the reasoning param nested in the request body instead of a
-        # top-level reasoning_effort string (e.g. Bedrock-hosted OpenAI models).
-        reasoning_in_body = any(
-            tag in model_name for tag in worker_config.get("reasoning_in_body_for", [])
-        )
-
         # Default means no Elitea-defined custom output cap. Optional provider
         # fields are omitted; required APIs resolve the configured model maximum.
         llm_max_tokens = model_config.get("max_tokens", None)
@@ -1148,17 +1142,12 @@ class EliteAClient:
                         "effort": reasoning_effort.lower(),
                         "summary": "auto"
                     }
-                elif reasoning_in_body:
-                    # Bedrock-hosted OpenAI models reject both reasoning_effort and the
-                    # Anthropic `thinking` that LiteLLM rewrites it into; they want a
-                    # nested reasoning object, which extra_body passes through verbatim.
-                    target_kwargs["extra_body"] = {
-                        **(target_kwargs.get("extra_body") or {}),
-                        "reasoning": {"effort": reasoning_effort.lower()},
-                    }
                 else:
                     # Chat Completions API path (default): use top-level reasoning_effort
-                    # string — widely supported and does NOT force the Responses API
+                    # string — widely supported and does NOT force the Responses API.
+                    # Bedrock-hosted OpenAI models need it too: since LiteLLM 1.108 they
+                    # reject a nested `reasoning` object. The old `reasoning_in_body_for`
+                    # worker setting is ignored for that reason.
                     target_kwargs["reasoning_effort"] = reasoning_effort.lower()
 
             if use_responses_api:
