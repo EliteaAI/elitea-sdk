@@ -18,6 +18,7 @@ from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 
@@ -109,13 +110,33 @@ class BuilderMiddleware(Middleware):
         self.core_prompt = core_prompt or ""
         self.interactive = interactive
         self._apply_tool: Optional[BaseTool] = None
-        self._seen_playbooks: set = set()
 
     def get_tools(self) -> List[BaseTool]:
         return []
 
     def get_system_prompt(self) -> str:
         return self.core_prompt
+
+    def transform_messages_for_model(self, messages: list, config: dict) -> Optional[list]:
+        """The platform attaches the entity playbook to every find / read. Keep it only in its first result in the
+        conversation, so the model reads each playbook once however often the middleware is rebuilt."""
+        seen = set()
+        transformed = []
+        changed = False
+        for message in messages or []:
+            parsed = None
+            if isinstance(message, ToolMessage) and builder_action(getattr(message, "name", "")):
+                parsed = _parse(message.content)
+            playbook = parsed.get("playbook") if parsed else None
+            if playbook and playbook in seen:
+                stripped = {k: v for k, v in parsed.items() if k != "playbook"}
+                transformed.append(message.model_copy(update={"content": json.dumps(stripped)}))
+                changed = True
+                continue
+            if playbook:
+                seen.add(playbook)
+            transformed.append(message)
+        return transformed if changed else None
 
     def bind_tools(self, tools: List[BaseTool]) -> None:
         """Remember builder_apply so the Changes card can apply what the user approved."""
@@ -163,14 +184,6 @@ class BuilderMiddleware(Middleware):
         parsed = _parse(result)
         if not parsed:
             return result
-        playbook = parsed.get("playbook")
-        if playbook:
-            if playbook in self._seen_playbooks:
-                parsed = {k: v for k, v in parsed.items() if k != "playbook"}
-                stripped = json.dumps(parsed)
-                result = (stripped, *result[1:]) if isinstance(result, tuple) else stripped
-            else:
-                self._seen_playbooks.add(playbook)
         status = parsed.get("status")
         if status == "needs_input":
             return self._ask(parsed, result, tool_name, tool_args)

@@ -202,25 +202,39 @@ def test_resume_reissues_propose_and_applies_the_confirmed_changeset(middleware,
     assert [c[0] for c in calls] == ['builder_propose', 'builder_propose', 'builder_apply']
 
 
-def test_a_playbook_reaches_the_model_once_per_conversation(middleware, interrupts):
-    """The platform attaches the entity playbook to every find / read; the middleware passes it once (review fix)."""
-    calls = []
-    responses = {'builder_read': lambda a: {'status': 'ok', 'state': {}, 'playbook': '<playbook entity="agent">x'}}
-    read = middleware.wrap_tool(mcp_tool('post_elitea_core_builder_read', {
-        'post_elitea_core_builder_read': responses['builder_read']}, calls))
-    first = json.loads(read.invoke({'type': 'agent', 'id': 1}))
-    second = json.loads(read.invoke({'type': 'agent', 'id': 2}))
-    assert 'playbook' in first
-    assert 'playbook' not in second
+def _read_result(call_id, playbook='<playbook entity="agent">x', name='post_elitea_core_builder_read'):
+    from langchain_core.messages import ToolMessage
+    body = {'status': 'ok', 'state': {}}
+    if playbook:
+        body['playbook'] = playbook
+    return ToolMessage(content=json.dumps(body), tool_call_id=call_id, name=name)
 
 
+def test_a_playbook_reaches_the_model_once_per_conversation():
+    """The platform attaches the playbook to every find / read; the model sees it only in the first one (review fix).
+    The dedupe reads the conversation's messages, so a middleware rebuilt each turn still sends it once."""
+    history = [_read_result('c1'), _read_result('c2'), _read_result('c3', playbook='<playbook entity="toolkit">y')]
+    for _ in range(2):
+        middleware = builder_mw.BuilderMiddleware(core_prompt='x')
+        out = middleware.transform_messages_for_model(history, {})
+        bodies = [json.loads(m.content) for m in out]
+        assert 'playbook' in bodies[0]
+        assert 'playbook' not in bodies[1]
+        assert bodies[2]['playbook'] == '<playbook entity="toolkit">y'
+    assert 'playbook' in json.loads(history[1].content)
 
-def test_a_repeated_playbook_keeps_a_content_and_artifact_result(middleware):
-    """A (content, artifact) tool result stays a two-tuple when the repeated playbook is stripped (review fix)."""
-    first = middleware._handle((json.dumps({'status': 'ok', 'playbook': 'p'}), {'a': 1}), 'builder_read', {})
-    second = middleware._handle((json.dumps({'status': 'ok', 'playbook': 'p'}), {'a': 2}), 'builder_read', {})
-    assert isinstance(first, tuple) and 'playbook' in json.loads(first[0])
-    assert isinstance(second, tuple) and second[1] == {'a': 2} and 'playbook' not in json.loads(second[0])
+
+def test_playbook_dedupe_leaves_other_messages_alone():
+    middleware = builder_mw.BuilderMiddleware(core_prompt='x')
+    other = _read_result('c2', name='search')
+    assert middleware.transform_messages_for_model([_read_result('c1'), other], {}) is None
+
+
+def test_a_wrapped_builder_tool_keeps_a_content_and_artifact_result(middleware):
+    """A (content, artifact) tool result passes through unchanged when it needs no card (review fix)."""
+    result = (json.dumps({'status': 'ok', 'playbook': 'p'}), {'a': 1})
+    assert middleware._handle(result, 'builder_read', {}) == result
+
 
 @pytest.mark.parametrize('builder, auto, interactive', [
     ({'core_prompt': 'x'}, False, True),
