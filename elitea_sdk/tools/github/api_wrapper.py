@@ -1,5 +1,6 @@
 import logging
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import model_validator, Field, SecretStr
 
@@ -12,6 +13,7 @@ from .schemas import (
 from ..code_indexer_toolkit import CodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils import normalize_base_url
+from ..utils.source_info import encode_path, encode_ref, web_base, web_url
 from ..utils.tool_groups import with_tool_groups
 
 logger = logging.getLogger(__name__)
@@ -21,10 +23,25 @@ logger = logging.getLogger(__name__)
 # Create schema models for the new indexing functionality
 
 
+def github_web_base(api_url: Optional[str]) -> Optional[str]:
+    """The browser host behind a GitHub API URL: api.github.com, api.<tenant>.ghe.com, or an Enterprise host's /api/v3."""
+    base = web_base(api_url)
+    if base is None:
+        return None
+    parts = urlsplit(base)
+    if parts.hostname == "api.github.com":
+        return urlunsplit((parts.scheme, "github.com", "", "", ""))
+    if parts.hostname.startswith("api.") and parts.hostname.endswith(".ghe.com") and parts.hostname.count(".") >= 3:
+        return urlunsplit((parts.scheme, parts.netloc[len("api."):], "", "", ""))
+    path = parts.path[:-len("/api/v3")] if parts.path.endswith("/api/v3") else parts.path
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
 class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
     """
     Wrapper for GitHub API that integrates both REST and GraphQL functionality.
     """
+    index_source_type = "github"
     # Authentication config
     github_access_token: Optional[SecretStr] = None
     github_username: Optional[SecretStr] = None
@@ -101,6 +118,7 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
 
         # Update values
         values["github_repository"] = github_repository
+        values["github_base_url"] = github_base_url
         values["active_branch"] = repo_config.active_branch
         values["github_base_branch"] = repo_config.github_base_branch
 
@@ -154,6 +172,11 @@ class EliteAGitHubAPIWrapper(CodeIndexerToolkit):
 
     def _index_target_metadata(self, target: Dict[str, str]) -> Dict[str, str]:
         return {"repository": target["repo_name"]} if target.get("repo_name") else {}
+
+    def _code_web_url(self, repository: str, branch: str, path: str = "") -> Optional[str]:
+        view = "blob" if path else "tree"
+        return web_url(github_web_base(self.github_base_url), encode_path(repository), view,
+                       encode_ref(branch), encode_path(path) if path else "")
 
     def _index_branch(self, branch: Optional[str], target: Dict[str, str]) -> Optional[str]:
         # The toolkit's branches belong to its own repository; another one is read on its default branch.

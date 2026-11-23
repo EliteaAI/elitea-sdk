@@ -55,6 +55,7 @@ def _handle_figma_error(e: ToolException) -> str:
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import _load_content_from_bytes_with_prompt
+from ..utils.source_info import join_location
 from .figma_client import EliteAFigmaPy
 from .toon_tools import (
     TOONSerializer,
@@ -338,6 +339,7 @@ class ArgsSchema(Enum):
 
 
 class FigmaApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "figma"
     index_item_labels = ('file', 'files')
     index_dependent_labels = ('image', 'images')
     # Threshold for subframe extraction: frames larger than this will have their
@@ -441,6 +443,15 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         ]
         return base_keys + figma_keys
 
+    def _parse_index_entry(self, entry: str) -> Tuple[Optional[str], Optional[List[str]]]:
+        """The file key and URL-pinned node ids of one urls_or_file_keys entry: a Figma URL or a bare key."""
+        if entry.startswith("http://") or entry.startswith("https://"):
+            return self._parse_figma_url(entry)
+        return entry, None
+
+    def _chunk_source_location(self, metadata: Dict) -> Optional[str]:
+        return join_location(metadata.get('file_key'), metadata.get('page_name'), metadata.get('node_name'))
+
     def _base_loader(
         self,
         urls_or_file_keys: Optional[str] = None,
@@ -496,18 +507,11 @@ class FigmaApiWrapper(NonCodeIndexerToolkit):
         if isinstance(number_of_threads, int) and 1 <= number_of_threads <= 5:
             metadata_threads_override = number_of_threads
 
-        for entry in entries:
-            per_file_node_ids_include: Optional[List[str]] = None
-            file_key: Optional[str] = None
+        parsed_entries = [self._parse_index_entry(entry) for entry in entries]
+        self._record_index_source(
+            location=", ".join(file_key for file_key, _ in parsed_entries if file_key) or None)
 
-            # Heuristic: treat as URL if it has a scheme and figma.com host
-            if entry.startswith("http://") or entry.startswith("https://"):
-                file_key, node_ids_from_url = self._parse_figma_url(entry)
-                per_file_node_ids_include = node_ids_from_url
-            else:
-                # Assume this is a raw file key
-                file_key = entry
-
+        for file_key, per_file_node_ids_include in parsed_entries:
             if not file_key:
                 continue
 

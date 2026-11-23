@@ -26,6 +26,7 @@ from ..utils.serialization import serialize_tool_result
 from ...configurations.utils import _resolve_api_version
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import encode_ref, join_location, web_base, web_host, web_url
 
 logger = logging.getLogger(__name__)
 
@@ -721,6 +722,7 @@ def process_search_response(jira_url, response, payload_params: Dict[str, Any] =
 
 
 class JiraApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "jira"
     index_item_labels = ('issue', 'issues')
     base_url: str
     api_version: Optional[str] = "auto"
@@ -2185,6 +2187,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error processing comments with images: {stacktrace}")
             return f"Error processing comments with images: {str(e)}"
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('issue_key')
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        issue_key = metadata.get('issue_key')
+        return web_url(web_base(self.base_url), "browse", encode_ref(issue_key)) if issue_key else None
+
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         """
         Base loader for Jira issues, used to load issues as documents.
@@ -2194,6 +2203,8 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
         # Extract parameters from kwargs
         jql = kwargs.get('jql')
+        self._record_index_source(location=join_location(web_host(self.base_url), f"JQL: {jql}" if jql else None),
+                                  url=web_base(self.base_url))
         fields_to_extract = kwargs.get('fields_to_extract')
         fields_to_index = kwargs.get('fields_to_index')
         max_total_issues = kwargs.get('max_total_issues', 1000)

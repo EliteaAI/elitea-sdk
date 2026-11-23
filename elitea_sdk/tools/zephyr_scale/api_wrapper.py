@@ -13,6 +13,7 @@ from langchain_core.documents import Document
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker
+from ..utils.source_info import join_location, web_host
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
 
@@ -265,6 +266,7 @@ ZephyrUpdateTestSteps = create_model(
 
 
 class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "zephyr_scale"
     index_item_labels = ('test case', 'test cases')
     # url for a Zephyr server
     base_url: Optional[str] = ""
@@ -1242,8 +1244,15 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             """)),
         }
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        if metadata.get('type') == "FOLDER":
+            return f"folder {metadata['name']}" if metadata.get('name') else None
+        return metadata.get('key')
+
     def _base_loader(self, project_key: str, jql: str, **kwargs) -> Generator[Document, None, None]:
         self._chunking_tool = kwargs.get('chunking_tool', None)
+        self._record_index_source(location=join_location(
+            web_host(self.base_url), project_key, f"JQL: {jql}" if jql else None))
         for test_case_doc in self._get_test_cases_docs(project_key, jql):
             yield test_case_doc
         for folder_doc in self._get_folders_docs(project_key):

@@ -16,6 +16,7 @@ from ..utils.file_metadata import guard_text_read, guard_nontext_read, capped_re
 from .utils import expand_inclusive_upper_bound, get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_WITH_PATH
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import encode_path, encode_ref, web_base, web_url
 
 AppendFileModel = create_model(
     "AppendFileModel",
@@ -167,6 +168,7 @@ GetMergeRequestModel = create_model(
 )
 
 class GitLabAPIWrapper(CodeIndexerToolkit):
+    index_source_type = "gitlab"
     url: str
     repository: str
     private_token: SecretStr
@@ -213,6 +215,15 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
     def _sanitize_url(url: str) -> str:
         """Remove trailing slash from URL if present."""
         return url.rstrip('/') if url else url
+
+    def _index_target_metadata(self, target: Dict[str, str]) -> Dict[str, str]:
+        repository = getattr(self.repo_instance, "path_with_namespace", None) or self.repository
+        return {"repository": repository} if repository else {}
+
+    def _code_web_url(self, repository: str, branch: str, path: str = "") -> Optional[str]:
+        view = "blob" if path else "tree"
+        return web_url(web_base(self.url), encode_path(repository), "-", view,
+                       encode_ref(branch), encode_path(path) if path else "")
 
     @model_validator(mode='before')
     @classmethod

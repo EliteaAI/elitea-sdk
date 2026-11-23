@@ -30,6 +30,7 @@ from msrest.authentication import BasicAuthentication
 from pydantic import Field, PrivateAttr, create_model, model_validator, SecretStr
 
 from ...elitea_base import BaseCodeToolApiWrapper
+from ...utils.source_info import encode_ref, web_base, web_url
 from ..utils import (
     AdoProjectScope,
     with_project_argument,
@@ -499,6 +500,7 @@ class ArgsSchema(Enum):
 
 
 class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
+    index_source_type = "ado_repos"
     # ADO Configuration fields (from AdoConfiguration)
     organization_url: Optional[str] = None
     project: Optional[str] = None
@@ -723,6 +725,17 @@ class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
                     self.base_branch,
                     self.active_branch,
                 ) = previous
+
+    def _index_target_metadata(self, target: Dict[str, str]) -> Dict[str, str]:
+        repository = self.searchable_repository_name or self.repository_id
+        return {"repository": f"{self._project()}/{repository}"} if repository else {}
+
+    def _code_web_url(self, repository: str, branch: str, path: str = "") -> Optional[str]:
+        project, _, repo = repository.partition("/")
+        if not (project and repo):
+            return None
+        query = {"path": f"/{path.lstrip('/')}", "version": f"GB{branch}"} if path else {"version": f"GB{branch}"}
+        return web_url(web_base(self.organization_url), encode_ref(project), "_git", encode_ref(repo), query=query)
 
     def _base_loader(self, *args, project=None, repository_id=None, **kwargs):
         # run() already resolved both; they only ride along to be recorded with the index

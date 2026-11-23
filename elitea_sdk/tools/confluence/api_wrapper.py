@@ -33,6 +33,7 @@ from ...runtime.langchain.utils import extract_text_from_completion
 from ...configurations.utils import _resolve_confluence_api_version
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import reuse_url, web_base, web_host
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +314,7 @@ class _StyledView:
 
 
 class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
+    index_source_type = "confluence"
     index_item_labels = ('page', 'pages')
     # Changed from PrivateAttr to Optional field with exclude=True
     client: Optional[Any] = Field(default=None, exclude=True)
@@ -1335,6 +1337,7 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
             raise ToolException(
                 "Specify at least one of Space Key, Page IDs, Label or CQL to index Confluence content."
             )
+        self._record_index_source(location=self._index_scope(index_space, kwargs), url=web_base(self.base_url))
         base_params = {
             'url': self.base_url,
             'space_key': index_space,
@@ -1417,6 +1420,25 @@ class ConfluenceAPIWrapper(NonCodeIndexerToolkit):
 
     def _remove_metadata_keys(self) -> List[str]:
         return super()._remove_metadata_keys() + [BLANK_PAGE_KEY]
+
+    def _index_scope(self, index_space: Optional[str], index_kwargs: dict) -> str:
+        selectors = [
+            f"space {index_space}" if index_space else None,
+            "page ids" if index_kwargs.get('page_ids') else None,
+            f"label {index_kwargs['label']}" if index_kwargs.get('label') else None,
+            "CQL" if index_kwargs.get('cql') else None,
+        ]
+        return " / ".join(part for part in (web_host(self.base_url), ", ".join(filter(None, selectors))) if part)
+
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        if metadata.get('download_url'):
+            return " / ".join(str(part) for part in (metadata.get('parent_id'), metadata.get('name')) if part) or None
+        return metadata.get('title')
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        if metadata.get('download_url'):
+            return reuse_url(metadata['download_url'], self.base_url)
+        return reuse_url(metadata.get('source'), self.base_url, kept_query=('pageId',))
 
     def _clean_metadata(self, documents: Generator[Document, None, None]):
         return super()._clean_metadata(self._with_page_source(documents))

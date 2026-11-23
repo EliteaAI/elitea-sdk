@@ -13,6 +13,7 @@ from python_graphql_client import GraphqlClient
 
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils import get_file_bytes_from_artifact, detect_mime_type
+from ..utils.source_info import join_location, web_host
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
@@ -136,6 +137,7 @@ def _parse_tests(test_results) -> List[Any]:
 
 
 class XrayApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "xray_cloud"
     index_item_labels = ('test case', 'test cases')
     _default_base_url: str = 'https://xray.cloud.getxray.app'
     base_url: str = ""
@@ -306,6 +308,9 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
         except Exception as e:
             raise ToolException(f"Unable to execute custom graphql due to error:\n{str(e)}")
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('key')
+
     def _base_loader(
             self, jql: Optional[str] = None, graphql: Optional[str] = None, include_attachments: Optional[bool] = False,
             skip_attachment_extensions: Optional[List[str]] = None, **kwargs: Any
@@ -332,6 +337,8 @@ class XrayApiWrapper(NonCodeIndexerToolkit):
 
         if jql and graphql:
             raise ToolException("Please provide either 'jql' or 'graphql', not both.")
+        self._record_index_source(
+            location=join_location(web_host(self.base_url), f"JQL: {jql}" if jql else "GraphQL"))
 
         try:
             if jql:
