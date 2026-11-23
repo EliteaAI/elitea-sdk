@@ -386,7 +386,7 @@ def test_second_run_now_prints_409_and_active_run_id(env, capsys):
 
 def test_other_errors_reach_the_caller(env, capsys):
     api = FakeApi()
-    api.answer("run_schedule", (404, {"code": "not_found", "error": "Schedule not found"}))
+    api.answer("run_schedule", (404, {"code": "not_found", "error": "The requested item could not be found"}))
     with pytest.raises(ApiDetailsRequestError) as error:
         run(api, setup_block(), errors_block())
     assert error.value.status_code == 404
