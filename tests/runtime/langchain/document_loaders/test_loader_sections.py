@@ -268,6 +268,24 @@ class TestPdfSectionBounds:
         assert not any(key in docs[0].metadata for key in SECTION_KEYS)
         assert _sections_of(docs)[1] == ("1", "Scope")
 
+    @pytest.mark.parametrize("lead", ["  ", "\n", " \n  "])
+    def test_cut_page_that_opens_with_an_indented_heading_gets_that_heading(self, monkeypatch, tmp_path, lead):
+        pages = [f"1 Scope\n{BODY}", f"{lead}2 Methods\nshort text\n3 Results\n{BODY}"]
+
+        class FakePages:
+            def __init__(self, **_kwargs):
+                pass
+
+            def load(self):
+                return [Document(page_content=text, metadata={"page": i, "source": "fake.pdf"})
+                        for i, text in enumerate(pages)]
+
+        monkeypatch.setattr("elitea_sdk.runtime.langchain.document_loaders.EliteAPDFLoader.PyPDFium2Loader",
+                            FakePages)
+        docs = EliteAPDFLoader(file_path=str(tmp_path / "missing.pdf")).load()
+        assert [d.page_content.strip().splitlines()[0] for d in docs] == ["1 Scope", "2 Methods", "3 Results"]
+        assert _sections_of(docs) == [("1", "Scope"), ("2", "Methods"), ("3", "Results")]
+
 
 class TestPageRange:
     def test_range_of_text_over_pages_five_and_six(self):

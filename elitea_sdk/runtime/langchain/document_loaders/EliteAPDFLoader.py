@@ -29,6 +29,7 @@ class _Part:
     opens: bool = False              # starts with a top-level heading (only the first part of a page can)
     tail: Optional['_Part'] = None   # the first part of the next page, joined behind this one
     absorbed: bool = False           # joined behind the part before it
+    lead: int = 0                    # offset of the opening heading when blanks come before it on a cut page
 
     @property
     def page(self) -> int:
@@ -54,6 +55,9 @@ def _cut_pages(docs, sections: SectionIndex) -> list[list[_Part]]:
         bounds = [0, *cuts, len(text)]
         parts = [_Part(doc, low, text[low:high], bool(cuts)) for low, high in pairwise(bounds)]
         parts[0].opens = len(cuts) < len(starts)
+        if cuts and parts[0].opens:
+            # The slack of section_at is off on a cut page, so the first chunk asks at the heading itself.
+            parts[0].lead = starts[0]
         pages.append(parts)
     return pages
 
@@ -272,7 +276,7 @@ class EliteAPDFLoader:
                 first, offset = part.locate(start)
                 last, _ = part.locate(max(start, cursor - 1))
                 metadata = {**first.doc.metadata, 'chunk_id': len(chunks), **page_metadata(first.page, last.page),
-                            **sections.section_at(first.page, offset, top_slack=not first.cut)}
+                            **sections.section_at(first.page, max(offset, first.lead), top_slack=not first.cut)}
                 chunks.append(Document(page_content=chunk_text, metadata=metadata))
         return chunks
 
