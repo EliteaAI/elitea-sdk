@@ -104,6 +104,9 @@ def _is_deno_available() -> bool:
         return result.returncode == 0
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
         return False
+    except OSError as e:
+        logger.warning("Deno probe failed: %s", e)
+        return False
 
 
 def _setup_pyodide_cache_env() -> None:
