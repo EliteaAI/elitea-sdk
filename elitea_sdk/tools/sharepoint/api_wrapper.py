@@ -1233,7 +1233,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     #  Change check and orphan removal                                     #
     # ------------------------------------------------------------------ #
 
-    def _index_scope(self, index_configuration):
+    def _run_scope_keys(self, index_configuration):
         scope = {}
         for key in INDEX_SCOPE_KEYS:
             value = (index_configuration or {}).get(key)

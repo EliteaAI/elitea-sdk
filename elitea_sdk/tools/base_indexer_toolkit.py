@@ -3105,10 +3105,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """True for a base row that the source listing does not cover; the check leaves it out."""
         return False
 
-    def _index_scope(self, index_configuration: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _run_scope_keys(self, index_configuration: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """The keys of an index configuration that decide which source items a run covers.
 
-        None means the toolkit does not track a scope.
+        None means the toolkit does not track a scope. The name differs from `_index_scope`
+        on purpose: the Confluence wrapper already defines that one with another signature.
         """
         return None
 
@@ -3163,7 +3164,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _add_scope_blocker(self, listing: index_change_check.SourceListing, configuration: Dict[str, Any],
                            metadata: Dict[str, Any]):
         """Name the scope cause when the next full run cannot confirm which source items are gone."""
-        current = self._index_scope(configuration)
+        current = self._run_scope_keys(configuration)
         if current is None:
             return
         stored = self._stored_last_run_scope(metadata)
@@ -3510,7 +3511,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         if run is not None:
             run.meta_existed = bool(index_meta)
             run.last_run_scope = self._stored_last_run_scope((index_meta or {}).get("metadata") or {})
-            run.run_scope = self._index_scope(index_configuration)
+            run.run_scope = self._run_scope_keys(index_configuration)
         if not index_meta:
             self._log_tool_event(
                 f"There is no existing index_meta for collection '{index_name}'. Initializing it.",

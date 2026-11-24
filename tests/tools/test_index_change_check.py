@@ -306,7 +306,7 @@ class TestCheckTool:
 
     @pytest.fixture
     def scoped_toolkit(self, indexed_toolkit, monkeypatch):
-        monkeypatch.setattr(_Indexed, "_index_scope", lambda self, cfg: {"path": cfg.get("path")})
+        monkeypatch.setattr(_Indexed, "_run_scope_keys", lambda self, cfg: {"path": cfg.get("path")})
         indexed_toolkit.listing_items = [item("a", marker="2")]
         indexed_toolkit.stored_rows = {"a": row("a", "1")}
         return indexed_toolkit

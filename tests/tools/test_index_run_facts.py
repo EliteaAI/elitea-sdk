@@ -46,7 +46,7 @@ class ListingToolkit(StagingToolkit):
     def _list_source_items(self, index_configuration):
         return check.SourceListing(items=[])
 
-    def _index_scope(self, index_configuration):
+    def _run_scope_keys(self, index_configuration):
         return {"path": index_configuration.get("path")}
 
 
@@ -108,6 +108,12 @@ class TestIndexDataRecordsRunFacts:
 
         assert calls[-1]["unindexed_items"] is None
         assert calls[-1]["last_run_scope"] is None
+
+
+def test_a_toolkit_with_its_own_index_scope_helper_still_gets_the_base_scope_hook():
+    from elitea_sdk.tools.confluence.api_wrapper import ConfluenceAPIWrapper
+
+    assert ConfluenceAPIWrapper.model_construct()._run_scope_keys({"space": "A"}) is None
 
 
 class TestSkippedItemsCap:

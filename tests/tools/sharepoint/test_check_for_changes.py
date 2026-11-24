@@ -208,7 +208,7 @@ class TestOrphanRemovalGates:
 
     def run_loader(self, files, gaps=(), run=None, **kwargs):
         toolkit = toolkit_with(Backend(files, gaps=gaps))
-        scope = toolkit._index_scope(kwargs)
+        scope = toolkit._run_scope_keys(kwargs)
         toolkit._index_run = run or run_state(meta_existed=False, run_scope=scope)
         docs = list(toolkit._base_loader(limit_files=kwargs.pop("limit_files", 50), **kwargs))
         return toolkit, docs
@@ -221,7 +221,7 @@ class TestOrphanRemovalGates:
 
     def test_the_same_scope_as_the_last_run_attests(self):
         toolkit = toolkit_with(Backend([listed_file()]))
-        scope = toolkit._index_scope({"path": "Lib"})
+        scope = toolkit._run_scope_keys({"path": "Lib"})
         run = run_state(last_scope=scope, run_scope=scope)
 
         toolkit, _ = self.run_loader([listed_file()], run=run, path="Lib")
@@ -230,15 +230,15 @@ class TestOrphanRemovalGates:
 
     def test_a_narrower_scope_than_the_last_run_does_not_attest(self):
         toolkit = toolkit_with(Backend())
-        wide = toolkit._index_scope({"path": "Lib"})
-        narrow = toolkit._index_scope({"path": "Lib/sub"})
+        wide = toolkit._run_scope_keys({"path": "Lib"})
+        narrow = toolkit._run_scope_keys({"path": "Lib/sub"})
 
         toolkit, _ = self.run_loader([listed_file()], run=run_state(last_scope=wide, run_scope=narrow), path="Lib/sub")
 
         assert toolkit._index_run.loader_attested is False
 
     def test_a_row_without_a_stored_scope_does_not_attest_once(self):
-        scope = toolkit_with(Backend())._index_scope({})
+        scope = toolkit_with(Backend())._run_scope_keys({})
 
         toolkit, _ = self.run_loader([listed_file()], run=run_state(last_scope=None, run_scope=scope))
 
@@ -258,7 +258,7 @@ class TestOrphanRemovalGates:
         toolkit = toolkit_with(Backend([listed_file()]))
         toolkit._onenote_base_loader = lambda cfg: iter(())
 
-        scope = toolkit._index_scope({"include_onenote": True})
+        scope = toolkit._run_scope_keys({"include_onenote": True})
         toolkit._index_run = run_state(meta_existed=False, run_scope=scope)
         list(toolkit._base_loader(limit_files=50, include_onenote=True))
 
@@ -272,9 +272,9 @@ class TestOrphanRemovalGates:
     def test_scope_ignores_list_order_and_empty_values(self):
         toolkit = toolkit_with(Backend())
 
-        assert toolkit._index_scope({"include_extensions": ["pdf", "docx"], "path": ""}) == \
-            toolkit._index_scope({"include_extensions": ["docx", "pdf"], "path": None})
-        assert toolkit._index_scope({"path": "a"}) != toolkit._index_scope({"path": "b"})
+        assert toolkit._run_scope_keys({"include_extensions": ["pdf", "docx"], "path": ""}) == \
+            toolkit._run_scope_keys({"include_extensions": ["docx", "pdf"], "path": None})
+        assert toolkit._run_scope_keys({"path": "a"}) != toolkit._run_scope_keys({"path": "b"})
 
 
 class TestRunScopeLifecycle:
