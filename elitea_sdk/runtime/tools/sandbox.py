@@ -306,6 +306,7 @@ def local_sandbox_permissions() -> dict:
     nothing on the host writable, no module fetched, no subprocesses, no FFI. Network stays each caller's choice."""
     sandbox_base = os.environ.get("SANDBOX_BASE", os.path.expanduser('~/.cache/pyodide'))
     return {
+        # Widening this means revisiting _PASSTHROUGH_ENV in langchain/pyodide_sandbox.py (the child's real environment).
         'allow_env': ["SANDBOX_BASE"],
         'allow_read': [os.path.join(sandbox_base, "pyodide")],
         'allow_write': False,
