@@ -37,7 +37,10 @@ def fake_deno(tmp_path, monkeypatch):
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{script.parent}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SANDBOX_BASE", str(tmp_path))
+    for key in ("HTTP_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "DENO_TLS_CA_STORE", "SSL_CERT_FILE"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:3128")
+    monkeypatch.setenv("DENO_CERT", "/etc/corp-ca.pem")
     for key, value in SECRETS.items():
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("SANDBOX_SNAPSHOT_PATH", raising=False)
@@ -50,9 +53,10 @@ def _assert_scoped(dump):
         assert key not in env, f"{key} leaked into the sandbox process"
     assert not set(SECRETS.values()) & set(env.values())
     assert env["SANDBOX_BASE"] and env["HTTPS_PROXY"] == "http://proxy.local:3128"
+    assert env["DENO_CERT"] == "/etc/corp-ca.pem"
     assert env["DENO_DIR"] == os.path.join(env["TMPDIR"], "deno_dir")
     # Python itself may inject a few process vars (e.g. LC_CTYPE); nothing else from the worker.
-    assert set(env) - {"PATH", "SANDBOX_BASE", "HTTPS_PROXY", "TMPDIR", "DENO_DIR", "LC_CTYPE"} == set()
+    assert set(env) - {"PATH", "SANDBOX_BASE", "HTTPS_PROXY", "DENO_CERT", "TMPDIR", "DENO_DIR", "LC_CTYPE"} == set()
 
 
 def _sandbox(cls):
@@ -79,7 +83,8 @@ def test_sync_execute_passes_only_allowlisted_env(fake_deno):
 
 
 def test_run_environment_omits_unset_passthrough_keys(monkeypatch, tmp_path):
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "SANDBOX_BASE"):
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "SANDBOX_BASE",
+                "DENO_CERT", "DENO_TLS_CA_STORE", "SSL_CERT_FILE"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("POSTGRES_PASSWORD", "pg-secret")
 

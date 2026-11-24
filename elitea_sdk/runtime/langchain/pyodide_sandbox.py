@@ -35,8 +35,11 @@ _BRIDGE_OUTPUT_KEEP_CHARS = 1024 * 1024
 _BRIDGE_STDERR_TAIL_BYTES = 64 * 1024
 
 
-# Proxies keep package installs working behind a corporate proxy; CA trust goes via --cert.
-_PASSTHROUGH_ENV = ("PATH", "SANDBOX_BASE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+# Proxy and CA-trust variables only (not secrets); keep in step with allow_env in tools/sandbox.py.
+_PASSTHROUGH_ENV = (
+    "PATH", "SANDBOX_BASE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "DENO_CERT", "DENO_TLS_CA_STORE", "SSL_CERT_FILE",
+)
 
 
 def get_default_pkg_name() -> str | None:
