@@ -287,6 +287,7 @@ class TestOrphanRemovalGates:
         toolkit = toolkit_with(Backend([listed_file()]))
 
         assert list(toolkit._base_loader(limit_files=50))
+        assert getattr(toolkit, '_index_run', None) is None
 
     def test_scope_ignores_list_order_and_empty_values(self):
         toolkit = toolkit_with(Backend())

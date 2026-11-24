@@ -165,3 +165,11 @@ class TestAuthorizationHelperPaging:
             self._helper().get_files_list(SITE, limit_files=1, on_listing_gap=gaps.append)
 
         assert len(gaps) == 1
+
+    def test_the_drives_and_page_requests_carry_a_timeout(self):
+        pages = [self._drives(), _response(200, {"value": [self._item()]})]
+        with patch(f"{AUTH_MODULE}.requests.get", side_effect=pages) as get:
+            self._helper().get_files_list(SITE)
+
+        assert get.call_count == 2
+        assert all(call.kwargs.get("timeout") == 60 for call in get.call_args_list)

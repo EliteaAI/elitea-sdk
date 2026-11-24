@@ -162,7 +162,7 @@ class SharepointAuthorizationHelper:
             access_token, site_id = self.generate_token_and_site_id(site_url)
             headers = {"Authorization": f"Bearer {access_token}"}
             drives_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
-            drives_response = send_with_retry(lambda: requests.get(drives_url, headers=headers))
+            drives_response = send_with_retry(lambda: requests.get(drives_url, headers=headers, timeout=60))
             drives = self._validate_response(drives_response, required_field="value", error_prefix="Drives request")
             result = []
             def _recurse_drive(drive_id, drive_path, parent_folder, limit_files):
@@ -176,7 +176,7 @@ class SharepointAuthorizationHelper:
                 files = []
                 next_link = url
                 while next_link:
-                    response = send_with_retry(lambda: requests.get(next_link, headers=headers))
+                    response = send_with_retry(lambda: requests.get(next_link, headers=headers, timeout=60))
                     if response.status_code != 200:
                         _report_gap("a folder page could not be read")
                         break
