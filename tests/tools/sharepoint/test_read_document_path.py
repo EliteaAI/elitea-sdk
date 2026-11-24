@@ -75,7 +75,7 @@ def _build_wrapper(content_status=200, probe_status=200, probe_kind="folder",
     # Pre-resolve the site id so _list_drives only needs the /drives GET.
     wrapper._SharepointGraphWrapper__site_id = "site-id"
 
-    def fake_get(url, params=None):
+    def fake_get(url, params=None, retry_throttled=False):
         if url.endswith("/drives"):
             return {"value": drives}
         if url.endswith("/drive"):

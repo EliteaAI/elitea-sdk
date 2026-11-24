@@ -224,10 +224,18 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             logging.warning("SharePoint: token refresh error: %s", type(e).__name__)  # never the request (secret, token)
             return False
 
-    def _get(self, url: str, params: Optional[dict] = None) -> dict:
-        resp = requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
+    def _get(self, url: str, params: Optional[dict] = None, retry_throttled: bool = False) -> dict:
+        # Only listings retry a throttled answer: a retry of other reads would slow a failing call for nothing.
+        def send() -> requests.Response:
+            return requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
+
+        if retry_throttled:
+            from .library_metadata import send_with_retry  # imported here: library_metadata imports this module
+            resp = send_with_retry(send)
+        else:
+            resp = send()
         if resp.status_code == 401 and self._try_refresh_token():
-            resp = requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
+            resp = send_with_retry(send) if retry_throttled else send()
         self._raise_with_body(resp)
         return resp.json()
 
@@ -313,6 +321,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         data = self._get(
             f"{_GRAPH_BASE}/sites/{self._resolve_site_id()}/drives",
             params={"$select": "id,name,webUrl"},
+            retry_throttled=True,
         )
         self.__drives_cache = data.get('value', [])
         logging.debug(
@@ -694,7 +703,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Optional[Callable[[str], None]] = None,
+                       on_listing_gap: Optional[Callable[[str], None]] = None):
         """
         Lists all files including files from subfolders across **all document
         libraries** on the site.
@@ -809,7 +819,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     _t_req = time.perf_counter()
                     data = self._get(
                         next_link,
-                        params=params if next_link == url else None)
+                        params=params if next_link == url else None,
+                        retry_throttled=True)
                     _page_num += 1
                     logging.debug(
                         "[SP-Graph][get_files_list] page %d fetched in %.3fs — "
@@ -846,6 +857,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         if len(result) >= limit_files:
                             break
                     next_link = data.get('@odata.nextLink')
+
+            if on_listing_gap and len(result) >= limit_files:
+                # The listing stopped at the cap, so the files after it were never seen.
+                on_listing_gap("the file limit was reached before the listing ended")
 
             _t_total = time.perf_counter() - _t_start
             _result_size = len(str(result))

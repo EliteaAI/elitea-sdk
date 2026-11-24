@@ -322,6 +322,39 @@ def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
     return min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS)
 
 
+def send_with_retry(send: Callable[[], requests.Response],
+                    sleep: Optional[Callable[[float], None]] = None) -> requests.Response:
+    """Call ``send`` until it answers with something other than a throttling status.
+
+    A timeout or a dropped connection is retried the same way. When the attempts
+    run out, a transient error is raised and a throttling answer is returned, so
+    the caller decides what a final 429 or 503 means.
+    """
+    sleep = sleep or time.sleep
+    attempt = 0
+    while True:
+        try:
+            resp = send()
+        except _TRANSIENT_ERRORS:
+            if attempt >= MAX_RETRIES:
+                raise
+            sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
+            attempt += 1
+            continue
+        if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+            delay = _retry_after_seconds(resp, attempt)
+            logger.info("[SP-library] Graph answered %s; retrying in %.1fs (attempt %d)",
+                        resp.status_code, delay, attempt + 1)
+            try:
+                resp.close()   # a streamed answer holds its connection until it is closed
+            except AttributeError:
+                pass
+            sleep(delay)
+            attempt += 1
+            continue
+        return resp
+
+
 class GraphListClient:
     """Read-only Graph calls for library mode: site, list catalogue, list items.
 
@@ -363,40 +396,31 @@ class GraphListClient:
         if not is_graph_url(url):
             raise LibraryMetadataError("Library mode only calls Microsoft Graph.")
         refreshed = False
-        attempt = 0
+        body_attempt = 0
         while True:
             try:
-                resp = self._session.get(
-                    url, params=params, timeout=REQUEST_TIMEOUT, allow_redirects=False, stream=True,
-                    headers={"Authorization": f"Bearer {self._get_token()}", "Accept": "application/json"})
+                resp = send_with_retry(
+                    lambda: self._session.get(
+                        url, params=params, timeout=REQUEST_TIMEOUT, allow_redirects=False, stream=True,
+                        headers={"Authorization": f"Bearer {self._get_token()}", "Accept": "application/json"}),
+                    self._sleep)
             except _TRANSIENT_ERRORS as exc:
-                if attempt >= MAX_RETRIES:
-                    raise LibraryMetadataError(
-                        f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
-                self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
-                attempt += 1
-                continue
+                raise LibraryMetadataError(
+                    f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
             try:
                 status = resp.status_code
                 if status == 401 and not refreshed and self._refresh and self._refresh():
                     refreshed = True
                     continue
-                if status in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                    delay = _retry_after_seconds(resp, attempt)
-                    logger.info("[SP-library] Graph answered %s; retrying in %.1fs (attempt %d)",
-                                status, delay, attempt + 1)
-                    self._sleep(delay)
-                    attempt += 1
-                    continue
                 self._raise_for_status(resp)
                 try:
                     body = self._read_body(resp)
                 except _TRANSIENT_ERRORS as exc:
-                    if attempt >= MAX_RETRIES:
+                    if body_attempt >= MAX_RETRIES:
                         raise LibraryMetadataError(
                             f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
-                    self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
-                    attempt += 1
+                    self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** body_attempt), MAX_RETRY_AFTER_SECONDS))
+                    body_attempt += 1
                     continue
                 try:
                     return json.loads(body or b"{}")
