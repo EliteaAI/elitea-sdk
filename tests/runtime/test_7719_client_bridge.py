@@ -274,6 +274,29 @@ def test_close_closes_worker_sessions(harness):
     client._session.close.assert_called_once()
 
 
+def test_oversized_bytes_are_refused_before_they_are_copied(harness, monkeypatch):
+    # An 18 MB artifact must not be base64-encoded just to be refused afterwards
+    dispatcher, _ = harness(max_result_bytes=1000)
+    monkeypatch.setattr(bridge, "encode_value", lambda value: pytest.fail("encoded an oversized result"))
+    monkeypatch.setattr(FakeClient, "download_artifact_s3", lambda self, bucket, key: b"x" * 5000)
+    reply = _call(dispatcher, "client.download_artifact_s3", "b", "k")
+    assert reply["ok"] is False and "limit" in reply["error"]
+
+
+def test_stub_codec_is_generated_from_the_worker_functions():
+    stub = bridge.build_client_stub("http://platform", 3)
+    assert "_eb_enc" in stub and "_eb_dec" in stub and bridge.BYTES_KEY in stub
+    assert "def _eb_enc(value):" in stub  # annotations stripped: the stub namespace has no typing names
+    assert stub.count("b64encode") == 1 and stub.count("b64decode") == 1  # one copy of each, not two
+
+
+def test_one_project_url_helper():
+    from elitea_sdk.runtime.clients import client as worker_client
+    assert worker_client.in_project is sc.in_project
+    assert sc.in_project("http://h/api/v2/x/prompt_lib/3", 9) == "http://h/api/v2/x/prompt_lib/9"
+    assert sc.in_project("http://h/api/v2/x/prompt_lib/3", None) == "http://h/api/v2/x/prompt_lib/3"
+
+
 def test_malformed_payload(harness):
     dispatcher, _ = harness()
     reply = json.loads(asyncio.run(dispatcher("client.get_user_data", "not json")))

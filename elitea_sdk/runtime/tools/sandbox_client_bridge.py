@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -57,9 +58,12 @@ def bridge_limits() -> Dict[str, int]:
     }
 
 
+BYTES_KEY = "__elitea_bridge_bytes__"
+
+
 def encode_value(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray)):
-        return {"__elitea_bridge_bytes__": base64.b64encode(bytes(value)).decode("ascii")}
+        return {BYTES_KEY: base64.b64encode(bytes(value)).decode("ascii")}
     if isinstance(value, dict):
         return {k: encode_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -69,8 +73,8 @@ def encode_value(value: Any) -> Any:
 
 def decode_value(value: Any) -> Any:
     if isinstance(value, dict):
-        if set(value) == {"__elitea_bridge_bytes__"}:
-            return base64.b64decode(value["__elitea_bridge_bytes__"])
+        if set(value) == {BYTES_KEY}:
+            return base64.b64decode(value[BYTES_KEY])
         return {k: decode_value(v) for k, v in value.items()}
     if isinstance(value, list):
         return [decode_value(v) for v in value]
@@ -190,6 +194,8 @@ class ClientBridgeDispatcher:
         if secret:
             self._audit(method, secret_name, "success" if value is not None else "not_found")
             self.masker.add(value)
+        if _payload_size(value) > self.max_result_bytes:
+            return _error("ValueError", f"The result of {name} is over the {self.max_result_bytes}-byte sandbox limit.")
         return {"ok": True, "value": encode_value(value)}
 
     def close(self) -> None:
@@ -233,6 +239,19 @@ class ClientBridgeDispatcher:
             logger.debug("sandbox secret audit failed: %s", exc)
 
 
+def _payload_size(value: Any) -> int:
+    """Rough size of a result as the stub receives it (bytes grow by a third in base64), before anything is copied."""
+    if isinstance(value, (bytes, bytearray)):
+        return len(value) * 4 // 3
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_payload_size(v) + len(str(k)) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return sum(_payload_size(v) for v in value)
+    return 8
+
+
 def _error(error_class: str, message: str) -> Dict[str, Any]:
     return {"ok": False, "error_class": error_class, "error": message}
 
@@ -255,6 +274,7 @@ def sandbox_client_factory(elitea_client: Any) -> Callable[[Optional[int]], Any]
 _STUB_TEMPLATE = '''
 import json as _eb_json
 import base64 as _eb_b64
+_EB_BYTES_KEY = __BYTES_KEY__
 import elitea_bridge as _eb_bridge
 from pyodide.ffi import run_sync as _eb_run_sync
 
@@ -284,24 +304,7 @@ _EB_ERRORS = {c.__name__: c for c in (ApiDetailsRequestError, PrivateSecretError
                                       ValueError, TypeError, KeyError)}
 
 
-def _eb_enc(v):
-    if isinstance(v, (bytes, bytearray)):
-        return {"__elitea_bridge_bytes__": _eb_b64.b64encode(bytes(v)).decode("ascii")}
-    if isinstance(v, dict):
-        return {k: _eb_enc(x) for k, x in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_eb_enc(x) for x in v]
-    return v
-
-
-def _eb_dec(v):
-    if isinstance(v, dict):
-        if set(v) == {"__elitea_bridge_bytes__"}:
-            return _eb_b64.b64decode(v["__elitea_bridge_bytes__"])
-        return {k: _eb_dec(x) for k, x in v.items()}
-    if isinstance(v, list):
-        return [_eb_dec(x) for x in v]
-    return v
+__CODEC__
 
 
 def _eb_call(_eb_name, _eb_project, *args, **kwargs):
@@ -365,9 +368,21 @@ elitea_client = SandboxClient()
 '''
 
 
+def _stub_codec() -> str:
+    """The stub's encode/decode are the worker's own functions renamed, so the two sides cannot drift apart."""
+    source = "\n\n".join(inspect.getsource(fn).rstrip() for fn in (encode_value, decode_value))
+    # The stub namespace has no typing names, so the annotations go.
+    for old, new in ((": Any", ""), (" -> Any", ""), ("encode_value", "_eb_enc"), ("decode_value", "_eb_dec"),
+                     ("base64.", "_eb_b64."), ("BYTES_KEY", "_EB_BYTES_KEY")):
+        source = source.replace(old, new)
+    return source
+
+
 def build_client_stub(base_url: str, project_id: Any) -> str:
     """The sandbox-side client: same public names as SandboxClient, no credential, every call bridged."""
     return (_STUB_TEMPLATE
+            .replace("__CODEC__", _stub_codec())
+            .replace("__BYTES_KEY__", repr(BYTES_KEY))
             .replace("__ARTIFACT_METHODS__", repr(ARTIFACT_METHODS))
             .replace("__CLIENT_METHODS__", repr(CLIENT_METHODS))
             .replace("__BASE_URL__", repr(str(base_url)))

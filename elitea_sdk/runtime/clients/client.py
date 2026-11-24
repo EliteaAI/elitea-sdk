@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
+from .sandbox_client import in_project
 from ..middleware import (
     InputGuardMiddleware,
     LoggingStrategy,
@@ -1317,9 +1318,7 @@ class EliteAClient:
     def get_app_version_details(self, application_id: int, application_version_id: int,
                                 project_id: Optional[int] = None) -> dict:
         """Get application version details for the client's project, or for ``project_id`` when given (#7719)."""
-        versions = self.application_versions if project_id is None else \
-            f"{self.application_versions.rsplit('/', 1)[0]}/{int(project_id)}"
-        url = f"{versions}/{application_id}/{application_version_id}"
+        url = f"{in_project(self.application_versions, project_id)}/{application_id}/{application_version_id}"
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
