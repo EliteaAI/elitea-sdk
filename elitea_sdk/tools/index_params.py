@@ -24,6 +24,18 @@ RemoveIndexParams = create_model(
     ),
 )
 
+CheckForChangesParams = create_model(
+    "CheckForChangesParams",
+    index_name=(
+        str,
+        Field(
+            description=f"Name of the index to check (max {INDEX_NAME_MAX_LENGTH} characters)",
+            min_length=1,
+            max_length=INDEX_NAME_MAX_LENGTH,
+        ),
+    ),
+)
+
 
 def _search_common_fields(cut_off_default: float) -> dict:
     return {

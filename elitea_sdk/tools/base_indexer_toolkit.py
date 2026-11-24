@@ -24,8 +24,10 @@ from langchain_core.tools import ToolException
 from ..runtime.tool_outcome import ToolErrorClass, classify_tool_error, quota_exhausted, retriable_for
 from pydantic import create_model, Field, SecretStr
 
+from . import index_change_check
 from .index_params import (
     INDEX_NAME_MAX_LENGTH,
+    CheckForChangesParams,
     RemoveIndexParams,
     build_base_search_params,
     build_base_stepback_search_params,
@@ -849,7 +851,14 @@ DEFAULT_CUT_OFF = 0.1
 SDK_OWNED_META_KEYS = (
     "indexed_chunks", "updated", "state", "updated_on",
     "error", "report", "skipped", "total", "indexed", "history",
+    "last_run_scope", "unindexed_items",
 )
+# Describe the latest successful run only. They stay out of every history entry,
+# which is copied into each indexes-list read.
+LATEST_RUN_META_KEYS = ("last_run_scope", "unindexed_items")
+# lean: 10_000 entries; raise it when a real index records more skipped files.
+# Beyond the cap a skipped file shows as "added" in the change check.
+MAX_UNINDEXED_ITEMS = 10_000
 # Mirrors the core-side vault default for `task_disconnected_timeout_sec`; used
 # only when the meta row never carried the key (agent-invoked fresh runs).
 TASK_DISCONNECTED_TIMEOUT_DEFAULT = 7200.0
@@ -971,6 +980,14 @@ class _IndexRunState:
     # where _consume_pipeline_output and every _flush_chunk run even on the
     # parallel path (the executor wraps the pipeline, not the flush).
     chunks_written: int = 0
+    # Scope of the last successful run, read from the meta row at run start; None
+    # when the row has none (an index built before the scope was recorded).
+    last_run_scope: Optional[Dict[str, Any]] = None
+    meta_existed: bool = False
+    # Scope of this run, written to the meta row only when the run succeeds.
+    run_scope: Optional[Dict[str, Any]] = None
+    # Base documents the loader yielded that ended with no row: {key: marker}.
+    unindexed_items: Dict[str, str] = field(default_factory=dict)
 
 
 _ACTIVE_INDEXING_STATS: "contextvars.ContextVar[Optional[IndexingStats]]" = contextvars.ContextVar(
@@ -1098,6 +1115,7 @@ class IndexTools(str, Enum):
     STEPBACK_SUMMARY_INDEX = "stepback_summary_index"
     REMOVE_INDEX = "remove_index"
     LIST_INDEXES = "list_indexes"
+    CHECK_FOR_CHANGES = "check_for_changes"
 
 BaseSearchParams = build_base_search_params(
     cut_off_default=DEFAULT_CUT_OFF, include_output_fields=True
@@ -1230,6 +1248,24 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         if doc_name in stats.documents_skipped_error | stats.explicitly_failed_documents:
             return
         self._withdraw_document(doc_name, base_doc, 'documents_skipped_empty')
+
+    def _note_unindexed_item(self, base_doc: Document):
+        """Remember a base document that ended with no row, so the change check does not call it new."""
+        run = getattr(self, '_index_run', None)
+        if run is None or not self._has_source_listing():
+            return
+        key = self.key_fn(base_doc)
+        if key is None or str(key) == IDLESS_STAGING_KEY:
+            return
+        run.unindexed_items[str(key)] = self._document_marker(base_doc)
+
+    def _unindexed_items_to_record(self) -> Dict[str, str]:
+        run = self._index_run
+        items = run.unindexed_items
+        if len(items) > MAX_UNINDEXED_ITEMS:
+            logger.warning("Skipped items of the run exceed the record cap; the extra ones are not recorded.")
+            return dict(itertools.islice(items.items(), MAX_UNINDEXED_ITEMS))
+        return dict(items)
 
     def _track_document_left_empty_by_error(self, document: Document):
         if document.page_content or document.metadata.get(IndexerKeywords.CONTENT_IN_BYTES.value):
@@ -1552,9 +1588,17 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             # Include unchanged docs in the indexed count so the UI reflects total items
             # currently in the vector store, not just newly indexed ones.
             indexed_total = docs_count + unchanged_count
-            written_state = self.index_meta_update(index_name, final_state, succeeded_chunks_count,
-                                                   error=message if status is not IndexingStatus.OK else None,
-                                                   skipped=skipped_data, docs_count=indexed_total, report=report)
+            # Only a run that published its corpus describes what the index covers. A
+            # failed run leaves the stored scope and skipped items of the last good run.
+            record_run_facts = staging and final_state != IndexerKeywords.INDEX_META_FAILED.value
+            written_state = self.index_meta_update(
+                index_name, final_state, succeeded_chunks_count,
+                error=message if status is not IndexingStatus.OK else None,
+                skipped=skipped_data, docs_count=indexed_total, report=report,
+                last_run_scope=run.run_scope if record_run_facts else None,
+                unindexed_items=(self._unindexed_items_to_record()
+                                 if record_run_facts and self._has_source_listing() else None),
+            )
             self._emit_index_event(index_name,
                                    error=message if status is not IndexingStatus.OK else None,
                                    state=written_state or final_state)
@@ -2146,23 +2190,33 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             "the loader cannot confirm source deletions, so previously indexed data stays searchable."
         )
 
-    def _collect_orphan_candidates(self, indexed_data: Dict[str, Dict[str, Any]],
-                                   seen_keys: Set[str]) -> Tuple[List[str], int]:
+    @staticmethod
+    def _dependent_keys(indexed_data: Dict[str, Dict[str, Any]]) -> Set[str]:
         dependent_keys = set()
         for entry in indexed_data.values():
             for dependent_key in entry.get(IndexerKeywords.DEPENDENT_DOCS.value) or []:
                 dependent_keys.add(str(dependent_key))
+        return dependent_keys
+
+    @staticmethod
+    def _is_base_row(doc_key: str, entry: Dict[str, Any], dependent_keys: Set[str]) -> bool:
+        """True for a row that stands for a source item, not for a part of one."""
+        if doc_key in dependent_keys:
+            return False
+        if entry.get('pk_fallback'):
+            return False
+        # -1 is the adapter's no-parent sentinel; any other value (including
+        # None — a dependent whose parent had no id and so can never appear
+        # in seen_keys) marks a dependent row that falls with its parent.
+        return entry.get(IndexerKeywords.PARENT.value, -1) == -1
+
+    def _collect_orphan_candidates(self, indexed_data: Dict[str, Dict[str, Any]],
+                                   seen_keys: Set[str]) -> Tuple[List[str], int]:
+        dependent_keys = self._dependent_keys(indexed_data)
         orphan_ids: List[str] = []
         orphan_doc_count = 0
         for doc_key, entry in indexed_data.items():
-            if doc_key in seen_keys or doc_key in dependent_keys:
-                continue
-            if entry.get('pk_fallback'):
-                continue
-            # -1 is the adapter's no-parent sentinel; any other value (including
-            # None — a dependent whose parent had no id and so can never appear
-            # in seen_keys) marks a dependent row that falls with its parent.
-            if entry.get(IndexerKeywords.PARENT.value, -1) != -1:
+            if doc_key in seen_keys or not self._is_base_row(doc_key, entry, dependent_keys):
                 continue
             orphan_doc_count += 1
             orphan_ids.extend(
@@ -2391,6 +2445,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             result["count"] += dependent_docs_counter
             if dependent_docs_counter == 0:
                 self._track_document_empty(_doc_name, base_doc)
+                self._note_unindexed_item(base_doc)
             elif not self._is_base_doc_explicitly_failed(base_doc):
                 result["docs_count"] += 1
                 if staging:
@@ -3019,6 +3074,91 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         return (f"Index '{index_name}' has been removed from the vector store.\n"
                 f"{self._available_indexes_note()}")
 
+    def _list_source_items(self, index_configuration: Dict[str, Any]) -> index_change_check.SourceListing:
+        """List the source with the scope of the saved index configuration.
+
+        A toolkit that overrides this gets the `check_for_changes` tool. The listing
+        must read metadata only, never file content.
+        """
+        raise NotImplementedError("This toolkit cannot list its source")
+
+    def _has_source_listing(self) -> bool:
+        return type(self)._list_source_items is not BaseIndexerToolkit._list_source_items
+
+    def _indexed_item(self, key: str, entry: Dict[str, Any]) -> index_change_check.ListedItem:
+        """One indexed base row, in the shape of the source listing."""
+        metadata = entry.get('metadata') or {}
+        name = str(metadata.get('name') or '')
+        return index_change_check.ListedItem(
+            key=key, name=name, path=str(metadata.get('path') or name), marker=self._stored_marker(metadata),
+        )
+
+    def _stored_marker(self, metadata: Dict[str, Any]) -> str:
+        """The change marker of a stored row. Must match what the listing gives for the same item."""
+        return str(metadata.get('updated_on') or '')
+
+    def _document_marker(self, document: Document) -> str:
+        """The change marker of a base document the loader yielded."""
+        return self._stored_marker(document.metadata)
+
+    def _is_unchecked_row(self, entry: Dict[str, Any]) -> bool:
+        """True for a base row that the source listing does not cover; the check leaves it out."""
+        return False
+
+    def _index_scope(self, index_configuration: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The keys of an index configuration that decide which source items a run covers.
+
+        None means the toolkit does not track a scope.
+        """
+        return None
+
+    @tool_group('read')
+    def check_for_changes(self, index_name: str):
+        """Compares the source with an existing index and reports which items were added, changed or removed.
+
+        It reads the source listing and the stored index only: nothing is indexed, deleted or rewritten.
+        """
+        if not index_name or not str(index_name).strip():
+            raise ToolException(
+                f"check_for_changes requires a non-empty 'index_name'. {self._available_indexes_note()}"
+            )
+        if not self._has_source_listing():
+            raise ToolException("This toolkit cannot check an index for changes.")
+        index_meta = super().get_index_meta(index_name)
+        if not index_meta:
+            raise ToolException(f"Index '{index_name}' not found. {self._available_indexes_note()}")
+        configuration = (index_meta.get("metadata") or {}).get("index_configuration")
+        if not isinstance(configuration, dict) or not configuration:
+            raise ToolException(
+                f"Index '{index_name}' has no saved indexing configuration, so the source cannot be "
+                f"listed. Run index_data first. {self._available_indexes_note()}"
+            )
+        listing = self._list_source_items(configuration)
+        indexed_data = self._get_indexed_data(index_name)
+        dependent_keys = self._dependent_keys(indexed_data)
+        indexed: Dict[str, index_change_check.ListedItem] = {}
+        excluded_rows = 0
+        for key, entry in indexed_data.items():
+            if not self._is_base_row(key, entry, dependent_keys):
+                continue
+            if self._is_unchecked_row(entry):
+                excluded_rows += 1
+                continue
+            indexed[key] = self._indexed_item(key, entry)
+        unindexed_raw = (index_meta.get("metadata") or {}).get("unindexed_items")
+        if isinstance(unindexed_raw, str):
+            try:
+                unindexed_raw = json.loads(unindexed_raw)
+            except json.JSONDecodeError:
+                unindexed_raw = None
+        unindexed_recorded = isinstance(unindexed_raw, dict)
+        comparison = index_change_check.compare(
+            listing, indexed, unindexed_raw if unindexed_recorded else None
+        )
+        return index_change_check.build_report(
+            index_name, comparison, listing, unindexed_recorded, excluded_rows
+        )
+
     def _available_indexes_note(self) -> str:
         try:
             return f"Available indexes: {serialize_tool_result(self.list_indexes())}"
@@ -3328,6 +3468,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             self._ensure_index_runs_table()
         index_meta = super().get_index_meta(index_name)
         initiator = self._resolve_initiator()
+        if run is not None:
+            run.meta_existed = bool(index_meta)
+            stored_scope = ((index_meta or {}).get("metadata") or {}).get("last_run_scope")
+            run.last_run_scope = stored_scope if isinstance(stored_scope, dict) else None
+            run.run_scope = self._index_scope(index_configuration)
         if not index_meta:
             self._log_tool_event(
                 f"There is no existing index_meta for collection '{index_name}'. Initializing it.",
@@ -3434,7 +3579,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                     history = []
             except (json.JSONDecodeError, TypeError):
                 history = []
-            history.append(dict(metadata))  # history key already popped -> no nesting
+            # history key already popped -> no nesting; the latest-run keys stay out of the entry
+            history.append({k: v for k, v in metadata.items() if k not in LATEST_RUN_META_KEYS})
             metadata["history"] = json.dumps(history)
             index_meta_doc = Document(
                 page_content=index_meta.get("content", f"{IndexerKeywords.INDEX_META_TYPE.value}_{index_name}"),
@@ -3449,7 +3595,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     def index_meta_update(self, index_name: str, state: str, result: int, error: Optional[str] = None,
                           skipped: Optional[Dict] = None, docs_count: Optional[int] = None,
-                          report: Optional[Dict] = None):
+                          report: Optional[Dict] = None,
+                          last_run_scope: Optional[Dict[str, Any]] = None,
+                          unindexed_items: Optional[Dict[str, str]] = None):
         """Patch the SDK-owned keys of the `index_meta` document.
 
         Mid-run progress no longer comes through here — it rides the run
@@ -3465,6 +3613,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             report: Optional canonical indexing report for this run. When present and not an
                     error report it also derives the persisted totals, so the numbers can
                     never contradict the breakdown rendered next to them.
+            last_run_scope: Scope keys of a successful run; a failed run passes none, so the
+                    stored value of the last good run stays.
+            unindexed_items: Base documents of a successful run that ended with no row,
+                    `{key: marker}`; None leaves the stored value alone.
         """
         self._ensure_vectorstore_initialized()
         index_meta_raw = super().get_index_meta(index_name)
@@ -3506,6 +3658,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 metadata["error"] = None
             if report is not None:
                 metadata["report"] = json.dumps(report)
+            if last_run_scope is not None:
+                metadata["last_run_scope"] = last_run_scope
+            if unindexed_items is not None:
+                metadata["unindexed_items"] = unindexed_items
             # Only a sample of each name list is persisted: this blob is copied into
             # every history entry and re-shipped by every indexes-list read. The counts
             # beside it stay exact.
@@ -3563,10 +3719,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             try:
                 history = json.loads(history_raw) if history_raw.strip() else []
                 # replace the last history item with updated metadata
+                # The latest-run keys describe the row, not one run: a copy in every
+                # history entry would be re-shipped by every indexes-list read.
+                entry = {k: v for k, v in metadata.items() if k not in LATEST_RUN_META_KEYS}
                 if history and isinstance(history, list):
-                    history[-1] = metadata
+                    history[-1] = entry
                 else:
-                    history = [metadata]
+                    history = [entry]
             except (json.JSONDecodeError, TypeError):
                 logger.warning(f"Failed to load index history: {history_raw}. Create new with only current item.")
                 history = [metadata]
@@ -3727,7 +3886,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 Field(default=False,
                       description="Optional flag to rebuild the index by re-processing every document "
                                   "from the source instead of skipping unchanged ones; previously "
-                                  "indexed documents the source no longer returns may remain searchable")
+                                  "indexed documents the source no longer returns are deleted only "
+                                  "when the toolkit confirms a complete source listing, otherwise "
+                                  "they may remain searchable")
             ),
             "progress_step": (
                 Optional[int],
@@ -3793,5 +3954,13 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 "args_schema": RemoveIndexParams
             },
         ]
+        if self._has_source_listing():
+            tools.append({
+                "name": IndexTools.CHECK_FOR_CHANGES.value,
+                "mode": IndexTools.CHECK_FOR_CHANGES.value,
+                "ref": self.check_for_changes,
+                "description": self.check_for_changes.__doc__,
+                "args_schema": CheckForChangesParams,
+            })
 
         return tools
