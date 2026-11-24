@@ -344,6 +344,8 @@ class PyodideSandbox(BasePyodideSandbox):
         max_line_bytes: int = BRIDGE_MAX_LINE_BYTES,
         max_concurrent_calls: int = BRIDGE_MAX_CONCURRENT_CALLS,
         on_output: Callable[[str, str], None] | None = None,
+        root_ca_path: str | None = None,
+        insecure_tls_domains: list[str] | None = None,
     ) -> BridgeExecutionResult:
         """Run `code` with `elitea_bridge.call(name, args_json)` routed to `dispatcher(name, args_json) -> value_json`.
 
@@ -359,7 +361,8 @@ class PyodideSandbox(BasePyodideSandbox):
         call_slots = asyncio.Semaphore(max(1, max_concurrent_calls))
         write_lock = asyncio.Lock()
 
-        cmd = self._build_command(memory_limit_mb=memory_limit_mb, bridge_max_line_bytes=max_line_bytes)
+        cmd = self._build_command(memory_limit_mb=memory_limit_mb, bridge_max_line_bytes=max_line_bytes,
+                                  root_ca_path=root_ca_path, insecure_tls_domains=insecure_tls_domains)
         run_directory = self._run_directory()
         # The reader limit must exceed the line cap, or asyncio rejects lines over its 64 KB default.
         try:

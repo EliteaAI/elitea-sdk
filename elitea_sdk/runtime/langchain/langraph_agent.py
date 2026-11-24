@@ -1487,7 +1487,8 @@ def create_graph(
             elif node_type == 'code':
                 from ..tools.sandbox import create_sandbox_tool
                 sandbox_tool = create_sandbox_tool(stateful=False, allow_net=True,
-                                                   elitea_client=kwargs.get('elitea_client', None))
+                                                   elitea_client=kwargs.get('elitea_client', None),
+                                                   caller="code_node")
                 # Apply middleware wrapping (e.g. exception handling) to the
                 # freshly-created sandbox tool — it was not in the `tools` list
                 # that was wrapped during Assistant.__init__().

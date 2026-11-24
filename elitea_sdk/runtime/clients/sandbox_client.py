@@ -16,6 +16,11 @@ _CHARDET_SAMPLE_SIZE = 10 * 1024
 _UNSET = object()
 
 
+def in_project(project_url: str, project_id: Optional[int]) -> str:
+    """``project_url`` pointed at another project: the id is the last segment of every per-project base URL (#7719)."""
+    return project_url if project_id is None else f"{project_url.rsplit('/', 1)[0]}/{int(project_id)}"
+
+
 class ApiDetailsRequestError(Exception):
     ...
 
@@ -304,8 +309,8 @@ class SandboxClient:
         except (ValueError, TypeError):
             return response.text
 
-    def get_app_details(self, application_id: int):
-        url = f'{self.app}/{application_id}'
+    def get_app_details(self, application_id: int, project_id: Optional[int] = None):
+        url = f'{in_project(self.app, project_id)}/{application_id}'
         data = self._request('get', url, headers=self.headers, verify=False).json()
         return data
 
@@ -329,8 +334,9 @@ class SandboxClient:
 
         return apps
 
-    def get_app_version_details(self, application_id: int, application_version_id: int) -> dict:
-        url = f'{self.application_versions}/{application_id}/{application_version_id}'
+    def get_app_version_details(self, application_id: int, application_version_id: int,
+                                project_id: Optional[int] = None) -> dict:
+        url = f'{in_project(self.application_versions, project_id)}/{application_id}/{application_version_id}'
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()

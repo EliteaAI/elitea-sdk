@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
+from .sandbox_client import in_project
 from ..middleware import (
     InputGuardMiddleware,
     LoggingStrategy,
@@ -623,8 +624,9 @@ class EliteAClient:
         response.raise_for_status()
         return response.json()
 
-    def get_app_details(self, application_id: int, version_name: Optional[str] = None):
-        url = f"{self.app}/{application_id}" if version_name is None else f"{self.app}/{application_id}/{version_name}"
+    def get_app_details(self, application_id: int, version_name: Optional[str] = None, project_id: Optional[int] = None):
+        app = self.app if project_id is None else f"{self.base_app_url}{int(project_id)}"
+        url = f"{app}/{application_id}" if version_name is None else f"{app}/{application_id}/{version_name}"
         resp = self._request('get', url, headers=self.headers, verify=False)
         not_live = run_not_live_code(self, resp)
         if not_live:
@@ -1313,9 +1315,10 @@ class EliteAClient:
             logger.error(f"Image generation request failed: {e}")
             raise
 
-    def get_app_version_details(self, application_id: int, application_version_id: int) -> dict:
-        """Get application version details for the client's project."""
-        url = f"{self.application_versions}/{application_id}/{application_version_id}"
+    def get_app_version_details(self, application_id: int, application_version_id: int,
+                                project_id: Optional[int] = None) -> dict:
+        """Get application version details for the client's project, or for ``project_id`` when given (#7719)."""
+        url = f"{in_project(self.application_versions, project_id)}/{application_id}/{application_version_id}"
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
