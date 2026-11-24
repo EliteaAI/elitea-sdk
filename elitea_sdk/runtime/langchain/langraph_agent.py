@@ -132,6 +132,24 @@ def _is_content_block(block) -> bool:
     return block_type is None and 'text' in block and set(block) <= _TEXT_ONLY_BLOCK_KEYS
 
 
+def extract_current_turn_answer(messages: list) -> Optional[str]:
+    """Return the latest non-empty reply of the current turn, or None.
+
+    Empty replies are skipped (Sonnet returns ``AIMessage(content=[])`` in synthesis
+    turns, issue #5057), but the scan stops at the latest HumanMessage: anything
+    before it belongs to an earlier turn, and surfacing it re-sends that turn's answer.
+    """
+    for msg in reversed(messages or []):
+        if isinstance(msg, HumanMessage):
+            return None
+        if not hasattr(msg, 'content'):
+            continue
+        normalized = normalize_message_content(msg.content)
+        if normalized.strip():
+            return normalized
+    return None
+
+
 def normalize_message_content(content: Any) -> str:
     """
     Normalize message content to a string.
@@ -2721,16 +2739,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             elif (printer_output := result.get(PRINTER_NODE_RS)) == PRINTER_COMPLETED_STATE:
                 # Printer completed, extract last AI message
                 messages = result['messages']
-                # Skip messages whose normalized content is empty (Sonnet 4.5/4.6 returns
-                # AIMessage(content=[]) in synthesis turns — issue #5057).
-                output = None
-                for _msg in reversed(messages):
-                    if isinstance(_msg, HumanMessage):
-                        continue
-                    _normed_check = normalize_message_content(_msg.content).strip()
-                    if _normed_check:
-                        output = normalize_message_content(_msg.content)
-                        break
+                output = extract_current_turn_answer(messages)
                 if output is None:
                     output = (
                         normalize_message_content(messages[-1].content) if messages else None
@@ -2739,18 +2748,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 # Printer node has output (interrupted state)
                 output = normalize_message_content(printer_output) if not isinstance(printer_output, str) else printer_output
             else:
-                # No printer node, extract last non-Human message with non-empty content.
-                # Skip messages whose normalized content is empty — Sonnet 4.5/4.6 returns
-                # AIMessage(content=[]) in synthesis turns after tool calls (issue #5057).
                 messages = result.get('messages', [])
-                output = None
-                for _msg in reversed(messages):
-                    if isinstance(_msg, HumanMessage):
-                        continue
-                    _normed_check = normalize_message_content(_msg.content).strip()
-                    if _normed_check:
-                        output = normalize_message_content(_msg.content)
-                        break
+                output = extract_current_turn_answer(messages)
         except Exception as exc:
             logger.warning("[OUTPUT] Exception during output extraction: %s", exc, exc_info=True)
             # If pipeline was blocked, we already have the output — use it
@@ -2758,16 +2757,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 output = _blocked_output
             else:
                 # Fallback: try to extract from messages first, then last state value.
-                # Skip messages whose normalized content is empty (issue #5057).
                 messages = result.get('messages', []) if isinstance(result, dict) else []
-                output = None
-                for _msg in reversed(messages):
-                    if not hasattr(_msg, 'content') or isinstance(_msg, HumanMessage):
-                        continue
-                    _normed_check = normalize_message_content(_msg.content).strip()
-                    if _normed_check:
-                        output = normalize_message_content(_msg.content)
-                        break
+                output = extract_current_turn_answer(messages)
                 if output is None:
                     output = str(list(result.values())[-1]) if result else 'Output is undefined'
         config_state = self.get_state(config)
