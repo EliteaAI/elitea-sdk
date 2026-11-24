@@ -35,6 +35,10 @@ _BRIDGE_OUTPUT_KEEP_CHARS = 1024 * 1024
 _BRIDGE_STDERR_TAIL_BYTES = 64 * 1024
 
 
+# Proxies keep package installs working behind a corporate proxy; CA trust goes via --cert.
+_PASSTHROUGH_ENV = ("PATH", "SANDBOX_BASE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+
+
 def get_default_pkg_name() -> str | None:
     """Get the Pyodide sandbox package/script path from environment.
 
@@ -217,7 +221,9 @@ class BasePyodideSandbox:
 
     @staticmethod
     def _run_environment(run_directory: tempfile.TemporaryDirectory) -> dict:
-        return {**os.environ, "TMPDIR": run_directory.name, "DENO_DIR": os.path.join(run_directory.name, "deno_dir")}
+        # Only what Deno needs; the worker's secrets never reach a sandbox process (#7727).
+        env = {key: os.environ[key] for key in _PASSTHROUGH_ENV if key in os.environ}
+        return {**env, "TMPDIR": run_directory.name, "DENO_DIR": os.path.join(run_directory.name, "deno_dir")}
 
 
 class PyodideSandbox(BasePyodideSandbox):
