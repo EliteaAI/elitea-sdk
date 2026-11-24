@@ -421,15 +421,17 @@ class PyodideSandboxTool(BaseTool):
                     config['metadata'][key] = value
         return super().invoke(input, config=config, **kwargs)
 
-    def _uses_client_bridge(self, code: str) -> bool:
-        """The bridged client (#7719): flag on, a local stateless sandbox, and code that names the client."""
+    def _bridge_mode(self) -> bool:
+        """The bridged client (#7719) applies: flag on and a local stateless sandbox."""
         return bool(
             self.elitea_client is not None
             and not self.stateful
             and not os.environ.get("SANDBOX_SERVICE_URL")
             and bridge_enabled()
-            and _code_needs_bridged_client(code)
         )
+
+    def _uses_client_bridge(self, code: str) -> bool:
+        return self._bridge_mode() and _code_needs_bridged_client(code)
 
     def _prepare_pyodide_input(self, code: str) -> str:
         """Prepare input for PyodideSandboxTool by injecting state and elitea_client into the code block."""
@@ -438,6 +440,9 @@ class PyodideSandboxTool(BaseTool):
         if self._uses_client_bridge(code):
             stub = build_client_stub(self.elitea_client.base_url, getattr(self.elitea_client, 'project_id', None))
             return f"#elitea simplified client\n{_LIGHT_PREAMBLE}{stub}\n{code}"
+        if self._bridge_mode():
+            # Never fall back to the token-carrying client, whatever the code looks like
+            return f"#elitea simplified client\n{_LIGHT_PREAMBLE}{code}"
         if self.elitea_client and not _code_needs_sandbox_client(code):
             pyodide_predata = _LIGHT_PREAMBLE
         elif self.elitea_client:
@@ -658,17 +663,20 @@ class PyodideSandboxTool(BaseTool):
             governed=is_run_token_bearer(client),
             max_result_bytes=bridge["max_line_bytes"],
         )
-        result = await self._sandbox.execute_with_bridge(
-            prepared_code,
-            dispatcher,
-            timeout_seconds=limits["timeout_seconds"],
-            max_tool_calls=bridge["max_calls"],
-            memory_limit_mb=limits["wasm_max_mem_mb"],
-            max_line_bytes=bridge["max_line_bytes"],
-            max_concurrent_calls=1,
-            root_ca_path=limits.get("root_ca_path"),
-            insecure_tls_domains=limits.get("allowed_pyodide_domains"),
-        )
+        try:
+            result = await self._sandbox.execute_with_bridge(
+                prepared_code,
+                dispatcher,
+                timeout_seconds=limits["timeout_seconds"],
+                max_tool_calls=bridge["max_calls"],
+                memory_limit_mb=limits["wasm_max_mem_mb"],
+                max_line_bytes=bridge["max_line_bytes"],
+                max_concurrent_calls=1,
+                root_ca_path=limits.get("root_ca_path"),
+                insecure_tls_domains=limits.get("allowed_pyodide_domains"),
+            )
+        finally:
+            dispatcher.close()
         logger.debug("[sandbox-timing] bridged client run: total=%.3fs calls=%s",
                      time.perf_counter() - arun_start, dispatcher.call_log)
         mask = dispatcher.masker.mask
@@ -676,8 +684,9 @@ class PyodideSandboxTool(BaseTool):
             raise SandboxAdmissionRefused(mask(result.error) or "Sandbox execution timed out", "timeout")
 
         result_dict: Dict[str, Any] = {}
+        # The result is pipeline state (a later node may need the secret); only printed and error text is masked
         if result.result is not None:
-            result_dict["result"] = mask(result.result)
+            result_dict["result"] = result.result
         if result.stdout:
             result_dict["output"] = mask(result.stdout)
         if result.status == 'error':

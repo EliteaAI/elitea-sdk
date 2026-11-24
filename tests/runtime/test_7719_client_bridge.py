@@ -259,6 +259,21 @@ def test_result_over_the_cap_is_an_error(harness):
     assert reply["ok"] is False and "limit" in reply["error"]
 
 
+def test_plain_dict_with_a_bytes_like_key_is_not_decoded(harness):
+    _, run = harness()
+    ns = run("r = elitea_client.artifact('bkt').create('x', {'__bytes__': 'abc'})\n")
+    assert harness.clients[None].calls[-1] == ("artifact.create", "bkt", "x", {"__bytes__": "abc"})
+
+
+def test_close_closes_worker_sessions(harness):
+    dispatcher, run = harness()
+    run("elitea_client.get_user_data()\n")
+    client = harness.clients[None]
+    client._session = MagicMock()
+    dispatcher.close()
+    client._session.close.assert_called_once()
+
+
 def test_malformed_payload(harness):
     dispatcher, _ = harness()
     reply = json.loads(asyncio.run(dispatcher("client.get_user_data", "not json")))
@@ -303,10 +318,16 @@ def test_flag_on_uses_the_stub_without_the_token(monkeypatch):
     assert "import requests" not in code and "class SandboxClient" in code
 
 
-def test_flag_on_requests_only_code_takes_the_plain_path(monkeypatch):
+@pytest.mark.parametrize("code", ["import requests\nrequests.get('https://x')",
+                                  "c = globals()['elitea_' + 'client']\nprint(c)"])
+def test_flag_on_never_injects_the_token(monkeypatch, code):
+    # Code that does not name the client (or hides the name) gets no client at all, never the old token-carrying one
     monkeypatch.setenv("SANDBOX_CLIENT_BRIDGE", "1")
+    monkeypatch.delenv("SANDBOX_SERVICE_URL", raising=False)
     tool = _tool()
-    assert not tool._uses_client_bridge("import requests\nrequests.get('https://x')")
+    prepared = tool._prepare_pyodide_input(code)
+    assert not tool._uses_client_bridge(code)
+    assert TOKEN not in prepared and "class SandboxClient" not in prepared and "elitea_client = None" in prepared
 
 
 @pytest.mark.parametrize("env,stateful", [({}, False), ({"SANDBOX_CLIENT_BRIDGE": "1"}, True),
@@ -335,7 +356,8 @@ def test_bridged_run_masks_secrets_and_maps_the_result(monkeypatch):
     tool._sandbox = MagicMock(execute_with_bridge=fake_execute_with_bridge)
     limits = {"timeout_seconds": 5, "wasm_max_mem_mb": 512, "root_ca_path": "/ca.pem", "allowed_pyodide_domains": []}
     out = asyncio.run(tool._arun_bridged("code", limits, 0.0))
-    assert out["result"] == {"k": "***"} and out["output"] == "printed ***\n"
+    # The result is pipeline state a later node may need; only printed text is masked
+    assert out["result"] == {"k": SECRET_VALUE} and out["output"] == "printed ***\n"
     assert captured["root_ca_path"] == "/ca.pem" and captured["max_concurrent_calls"] == 1
 
 

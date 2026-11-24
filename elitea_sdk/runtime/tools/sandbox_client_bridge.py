@@ -50,7 +50,8 @@ def _env_int(name: str, default: int) -> int:
 
 def bridge_limits() -> Dict[str, int]:
     return {
-        "max_calls": _env_int("SANDBOX_CLIENT_BRIDGE_MAX_CALLS", 500),
+        # The run timeout is the real bound; this only stops a runaway loop.
+        "max_calls": _env_int("SANDBOX_CLIENT_BRIDGE_MAX_CALLS", 10000),
         # Room for a base64 artifact download of ~18 MB in one reply.
         "max_line_bytes": _env_int("SANDBOX_CLIENT_BRIDGE_MAX_LINE_BYTES", 24 * 1024 * 1024),
     }
@@ -58,7 +59,7 @@ def bridge_limits() -> Dict[str, int]:
 
 def encode_value(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray)):
-        return {"__bytes__": base64.b64encode(bytes(value)).decode("ascii")}
+        return {"__elitea_bridge_bytes__": base64.b64encode(bytes(value)).decode("ascii")}
     if isinstance(value, dict):
         return {k: encode_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -68,8 +69,8 @@ def encode_value(value: Any) -> Any:
 
 def decode_value(value: Any) -> Any:
     if isinstance(value, dict):
-        if set(value) == {"__bytes__"}:
-            return base64.b64decode(value["__bytes__"])
+        if set(value) == {"__elitea_bridge_bytes__"}:
+            return base64.b64decode(value["__elitea_bridge_bytes__"])
         return {k: decode_value(v) for k, v in value.items()}
     if isinstance(value, list):
         return [decode_value(v) for v in value]
@@ -191,6 +192,18 @@ class ClientBridgeDispatcher:
             self.masker.add(value)
         return {"ok": True, "value": encode_value(value)}
 
+    def close(self) -> None:
+        """Closes the worker-side HTTP sessions this run opened."""
+        for client in self._clients.values():
+            try:
+                session = getattr(client, "_session", None)
+                if session is not None:
+                    session.close()
+            except Exception:  # pylint: disable=W0718
+                pass
+        self._clients.clear()
+        self._artifacts.clear()
+
     def _client(self, project_id: Optional[int]) -> Any:
         if project_id not in self._clients:
             self._clients[project_id] = self._client_factory(project_id)
@@ -273,7 +286,7 @@ _EB_ERRORS = {c.__name__: c for c in (ApiDetailsRequestError, PrivateSecretError
 
 def _eb_enc(v):
     if isinstance(v, (bytes, bytearray)):
-        return {"__bytes__": _eb_b64.b64encode(bytes(v)).decode("ascii")}
+        return {"__elitea_bridge_bytes__": _eb_b64.b64encode(bytes(v)).decode("ascii")}
     if isinstance(v, dict):
         return {k: _eb_enc(x) for k, x in v.items()}
     if isinstance(v, (list, tuple)):
@@ -283,8 +296,8 @@ def _eb_enc(v):
 
 def _eb_dec(v):
     if isinstance(v, dict):
-        if set(v) == {"__bytes__"}:
-            return _eb_b64.b64decode(v["__bytes__"])
+        if set(v) == {"__elitea_bridge_bytes__"}:
+            return _eb_b64.b64decode(v["__elitea_bridge_bytes__"])
         return {k: _eb_dec(x) for k, x in v.items()}
     if isinstance(v, list):
         return [_eb_dec(x) for x in v]
