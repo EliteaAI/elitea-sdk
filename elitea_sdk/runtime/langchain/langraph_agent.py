@@ -845,6 +845,11 @@ class PrinterNode(Runnable):
         else:
             self.final_message = self.DEFAULT_FINAL_MSG
 
+    @property
+    def footer(self) -> str:
+        """The resume hint appended to the printed value while the run is paused."""
+        return f"\n\n-----\n*{self.final_message}*"
+
     def invoke(self, state: BaseStore, config: Optional[RunnableConfig] = None) -> dict:
         logger.debug(f"Printer Node - Current state variables: {state}")
         result = {}
@@ -863,7 +868,7 @@ class PrinterNode(Runnable):
             # convert formatted output to string if it's not
             if not isinstance(formatted_output, str):
                 formatted_output = str(formatted_output)
-            formatted_output += f"\n\n-----\n*{self.final_message}*"
+            formatted_output += self.footer
         logger.debug(f"Formatted output: {formatted_output}")
         result[PRINTER_NODE_RS] = formatted_output
         return result
@@ -1912,6 +1917,18 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         self._independent_parallel_hitl = independent_parallel_hitl
         self._parallel_hitl_max_concurrency = parallel_hitl_max_concurrency
 
+    def _strip_printer_footer(self, output):
+        # Top-level printers are all there is: a flattened subgraph's printers are hoisted
+        # into this builder, and a child built with for_subgraph has its printers removed.
+        if not isinstance(output, str):
+            return output
+        for spec in getattr(self.builder, 'nodes', {}).values():
+            printer = getattr(spec, 'runnable', None)
+            if isinstance(printer, PrinterNode) and output.endswith(printer.footer):
+                # A printer that rendered nothing leaves no answer, not ''
+                return output[:-len(printer.footer)] or None
+        return output
+
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,
                *args, **kwargs):
@@ -2744,6 +2761,9 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                     output = (
                         normalize_message_content(messages[-1].content) if messages else None
                     ) if messages else result.get('output')
+                # Nothing after the printer answered, so this is the printer's own reply
+                # from the paused turn; the run has finished, so drop its resume hint (#6889).
+                output = self._strip_printer_footer(output)
             elif printer_output is not None:
                 # Printer node has output (interrupted state)
                 output = normalize_message_content(printer_output) if not isinstance(printer_output, str) else printer_output
