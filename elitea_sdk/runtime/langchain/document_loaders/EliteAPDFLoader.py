@@ -10,7 +10,9 @@ from langchain_core.documents import Document
 from langchain_text_splitters import TokenTextSplitter
 
 from .ImageParser import ImageParser
-from .sections import SHORT_PART_CHARS, SectionIndex, detect_headings, outline_headings, page_metadata
+from .sections import (
+    HEADING_TOP_SLACK_CHARS, MAX_HEADINGS_PER_PAGE, SHORT_PART_CHARS, SectionIndex, detect_headings,
+    outline_headings, page_metadata)
 from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
 from ..tools.utils import encode_image_bytes_for_llm
 from langchain_core.tools import ToolException
@@ -30,6 +32,7 @@ class _Part:
     tail: Optional['_Part'] = None   # the first part of the next page, joined behind this one
     absorbed: bool = False           # joined behind the part before it
     lead: int = 0                    # offset of the opening heading when blanks come before it on a cut page
+    slack: int = HEADING_TOP_SLACK_CHARS   # how far below the part start a heading still names its first chunk
 
     @property
     def page(self) -> int:
@@ -39,25 +42,41 @@ class _Part:
         return self.text if self.tail is None else f'{self.text}\n{self.tail.text}'
 
     def locate(self, offset: int) -> tuple['_Part', int]:
-        """The piece (this part or the joined one) and the page offset of one character of the joined text."""
-        if self.tail is not None and offset > len(self.text):
-            return self.tail, self.tail.start + offset - len(self.text) - 1
+        """The piece (this part or the joined one) and the page offset of one character of the joined text.
+
+        The newline that joins the two texts belongs to the tail: a chunk that starts at it starts there.
+        """
+        if self.tail is not None and offset >= len(self.text):
+            return self.tail, self.tail.start + max(offset - len(self.text) - 1, 0)
         return self, self.start + offset
 
 
+def _is_header_line(head: str) -> bool:
+    """One short line, such as a running header, and nothing else."""
+    head = head.strip()
+    return len(head) < SHORT_PART_CHARS and len(head.splitlines()) == 1
+
+
 def _cut_pages(docs, sections: SectionIndex) -> list[list[_Part]]:
-    """Cut each page where a top-level heading starts after some text, so a part never holds two top sections."""
+    """Cut each page where a top-level heading starts after some text, so a part never holds two top sections.
+
+    One short line above the first heading of a page is a running header and stays with the chapter.
+    """
     pages = []
     for doc in docs:
         text = doc.page_content or ''
-        starts = sections.top_starts(doc.metadata['page'])
-        cuts = [offset for offset in starts if text[:offset].strip()]
+        starts = sections.top_starts(doc.metadata['page'])[:MAX_HEADINGS_PER_PAGE]
+        first_text = len(text) - len(text.lstrip())
+        cuts = [offset for index, offset in enumerate(starts)
+                if offset > first_text and not (index == 0 and _is_header_line(text[first_text:offset]))]
         bounds = [0, *cuts, len(text)]
         parts = [_Part(doc, low, text[low:high], bool(cuts)) for low, high in pairwise(bounds)]
         parts[0].opens = len(cuts) < len(starts)
-        if cuts and parts[0].opens:
-            # The slack of section_at is off on a cut page, so the first chunk asks at the heading itself.
-            parts[0].lead = starts[0]
+        if cuts:
+            # The first part must not name its first chunk after the heading that the next part starts with.
+            parts[0].slack = min(HEADING_TOP_SLACK_CHARS, cuts[0] - 1)
+            if parts[0].opens:
+                parts[0].lead = starts[0]
         pages.append(parts)
     return pages
 
@@ -260,23 +279,28 @@ class EliteAPDFLoader:
         _join_short_parts(pages)
         splitter = None
         if self.max_tokens and self.max_tokens > 0:
+            # Literal text such as '<|endoftext|>' in a document is text, not a control token.
             splitter = TokenTextSplitter(encoding_name="cl100k_base", chunk_size=self.max_tokens, chunk_overlap=0,
-                                         add_start_index=True)
+                                         disallowed_special=())
         chunks = []
         for part in (part for page in pages for part in page if not part.absorbed):
             text = part.joined_text()
-            pieces = [(text, 0)]
+            pieces = [text]
             if splitter:
-                pieces = [(c.page_content, c.metadata['start_index']) for c in splitter.create_documents([text])]
+                pieces = [c.page_content for c in splitter.create_documents([text])]
             cursor = 0
-            for chunk_text, start in pieces:
-                if start < 0:   # chunk text not found verbatim in the part (token split inside a character)
-                    start = cursor
-                cursor = start + len(chunk_text)
+            for chunk_text in pieces:
+                # The splitter's own start_index restarts near 0 after a chunk it cannot find, and then matches
+                # repeated text of an earlier page; a search that never goes back keeps the pages in order.
+                found = text.find(chunk_text, cursor)
+                start = max(found, cursor)
+                # A token split inside a multi-byte character leaves U+FFFD marks that the text does not hold.
+                body = chunk_text if found >= 0 else chunk_text.replace('�', '')
+                cursor = start + len(body)
                 first, offset = part.locate(start)
-                last, _ = part.locate(max(start, cursor - 1))
+                last, _ = part.locate(start + max(len(body.rstrip()) - 1, 0))
                 metadata = {**first.doc.metadata, 'chunk_id': len(chunks), **page_metadata(first.page, last.page),
-                            **sections.section_at(first.page, max(offset, first.lead), top_slack=not first.cut)}
+                            **sections.section_at(first.page, max(offset, first.lead), top_slack=first.slack)}
                 chunks.append(Document(page_content=chunk_text, metadata=metadata))
         return chunks
 

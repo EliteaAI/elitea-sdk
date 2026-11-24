@@ -36,6 +36,7 @@ MAX_SECTION_TITLE_CHARS = 160       # longer outline titles are cut; longer line
 MAX_HEADING_LINE_CHARS = 120        # a text line longer than this is never a heading
 MAX_HEADING_WORDS = 15
 MAX_NUMBER_COMPONENT = 99           # "2024.03" is a date or version, not a section
+MAX_TITLE_MATCH_CHARS = 60          # characters of an outline title searched for in the page text
 NUMBER_GAP = 2                      # missed headings tolerated between two accepted numbers
 # A heading that starts within this many characters of a chunk's start still names the chunk:
 # page chunks usually begin with a running header line above the first heading.
@@ -48,7 +49,9 @@ MAX_ADJACENT_HEADINGS = 2
 
 _NUMBERED_RE = re.compile(r'^(\d{1,2}(?:\.\d{1,2}){0,5})\.?\s+(\S.*)$')
 _KEYWORD_RE = re.compile(
-    r'^(Chapter|Section|Article|Part|Appendix|Annex)\s+(\d{1,3}(?:\.\d{1,2}){0,5}|[IVXLC]{1,7}|[A-Z])\b\.?'
+    r'^(Chapter|Section|Article|Part|Appendix|Annex)\s+'
+    # A letter with dotted parts ("D.2") goes before the Roman branch, or "C.1" would read as Roman C.
+    r'(\d{1,3}(?:\.\d{1,2}){0,5}|[A-Z](?:\.\d{1,2}){1,5}|[IVXLC]{1,7}|[A-Z])\b\.?'
     r'(?:\s*[:.\-–—]\s*|\s+)?(.*)$')
 _DOT_LEADER_RE = re.compile(r'(\.\s?){3,}|…')
 _TRAILING_PAGE_RE = re.compile(r'\s\d{1,4}$')
@@ -135,9 +138,11 @@ _ROMAN = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100}
 
 
 def _keyword_number(token: str) -> Optional[tuple]:
-    """``4.2`` -> (4, 2); ``IV`` -> (4,); ``B`` -> (2,); anything else -> None."""
-    if token[0].isdigit():
-        numeric = tuple(int(part) for part in token.split('.'))
+    """``4.2`` -> (4, 2); ``IV`` -> (4,); ``B`` -> (2,); ``D.2`` -> (4, 2); anything else -> None."""
+    if token[0].isdigit() or '.' in token:
+        head, *rest = token.split('.')
+        first = int(head) if head.isdigit() else ord(head) - ord('A') + 1
+        numeric = (first, *(int(part) for part in rest))
         return numeric if all(part <= MAX_NUMBER_COMPONENT for part in numeric) else None
     if len(token) == 1 and token not in _ROMAN:
         return (ord(token) - ord('A') + 1,)
@@ -221,11 +226,10 @@ def detect_headings(page_texts: Sequence[str]) -> list[Heading]:
 def outline_headings(toc: Iterable[Sequence], page_texts: Sequence[str]) -> list[Heading]:
     """Map outline entries ``[level, title, page (1-based), ...]`` to headings.
 
-    The entry is placed where its title appears in the page text; when the title is not found the entry
-    is taken to start at the top of its page.
+    The entry is placed where its title starts a line of the page text; when no line starts with it the
+    entry is taken to start at the top of its page, which never cuts the page.
     """
     headings = []
-    folded: dict[int, str] = {}
     for index, entry in enumerate(toc):
         if index >= MAX_OUTLINE_ENTRIES:
             break
@@ -238,22 +242,22 @@ def outline_headings(toc: Iterable[Sequence], page_texts: Sequence[str]) -> list
         number, clean_title = split_heading_text(title)
         if not number and not clean_title:
             continue
-        offset = _find_offset(page_texts[page - 1], title, folded, page)
+        offset = _find_offset(page_texts[page - 1], title)
         headings.append(Heading(page - 1, offset, number, clean_title, level=level))
     headings.sort(key=lambda h: (h.page, h.offset))
     return headings
 
 
-def _find_offset(page_text: str, title: str, folded: dict, page: int) -> int:
-    needle = _clean(title)[:60]
+def _find_offset(page_text: str, title: str) -> int:
+    """Offset of the first line of ``page_text`` that starts with ``title`` (a title may wrap over lines); 0 when none."""
+    needle = _clean(title)[:MAX_TITLE_MATCH_CHARS]
     if not needle or not page_text:
         return 0
-    position = page_text.find(needle)
-    if position < 0:
-        if page not in folded:
-            folded[page] = page_text.lower()   # once per page, not once per entry
-        position = folded[page].find(needle.lower())
-    return max(position, 0)
+    words = r'\s+'.join(re.escape(word) for word in needle.split())
+    # A title cut at the limit may end inside a word; a whole title must not continue into another word.
+    end = '' if len(_clean(title)) > MAX_TITLE_MATCH_CHARS else r'(?!\w)'
+    match = re.search(rf'^[ \t]*({words}){end}', page_text, re.IGNORECASE | re.MULTILINE)
+    return match.start(1) if match else 0
 
 
 class SectionIndex:
@@ -266,13 +270,13 @@ class SectionIndex:
     def __bool__(self) -> bool:
         return bool(self._headings)
 
-    def section_at(self, page: int, offset: int = 0, top_slack: bool = True) -> dict:
+    def section_at(self, page: int, offset: int = 0, top_slack: int = HEADING_TOP_SLACK_CHARS) -> dict:
         """Section of a chunk starting at ``offset`` of ``page``; the top-of-page slack applies at offset 0 only.
 
-        A page that is cut at its top-level headings turns the slack off: its first part must not take a
-        heading that the next part starts with.
+        The first part of a page that is cut at its top-level headings passes a smaller ``top_slack``: it
+        must not take the heading that the next part starts with.
         """
-        slack = HEADING_TOP_SLACK_CHARS if offset == 0 and top_slack else 0
+        slack = top_slack if offset == 0 else 0
         position = bisect_right(self._keys, (page, offset + slack))
         if position == 0:
             return {}
