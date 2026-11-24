@@ -1031,7 +1031,7 @@ class EliteAClient:
                 raise ValueError('Invalid Auto measured reasoning contract')
             expected_fields = {}
             if effort is not None:
-                expected_fields = ({'reasoning': {'effort': effort}}
+                expected_fields = ({'reasoning_effort': effort}
                     if routing_transport == 'chat_completions' else {
                         'thinking': {'type': 'adaptive', 'display': 'summarized'},
                         'output_config': {'effort': effort},
