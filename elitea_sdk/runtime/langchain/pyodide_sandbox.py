@@ -44,6 +44,12 @@ def get_default_pkg_name() -> str | None:
     return os.environ.get("PYODIDE_SANDBOX_PKG")
 
 
+def _usable_snapshot_path() -> str | None:
+    # Set by indexer_worker when the snapshot flag is on (#6718); a granted read of a vanished file is harmless.
+    path = os.environ.get("SANDBOX_SNAPSHOT_PATH")
+    return path if path and os.path.isfile(path) else None
+
+
 def build_permission_flag(
     flag: str,
     *,
@@ -137,9 +143,13 @@ class BasePyodideSandbox:
         ]
 
         # Add permission flags
+        snapshot = _usable_snapshot_path()
+        allow_read = self.allow_read
+        if snapshot and isinstance(allow_read, list):
+            allow_read = [*allow_read, snapshot]
         permission_configs = [
             ("--allow-env", self.allow_env),
-            ("--allow-read", self.allow_read),
+            ("--allow-read", allow_read),
             ("--allow-write", self.allow_write),
             ("--allow-net", self.allow_net),
             ("--allow-run", self.allow_run),
@@ -179,10 +189,11 @@ class BasePyodideSandbox:
 
         # Add the package and stdin flag (code will be passed via stdin to avoid
         # Linux kernel's MAX_ARG_STRLEN 128KB limit on individual CLI arguments)
+        snapshot_flag = [f"--snapshot={snapshot}"] if snapshot else []
         if bridge_max_line_bytes:
-            cmd.extend([self.pkg_name, "--bridge", f"--max-line-bytes={int(bridge_max_line_bytes)}"])
+            cmd.extend([self.pkg_name, "--bridge", f"--max-line-bytes={int(bridge_max_line_bytes)}", *snapshot_flag])
             return cmd
-        cmd.extend([self.pkg_name, "--stdin"])
+        cmd.extend([self.pkg_name, "--stdin", *snapshot_flag])
 
         # Add stateful flag
         if self.stateful:
