@@ -346,10 +346,10 @@ def send_with_retry(send: Callable[[], requests.Response],
             delay = _retry_after_seconds(resp, attempt)
             logger.info("[SP-library] Graph answered %s; retrying in %.1fs (attempt %d)",
                         resp.status_code, delay, attempt + 1)
-            try:
-                resp.close()   # a streamed answer holds its connection until it is closed
-            except AttributeError:
-                pass
+            # a streamed answer holds its connection until it is closed
+            close = getattr(resp, "close", None)
+            if callable(close):
+                close()
             sleep(delay)
             attempt += 1
             continue

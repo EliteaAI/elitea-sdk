@@ -39,7 +39,8 @@ from ..utils.source_info import join_location, reuse_url, web_base
 # Settings that decide which files an index run covers. A run that covers other files than the
 # run before it must not remove rows, because the rows of the earlier scope look absent.
 INDEX_SCOPE_KEYS = ('path', 'form_name', 'include_extensions', 'skip_extensions',
-                    'library_lists', 'categories', 'include_onenote', 'onenote_filter')
+                    'library_lists', 'metadata_fields', 'categories', 'limit_files', 'include_onenote')
+DEFAULT_LIMIT_FILES = 10000
 
 # ------------------------------------------------------------------ #
 #  Read-safety: block executable / binary files (read_document only)  #
@@ -1237,6 +1238,9 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         scope = {}
         for key in INDEX_SCOPE_KEYS:
             value = (index_configuration or {}).get(key)
+            if key == 'limit_files' and value is None:
+                # The loader treats a missing limit as the default, so both forms compare equal.
+                value = DEFAULT_LIMIT_FILES
             if isinstance(value, (list, tuple, set)):
                 value = sorted(str(item) for item in value)
             scope[key] = None if value in (None, '', [], {}, False) else value
@@ -1246,6 +1250,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         """True when this run's listing proves which files are gone, so the clean-up may remove rows."""
         run = getattr(self, '_index_run', None)
         if run is None or gaps or kwargs.get('include_onenote') or listed >= list_limit:
+            return False
+        if listed == 0 and self._has_previous_index_run():
+            # An empty listing of an index that held files can come from a renamed or removed
+            # library. Clean index is the way to empty such an index on purpose.
             return False
         return not run.meta_existed or run.run_scope == run.last_run_scope
 

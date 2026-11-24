@@ -810,6 +810,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                             continue
                     typed_queue.append(
                         (did, f"{_GRAPH_BASE}/drives/{did}/root/children"))
+                if form_name and not typed_queue and on_listing_gap:
+                    # A renamed or removed library lists nothing; that is not proof that
+                    # the library holds no files.
+                    on_listing_gap("no document library matched the form name")
 
             while typed_queue and len(result) < limit_files:
                 drive_id, url = typed_queue.pop(0)

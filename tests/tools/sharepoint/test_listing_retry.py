@@ -4,6 +4,7 @@ Without the retry a single 429 in the middle of a listing ends the walk, and a
 change check would read the missing files as removed.
 """
 
+import io
 import json
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ def _response(status: int, body: dict = None, headers: dict = None) -> requests.
     resp = requests.Response()
     resp.status_code = status
     resp._content = json.dumps(body if body is not None else {}).encode()
+    resp.raw = io.BytesIO()  # a real response has a raw stream that close() releases
     resp.url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/children"
     resp.headers.update(headers or {})
     return resp
@@ -97,6 +99,23 @@ class TestGraphListing:
         with patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(200, {"value": [FILE]})):
             _graph().get_files_list(limit_files=10, on_listing_gap=gaps.append)
 
+        assert gaps == []
+
+    def test_a_form_name_that_matches_no_library_reports_a_gap(self):
+        gaps = []
+        with patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(200, {"value": [FILE]})) as get:
+            result = _graph().get_files_list(form_name="Renamed Library", on_listing_gap=gaps.append)
+
+        assert result == []
+        assert get.call_count == 0
+        assert len(gaps) == 1
+
+    def test_a_form_name_that_matches_a_library_reports_no_gap(self):
+        gaps = []
+        with patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(200, {"value": [FILE]})):
+            result = _graph().get_files_list(form_name="shared documents", on_listing_gap=gaps.append)
+
+        assert len(result) == 1
         assert gaps == []
 
 

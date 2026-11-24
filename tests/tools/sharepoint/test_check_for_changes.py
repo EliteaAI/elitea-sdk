@@ -264,6 +264,25 @@ class TestOrphanRemovalGates:
 
         assert toolkit._index_run.loader_attested is False
 
+    def test_an_empty_listing_of_an_index_with_earlier_runs_does_not_attest(self):
+        toolkit = toolkit_with(Backend([]))
+        toolkit._index_meta_config = {"previous_runs": 2}
+        scope = toolkit._run_scope_keys({})
+        toolkit._index_run = run_state(last_scope=scope, run_scope=scope)
+
+        assert list(toolkit._base_loader(limit_files=50)) == []
+
+        assert toolkit._index_run.loader_attested is False
+
+    def test_an_empty_listing_of_a_first_run_attests(self):
+        toolkit = toolkit_with(Backend([]))
+        toolkit._index_meta_config = {"previous_runs": 0}
+        toolkit._index_run = run_state(meta_existed=False, run_scope=toolkit._run_scope_keys({}))
+
+        assert list(toolkit._base_loader(limit_files=50)) == []
+
+        assert toolkit._index_run.loader_attested is True
+
     def test_a_loader_outside_an_index_run_attests_nothing(self):
         toolkit = toolkit_with(Backend([listed_file()]))
 
@@ -275,6 +294,17 @@ class TestOrphanRemovalGates:
         assert toolkit._run_scope_keys({"include_extensions": ["pdf", "docx"], "path": ""}) == \
             toolkit._run_scope_keys({"include_extensions": ["docx", "pdf"], "path": None})
         assert toolkit._run_scope_keys({"path": "a"}) != toolkit._run_scope_keys({"path": "b"})
+
+    def test_scope_holds_the_limit_and_the_metadata_fields_but_not_the_onenote_filter(self):
+        toolkit = toolkit_with(Backend())
+
+        scope = toolkit._run_scope_keys({"onenote_filter": {"capture_images": False}})
+
+        assert {"limit_files", "metadata_fields"} <= set(scope)
+        assert "onenote_filter" not in scope
+        assert toolkit._run_scope_keys({}) == toolkit._run_scope_keys({"limit_files": 10000})
+        assert toolkit._run_scope_keys({"limit_files": 50}) != toolkit._run_scope_keys({})
+        assert toolkit._run_scope_keys({"metadata_fields": ["a=b"]}) != toolkit._run_scope_keys({})
 
 
 class TestRunScopeLifecycle:
