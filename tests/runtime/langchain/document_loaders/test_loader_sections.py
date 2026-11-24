@@ -191,9 +191,10 @@ class TestPdfOutline:
         assert len(docs) > 2
         assert docs[0].metadata["section_title"] == "Scope"
         index = next(i for i, d in enumerate(docs) if "2 Access control" in d.page_content)
-        # the chunk that contains the heading starts in section 1; the chunks after it are in section 2
-        if not docs[index].page_content.lstrip().startswith("2 Access control"):
-            assert docs[index].metadata["section_title"] == "Scope"
+        # the page is cut at the top-level heading, so the chunk with it starts section 2 and no chunk mixes both
+        assert docs[index].page_content.lstrip().startswith("2 Access control")
+        assert docs[index].metadata["section_title"] == "Access control"
+        assert all(d.metadata["section_title"] == "Scope" for d in docs[:index])
         assert all(d.metadata["section_title"] == "Access control" for d in docs[index + 1:])
         assert docs[-1].metadata["section_number"] == "2"
         assert all("start_index" not in d.metadata for d in docs)
