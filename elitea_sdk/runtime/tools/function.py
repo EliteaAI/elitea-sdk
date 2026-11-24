@@ -10,7 +10,7 @@ from uuid import uuid4
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.messages import ToolCall
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, ToolException
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
@@ -132,6 +132,10 @@ alita_state = elitea_state.copy()
 
     def _handle_pyodide_output(self, tool_result: Any) -> dict:
         """Handle output processing for PyodideSandboxTool results."""
+        if not isinstance(tool_result, dict):
+            # Sandbox returns a plain error string when it fails before execution
+            raise ToolException(str(tool_result))
+
         tool_result_converted = {}
 
         if self.output_variables:
