@@ -99,6 +99,23 @@ class TestListingHook:
         assert "OneNote pages are not checked" in report["warnings"]
         assert any("OneNote" in blocker for blocker in listing.attest_blockers)
 
+    def test_the_reason_says_a_full_run_can_delete_onenote_rows_when_onenote_is_off(self):
+        toolkit = toolkit_with(Backend([listed_file()]))
+        listing = toolkit._list_source_items({"limit_files": 50})
+
+        report = check.build_report("idx", check.compare(listing, {}, {}), listing, True, excluded_rows=2)
+
+        assert "next complete full run can delete them" in report["reason"]
+
+    def test_the_reason_says_changes_are_not_reported_when_onenote_is_on(self):
+        toolkit = toolkit_with(Backend([listed_file()]))
+        listing = toolkit._list_source_items({"limit_files": 50, "include_onenote": True})
+
+        report = check.build_report("idx", check.compare(listing, {}, {}), listing, True, excluded_rows=2)
+
+        assert "changes there are not reported" in report["reason"]
+        assert "can delete them" not in report["reason"]
+
     def test_the_limit_is_a_gap_when_files_are_left_over(self):
         toolkit = toolkit_with(Backend([listed_file(file_id="f1"), listed_file("b.docx", file_id="f2")]))
         backend_files = toolkit._backend.files

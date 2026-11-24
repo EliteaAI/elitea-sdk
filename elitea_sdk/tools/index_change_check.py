@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 REPORT_SCHEMA_VERSION = 1
 MAX_LISTED_PER_GROUP = 200
+# A listing can report one gap per folder or page; the report keeps the model context small.
+MAX_REPORT_LINES = 20
 
 STATUS_UP_TO_DATE = "up_to_date"
 STATUS_ADD_ONLY = "add_only"
@@ -95,6 +97,14 @@ def compare(listing: SourceListing, indexed: Dict[str, ListedItem],
     return result
 
 
+def _capped_lines(lines: List[str]) -> List[str]:
+    """Distinct lines in order, cut to MAX_REPORT_LINES with a '+N more' line."""
+    distinct = list(dict.fromkeys(lines))
+    if len(distinct) <= MAX_REPORT_LINES:
+        return distinct
+    return distinct[:MAX_REPORT_LINES] + [f"+{len(distinct) - MAX_REPORT_LINES} more"]
+
+
 def _status(comparison: Comparison) -> str:
     if comparison.changed or comparison.removed:
         return STATUS_NEEDS_CLEAN_REINDEX
@@ -112,7 +122,7 @@ def _reason(status: str, comparison: Comparison, listing: SourceListing, exclude
         text = "Changed or removed items found. Run index_data with clean_index to rebuild the index."
         if listing.attest_blockers:
             text += (" Clean index will not remove the chunks of removed items, because "
-                     + "; ".join(listing.attest_blockers) + ".")
+                     + "; ".join(_capped_lines(listing.attest_blockers)) + ".")
     if not comparison.listing_complete:
         text += " The listing is incomplete, so removed items cannot be found."
     if excluded_rows and listing.unchecked_reason:
@@ -148,6 +158,6 @@ def build_report(index_name: str, comparison: Comparison, listing: SourceListing
         },
         "items": {name: _paths(items) for name, items in groups.items()},
         "items_truncated": any(len(items) > MAX_LISTED_PER_GROUP for items in groups.values()),
-        "warnings": warnings,
+        "warnings": _capped_lines(warnings),
         "reason": _reason(status, comparison, listing, excluded_rows),
     }

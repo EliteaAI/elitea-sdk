@@ -1297,7 +1297,11 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             items=items, complete=not gaps, gaps=gaps, id_family=type(self._backend).__name__,
             attest_blockers=blockers,
             unchecked_note="OneNote pages are not checked",
-            unchecked_reason="OneNote pages are not checked, so changes there are not reported.")
+            unchecked_reason=(
+                "OneNote pages are not checked, so changes there are not reported."
+                if kwargs.get('include_onenote') else
+                "OneNote pages are in the index but OneNote is now off, so the next complete "
+                "full run can delete them."))
 
     # ------------------------------------------------------------------ #
     #  OneNote helpers                                                     #

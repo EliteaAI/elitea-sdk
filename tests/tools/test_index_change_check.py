@@ -194,6 +194,31 @@ class TestReportCaps:
         assert "Turn include_onenote on to keep them." in report["reason"]
 
 
+class TestReportBounds:
+
+    def test_a_gap_repeated_for_every_folder_shows_once(self):
+        _, report = run_compare([item("a")], [item("a")], unindexed={}, gaps=["a folder page could not be read"] * 500)
+
+        assert report["warnings"].count("a folder page could not be read") == 1
+
+    def test_distinct_warnings_are_capped_with_a_count_of_the_rest(self):
+        gaps = [f"folder {n} could not be read" for n in range(check.MAX_REPORT_LINES + 7)]
+
+        _, report = run_compare([item("a")], [item("a")], unindexed={}, gaps=gaps)
+
+        assert len(report["warnings"]) == check.MAX_REPORT_LINES + 1
+        assert "+7 more" in report["warnings"]
+
+    def test_the_reason_lists_each_blocker_once_and_caps_the_rest(self):
+        blockers = ["a folder page could not be read"] * 300 + [f"folder {n} failed" for n in range(40)]
+
+        _, report = run_compare([item("a", marker="2")], [item("a")], unindexed={}, attest_blockers=blockers)
+
+        assert report["reason"].count("a folder page could not be read") == 1
+        assert "+21 more" in report["reason"]
+        assert len(report["reason"]) < 1000
+
+
 class _Indexed(NonCodeIndexerToolkit):
     """Toolkit double with a source listing."""
 
@@ -278,6 +303,45 @@ class TestCheckTool:
         indexed_toolkit.check_for_changes("idx")
 
         assert indexed_toolkit.seen_configuration == {"path": "/lib"}
+
+    @pytest.fixture
+    def scoped_toolkit(self, indexed_toolkit, monkeypatch):
+        monkeypatch.setattr(_Indexed, "_index_scope", lambda self, cfg: {"path": cfg.get("path")})
+        indexed_toolkit.listing_items = [item("a", marker="2")]
+        indexed_toolkit.stored_rows = {"a": row("a", "1")}
+        return indexed_toolkit
+
+    def test_reason_names_a_scope_that_differs_from_the_last_run(self, scoped_toolkit):
+        scoped_toolkit.stored_meta["metadata"]["last_run_scope"] = {"path": "/other"}
+
+        report = scoped_toolkit.check_for_changes("idx")
+
+        assert report["status"] == check.STATUS_NEEDS_CLEAN_REINDEX
+        assert "the saved scope differs from the last run" in report["reason"]
+
+    def test_reason_names_a_missing_last_run_scope(self, scoped_toolkit):
+        report = scoped_toolkit.check_for_changes("idx")
+
+        assert "no earlier run recorded its scope" in report["reason"]
+
+    def test_reason_reads_the_scope_from_the_history_after_the_dispatch_reset(self, scoped_toolkit):
+        scoped_toolkit.stored_meta["metadata"]["history"] = json.dumps([
+            {"state": "completed", "last_run_scope": {"path": "/lib"}},
+            {"state": "in_progress"},
+        ])
+
+        report = scoped_toolkit.check_for_changes("idx")
+
+        assert "scope" not in report["reason"]
+        assert "will not remove" not in report["reason"]
+
+    def test_a_toolkit_without_a_scope_names_no_scope_cause(self, indexed_toolkit):
+        indexed_toolkit.listing_items = [item("a", marker="2")]
+        indexed_toolkit.stored_rows = {"a": row("a", "1")}
+
+        report = indexed_toolkit.check_for_changes("idx")
+
+        assert "scope" not in report["reason"]
 
     def test_dependent_pk_fallback_and_child_rows_are_not_compared(self, indexed_toolkit):
         indexed_toolkit.listing_items = [item("a")]
@@ -374,7 +438,8 @@ def meta_toolkit(monkeypatch):
 
 class TestRunFacts:
 
-    def test_a_successful_write_stores_scope_and_unindexed_items_outside_history(self, meta_toolkit):
+    def test_a_successful_write_keeps_unindexed_items_out_of_history_and_the_scope_in_the_last_entry(
+            self, meta_toolkit):
         toolkit, adapter = meta_toolkit
 
         toolkit.index_meta_update(
@@ -385,8 +450,35 @@ class TestRunFacts:
         assert patch["last_run_scope"] == {"path": "/new"}
         assert patch["unindexed_items"] == {"k": "5"}
         history = json.loads(patch["history"])
-        assert "last_run_scope" not in history[-1]
+        assert history[-1]["last_run_scope"] == {"path": "/new"}
         assert "unindexed_items" not in history[-1]
+
+    def test_an_older_history_entry_loses_its_scope_when_a_newer_run_records_one(self, meta_toolkit):
+        toolkit, adapter = meta_toolkit
+        stored = VectorStoreWrapperBase.get_index_meta(toolkit, "idx")
+        stored["metadata"]["history"] = json.dumps([
+            {"state": "completed", "last_run_scope": {"path": "/old"}},
+            {"state": "in_progress"},
+        ])
+
+        toolkit.index_meta_update("idx", "completed", 3, last_run_scope={"path": "/new"})
+
+        history = json.loads(adapter.patches[-1]["history"])
+        assert [entry.get("last_run_scope") for entry in history] == [None, {"path": "/new"}]
+
+    def test_a_failed_write_leaves_the_scope_of_the_last_good_entry_alone(self, meta_toolkit):
+        toolkit, adapter = meta_toolkit
+        stored = VectorStoreWrapperBase.get_index_meta(toolkit, "idx")
+        stored["metadata"]["history"] = json.dumps([
+            {"state": "completed", "last_run_scope": {"path": "/old"}},
+            {"state": "in_progress"},
+        ])
+
+        toolkit.index_meta_update("idx", "failed", 0, error="boom")
+
+        history = json.loads(adapter.patches[-1]["history"])
+        assert history[0]["last_run_scope"] == {"path": "/old"}
+        assert "last_run_scope" not in history[-1]
 
     def test_a_write_without_run_facts_keeps_the_stored_values(self, meta_toolkit):
         toolkit, adapter = meta_toolkit

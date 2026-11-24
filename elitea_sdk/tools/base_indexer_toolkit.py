@@ -3134,6 +3134,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 f"listed. Run index_data first. {self._available_indexes_note()}"
             )
         listing = self._list_source_items(configuration)
+        self._add_scope_blocker(listing, configuration, index_meta.get("metadata") or {})
         indexed_data = self._get_indexed_data(index_name)
         dependent_keys = self._dependent_keys(indexed_data)
         indexed: Dict[str, index_change_check.ListedItem] = {}
@@ -3158,6 +3159,18 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         return index_change_check.build_report(
             index_name, comparison, listing, unindexed_recorded, excluded_rows
         )
+
+    def _add_scope_blocker(self, listing: index_change_check.SourceListing, configuration: Dict[str, Any],
+                           metadata: Dict[str, Any]):
+        """Name the scope cause when the next full run cannot confirm which source items are gone."""
+        current = self._index_scope(configuration)
+        if current is None:
+            return
+        stored = self._stored_last_run_scope(metadata)
+        if stored is None:
+            listing.attest_blockers.append("no earlier run recorded its scope")
+        elif stored != current:
+            listing.attest_blockers.append("the saved scope differs from the last run")
 
     def _available_indexes_note(self) -> str:
         try:
@@ -3459,6 +3472,32 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if isinstance(entry, dict) and entry.get("state") in COMPLETED_INDEX_STATES
         ])
 
+    @staticmethod
+    def _stored_last_run_scope(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The scope of the last successful run, or None when no run recorded one.
+
+        The platform rebuilds the row at every dispatch and keeps only its own keys and the
+        history, so the row key is gone by the time a run starts. The history entry of the
+        successful run still carries the scope.
+        """
+        scope = metadata.get("last_run_scope")
+        if isinstance(scope, dict):
+            return scope
+        history_raw = metadata.get("history")
+        if not isinstance(history_raw, str) or not history_raw.strip():
+            return None
+        try:
+            history = json.loads(history_raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(history, list):
+            return None
+        for entry in reversed(history):
+            if (isinstance(entry, dict) and entry.get("state") in COMPLETED_INDEX_STATES
+                    and isinstance(entry.get("last_run_scope"), dict)):
+                return entry["last_run_scope"]
+        return None
+
     def index_meta_init(self, index_name: str, index_configuration: dict[str, Any]):
         from ..runtime.langchain.interfaces.llm_processor import add_documents
         self._ensure_vectorstore_initialized()
@@ -3470,8 +3509,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         initiator = self._resolve_initiator()
         if run is not None:
             run.meta_existed = bool(index_meta)
-            stored_scope = ((index_meta or {}).get("metadata") or {}).get("last_run_scope")
-            run.last_run_scope = stored_scope if isinstance(stored_scope, dict) else None
+            run.last_run_scope = self._stored_last_run_scope((index_meta or {}).get("metadata") or {})
             run.run_scope = self._index_scope(index_configuration)
         if not index_meta:
             self._log_tool_event(
@@ -3722,7 +3760,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # The latest-run keys describe the row, not one run: a copy in every
                 # history entry would be re-shipped by every indexes-list read.
                 entry = {k: v for k, v in metadata.items() if k not in LATEST_RUN_META_KEYS}
+                if last_run_scope is not None:
+                    # The dispatch reset of the platform drops the row key but keeps the
+                    # history, so the successful run's entry is where the scope survives.
+                    entry["last_run_scope"] = last_run_scope
                 if history and isinstance(history, list):
+                    if last_run_scope is not None:
+                        for older in history[:-1]:
+                            if isinstance(older, dict):
+                                older.pop("last_run_scope", None)
                     history[-1] = entry
                 else:
                     history = [entry]
