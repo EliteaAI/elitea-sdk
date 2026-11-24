@@ -1918,12 +1918,15 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         self._parallel_hitl_max_concurrency = parallel_hitl_max_concurrency
 
     def _strip_printer_footer(self, output):
+        # Top-level printers are all there is: a flattened subgraph's printers are hoisted
+        # into this builder, and a child built with for_subgraph has its printers removed.
         if not isinstance(output, str):
             return output
         for spec in getattr(self.builder, 'nodes', {}).values():
             printer = getattr(spec, 'runnable', None)
             if isinstance(printer, PrinterNode) and output.endswith(printer.footer):
-                return output[:-len(printer.footer)]
+                # A printer that rendered nothing leaves no answer, not ''
+                return output[:-len(printer.footer)] or None
         return output
 
     def invoke(self, input: Union[dict[str, Any], Any],
