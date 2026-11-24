@@ -662,6 +662,7 @@ class PyodideSandboxTool(BaseTool):
             user_id=getattr(client, 'user_id', None),
             governed=is_run_token_bearer(client),
             max_result_bytes=bridge["max_line_bytes"],
+            deadline=time.monotonic() + limits["timeout_seconds"],
         )
         try:
             result = await self._sandbox.execute_with_bridge(

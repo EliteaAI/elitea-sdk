@@ -297,6 +297,77 @@ def test_one_project_url_helper():
     assert sc.in_project("http://h/api/v2/x/prompt_lib/3", None) == "http://h/api/v2/x/prompt_lib/3"
 
 
+class _SlowClient(FakeClient):
+    """A client whose call blocks in its thread until released, like a slow platform request."""
+
+    def __init__(self, project_id, started, release):
+        super().__init__(project_id)
+        self.started, self.release = started, release
+        self._session = MagicMock()
+        self.timeout = (5, 30)
+        self.sent = []
+
+    def _request(self, method, url, **kwargs):
+        self.sent.append(kwargs.get("timeout"))
+
+    def get_user_data(self):
+        self.started.set()
+        self.release.wait(5)
+        return {"id": 3}
+
+
+def _slow_dispatcher(deadline=None):
+    import threading
+    started, release = threading.Event(), threading.Event()
+    clients = []
+
+    def factory(project_id):
+        clients.append(_SlowClient(project_id, started, release))
+        return clients[0]
+    return bridge.ClientBridgeDispatcher(factory, caller="code_node", audit=lambda **kw: None,
+                                         deadline=deadline), started, release, clients
+
+
+def test_requests_are_bounded_by_the_run_deadline():
+    import time
+    dispatcher, _, _, clients = _slow_dispatcher(deadline=time.monotonic() + 2)
+    client = dispatcher._client(None)
+    client._request("get", "http://x")                       # default (5, 30) is cut to what is left
+    client._request("get", "http://x", timeout=(5, 120))     # an explicit longer timeout too
+    client._request("get", "http://x", timeout=(0.5, 1))     # a shorter one is kept
+    assert all(max(t) <= 2 for t in client.sent[:2]) and client.sent[2] == (0.5, 1)
+    dispatcher.deadline = time.monotonic() - 1
+    with pytest.raises(TimeoutError, match="out of time"):
+        client._request("get", "http://x")
+    assert len(client.sent) == 3                              # the late request was never sent
+
+
+def test_session_stays_open_until_the_inflight_call_finishes():
+    async def scenario():
+        dispatcher, started, release, clients = _slow_dispatcher()
+        call = asyncio.create_task(dispatcher("client.get_user_data", "{}"))
+        await asyncio.to_thread(started.wait, 5)
+        call.cancel()                                          # the run timed out: the await goes, the thread stays
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        dispatcher.close()
+        still_open = not clients[0]._session.close.called
+        release.set()
+        for _ in range(100):
+            if clients[0]._session.close.called:
+                break
+            await asyncio.sleep(0.02)
+        return still_open, clients[0]._session.close.call_count
+    assert asyncio.run(scenario()) == (True, 1)
+
+
+def test_no_new_platform_request_after_close():
+    dispatcher, _, _, _ = _slow_dispatcher()
+    dispatcher.close()
+    reply = json.loads(asyncio.run(dispatcher("client.get_user_data", "{}")))
+    assert reply["ok"] is False and "has ended" in reply["error"]
+
+
 def test_malformed_payload(harness):
     dispatcher, _ = harness()
     reply = json.loads(asyncio.run(dispatcher("client.get_user_data", "not json")))

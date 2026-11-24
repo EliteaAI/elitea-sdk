@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -136,10 +137,15 @@ class ClientBridgeDispatcher:
 
     def __init__(self, client_factory: Callable[[Optional[int]], Any], *, caller: str, project_id: Any = None,
                  user_id: Any = None, governed: bool = False, max_result_bytes: int = 24 * 1024 * 1024,
-                 audit: Callable[..., None] = emit_secret_audit) -> None:
+                 audit: Callable[..., None] = emit_secret_audit, deadline: Optional[float] = None) -> None:
         self._client_factory = client_factory
         self._clients: Dict[Optional[int], Any] = {}
         self._artifacts: Dict[Tuple[Optional[int], str], Any] = {}
+        # time.monotonic() value after which no platform request starts or waits (None = unbounded)
+        self.deadline = deadline
+        self._lock = threading.RLock()
+        self._inflight = 0
+        self._closing = False
         self.caller = caller
         self.project_id = project_id
         self.user_id = user_id
@@ -185,7 +191,7 @@ class ClientBridgeDispatcher:
             self._audit(method, secret_name, "denied")
             return _error("PermissionError", LLM_CODE_REFUSAL)
         try:
-            value = await asyncio.to_thread(self._invoke, kind, method, project_id, args, kwargs)
+            value = await asyncio.to_thread(self._run_in_thread, kind, method, project_id, args, kwargs)
         except Exception as exc:  # pylint: disable=W0718
             error_class = type(exc).__name__
             if secret:
@@ -199,7 +205,13 @@ class ClientBridgeDispatcher:
         return {"ok": True, "value": encode_value(value)}
 
     def close(self) -> None:
-        """Closes the worker-side HTTP sessions this run opened."""
+        """Ends the run's platform access. A request still running in a thread keeps its session; the last one out closes."""
+        with self._lock:
+            self._closing = True
+            if self._inflight == 0:
+                self._close_sessions()
+
+    def _close_sessions(self) -> None:
         for client in self._clients.values():
             try:
                 session = getattr(client, "_session", None)
@@ -211,15 +223,50 @@ class ClientBridgeDispatcher:
         self._artifacts.clear()
 
     def _client(self, project_id: Optional[int]) -> Any:
-        if project_id not in self._clients:
-            self._clients[project_id] = self._client_factory(project_id)
-        return self._clients[project_id]
+        with self._lock:
+            if project_id not in self._clients:
+                client = self._client_factory(project_id)
+                self._bound_to_deadline(client)
+                self._clients[project_id] = client
+            return self._clients[project_id]
+
+    def _bound_to_deadline(self, client: Any) -> None:
+        """Every request the client makes gets timeouts no longer than what is left of the run."""
+        if self.deadline is None or not hasattr(client, "_request"):
+            return
+        original = client._request  # pylint: disable=W0212
+
+        def request(method: str, url: str, **kwargs: Any) -> Any:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("The sandbox run is out of time; the platform request was not sent.")
+            timeout = kwargs.get("timeout", getattr(client, "timeout", None))
+            connect, read = timeout if isinstance(timeout, tuple) else (timeout, timeout)
+            kwargs["timeout"] = tuple(min(t, remaining) if t else remaining for t in (connect, read))
+            return original(method, url, **kwargs)
+
+        client._request = request  # pylint: disable=W0212
 
     def _artifact(self, project_id: Optional[int], bucket_name: str) -> Any:
         key = (project_id, str(bucket_name))
-        if key not in self._artifacts:
-            self._artifacts[key] = self._client(project_id).artifact(bucket_name)
-        return self._artifacts[key]
+        with self._lock:
+            if key not in self._artifacts:
+                self._artifacts[key] = self._client(project_id).artifact(bucket_name)
+            return self._artifacts[key]
+
+    def _run_in_thread(self, kind: str, method: str, project_id: Optional[int], args: list, kwargs: dict) -> Any:
+        # Counted inside the thread: awaiting to_thread can be cancelled after the call has already started.
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("The sandbox run has ended; the platform request was not sent.")
+            self._inflight += 1
+        try:
+            return self._invoke(kind, method, project_id, args, kwargs)
+        finally:
+            with self._lock:
+                self._inflight -= 1
+                if self._closing and self._inflight == 0:
+                    self._close_sessions()
 
     def _invoke(self, kind: str, method: str, project_id: Optional[int], args: list, kwargs: dict) -> Any:
         if kind == "artifact":
