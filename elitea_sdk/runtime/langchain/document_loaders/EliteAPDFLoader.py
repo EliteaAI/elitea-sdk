@@ -1,17 +1,78 @@
 import logging
+from dataclasses import dataclass
+from itertools import pairwise
+from typing import Optional
 
 import pymupdf
 import fitz
 from langchain_community.document_loaders import PyPDFium2Loader
+from langchain_core.documents import Document
 from langchain_text_splitters import TokenTextSplitter
 
 from .ImageParser import ImageParser
-from .sections import SECTION_KEYS, SectionIndex, detect_headings, outline_headings, page_metadata
+from .sections import SHORT_PART_CHARS, SectionIndex, detect_headings, outline_headings, page_metadata
 from .utils import perform_llm_prediction_for_image_bytes, create_temp_file
 from ..tools.utils import encode_image_bytes_for_llm
 from langchain_core.tools import ToolException
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _Part:
+    """The whole text of a page, or the stretch of it between two top-level headings."""
+
+    doc: Document                    # the page that holds the first character
+    start: int                       # offset of that character in the page text
+    text: str
+    cut: bool                        # the page was cut at a top-level heading
+    opens: bool = False              # starts with a top-level heading (only the first part of a page can)
+    tail: Optional['_Part'] = None   # the first part of the next page, joined behind this one
+    absorbed: bool = False           # joined behind the part before it
+
+    @property
+    def page(self) -> int:
+        return self.doc.metadata['page']
+
+    def joined_text(self) -> str:
+        return self.text if self.tail is None else f'{self.text}\n{self.tail.text}'
+
+    def locate(self, offset: int) -> tuple['_Part', int]:
+        """The piece (this part or the joined one) and the page offset of one character of the joined text."""
+        if self.tail is not None and offset > len(self.text):
+            return self.tail, self.tail.start + offset - len(self.text) - 1
+        return self, self.start + offset
+
+
+def _cut_pages(docs, sections: SectionIndex) -> list[list[_Part]]:
+    """Cut each page where a top-level heading starts after some text, so a part never holds two top sections."""
+    pages = []
+    for doc in docs:
+        text = doc.page_content or ''
+        starts = sections.top_starts(doc.metadata['page'])
+        cuts = [offset for offset in starts if text[:offset].strip()]
+        bounds = [0, *cuts, len(text)]
+        parts = [_Part(doc, low, text[low:high], bool(cuts)) for low, high in pairwise(bounds)]
+        parts[0].opens = len(cuts) < len(starts)
+        pages.append(parts)
+    return pages
+
+
+def _join_short_parts(pages: list[list[_Part]]) -> None:
+    """Join the last part of a page with the first part of the next one when a cut made one of them short.
+
+    The first part of a page never starts a top section when it joins, so a join stays in one top section.
+    Pages go in order and a part joins once, so the forward join wins when a whole page sits between two
+    short parts.
+    """
+    def short(part):
+        return part.cut and len(part.text.strip()) < SHORT_PART_CHARS
+
+    for before, after in pairwise(pages):
+        last, first = before[-1], after[0]
+        if (not last.absorbed and not first.opens and last.page + 1 == first.page
+                and last.text.strip() and first.text.strip() and (short(last) or short(first))):
+            last.tail, first.absorbed = first, True
 
 
 class EliteAPDFLoader:
@@ -191,27 +252,29 @@ class EliteAPDFLoader:
                 images_parser = images_parser,
             ).load()
         sections = self._section_index(docs)
-        for doc in docs:
-            doc.metadata['chunk_id'] = doc.metadata['page']
-            doc.metadata.update(page_metadata(doc.metadata['page']))
-            doc.metadata.update(sections.section_at(doc.metadata['page']))
+        pages = _cut_pages(docs, sections)
+        _join_short_parts(pages)
+        splitter = None
         if self.max_tokens and self.max_tokens > 0:
             splitter = TokenTextSplitter(encoding_name="cl100k_base", chunk_size=self.max_tokens, chunk_overlap=0,
                                          add_start_index=True)
-            docs = splitter.split_documents(docs)
-            cursor = {}   # page -> where the previous chunk of that page ended
-            for idx, doc in enumerate(docs):
-                doc.metadata['chunk_id'] = idx
-                page = doc.metadata['page']
-                start = doc.metadata.pop('start_index', -1)
-                if start < 0:   # chunk text not found verbatim in the page (token split inside a character)
-                    start = cursor.get(page, 0)
-                cursor[page] = start + len(doc.page_content)
-                if sections:
-                    for key in SECTION_KEYS:
-                        doc.metadata.pop(key, None)
-                    doc.metadata.update(sections.section_at(page, start))
-        return docs
+        chunks = []
+        for part in (part for page in pages for part in page if not part.absorbed):
+            text = part.joined_text()
+            pieces = [(text, 0)]
+            if splitter:
+                pieces = [(c.page_content, c.metadata['start_index']) for c in splitter.create_documents([text])]
+            cursor = 0
+            for chunk_text, start in pieces:
+                if start < 0:   # chunk text not found verbatim in the part (token split inside a character)
+                    start = cursor
+                cursor = start + len(chunk_text)
+                first, offset = part.locate(start)
+                last, _ = part.locate(max(start, cursor - 1))
+                metadata = {**first.doc.metadata, 'chunk_id': len(chunks), **page_metadata(first.page, last.page),
+                            **sections.section_at(first.page, offset, top_slack=not first.cut)}
+                chunks.append(Document(page_content=chunk_text, metadata=metadata))
+        return chunks
 
     def _section_index(self, docs) -> SectionIndex:
         """Sections from the PDF outline when it has entries, otherwise from numbered headings in the text."""

@@ -17,6 +17,7 @@ of the previously accepted heading, so list items, table rows and dates are left
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
@@ -39,6 +40,9 @@ NUMBER_GAP = 2                      # missed headings tolerated between two acce
 # A heading that starts within this many characters of a chunk's start still names the chunk:
 # page chunks usually begin with a running header line above the first heading.
 HEADING_TOP_SLACK_CHARS = 200
+# A part of a page under this many non-blank characters joins its neighbour page: a lone running header or
+# a three-line section tail is not worth a chunk of its own.
+SHORT_PART_CHARS = 200
 # This many headings on consecutive lines with no text between them are a contents block or a list.
 MAX_ADJACENT_HEADINGS = 2
 
@@ -64,6 +68,7 @@ class Heading:
     title: Optional[str]
     numeric: Optional[tuple] = None  # parsed number, for the continuity check
     kind: str = ''                   # '' for "4.2 Title", the keyword ("chapter", ...) otherwise
+    level: int = 0                   # 1 = top level (outline level, or parts of the number); 0 = not known
 
     def metadata(self) -> dict:
         meta = {}
@@ -114,7 +119,7 @@ def heading_candidate(line: str, page: int, offset: int) -> Optional[Heading]:
         title = _clean(match.group(2))
         if any(part > MAX_NUMBER_COMPONENT for part in numeric) or not _plausible_title(title):
             return None
-        return Heading(page, offset, match.group(1), title, numeric)
+        return Heading(page, offset, match.group(1), title, numeric, level=len(numeric))
     match = _KEYWORD_RE.match(line)
     if match:
         title = _clean(match.group(3))
@@ -122,7 +127,7 @@ def heading_candidate(line: str, page: int, offset: int) -> Optional[Heading]:
         if numeric is None or (title and not _plausible_title(title)):
             return None
         return Heading(page, offset, f'{match.group(1)} {match.group(2)}', title or None, numeric,
-                       match.group(1).lower())
+                       match.group(1).lower(), len(numeric))
     return None
 
 
@@ -234,7 +239,7 @@ def outline_headings(toc: Iterable[Sequence], page_texts: Sequence[str]) -> list
         if not number and not clean_title:
             continue
         offset = _find_offset(page_texts[page - 1], title, folded, page)
-        headings.append(Heading(page - 1, offset, number, clean_title))
+        headings.append(Heading(page - 1, offset, number, clean_title, level=level))
     headings.sort(key=lambda h: (h.page, h.offset))
     return headings
 
@@ -261,15 +266,26 @@ class SectionIndex:
     def __bool__(self) -> bool:
         return bool(self._headings)
 
-    def section_at(self, page: int, offset: int = 0) -> dict:
-        """Section of a chunk starting at ``offset`` of ``page``; the top-of-page slack applies at offset 0 only."""
-        from bisect import bisect_right
-        position = bisect_right(self._keys, (page, offset + (HEADING_TOP_SLACK_CHARS if offset == 0 else 0)))
+    def section_at(self, page: int, offset: int = 0, top_slack: bool = True) -> dict:
+        """Section of a chunk starting at ``offset`` of ``page``; the top-of-page slack applies at offset 0 only.
+
+        A page that is cut at its top-level headings turns the slack off: its first part must not take a
+        heading that the next part starts with.
+        """
+        slack = HEADING_TOP_SLACK_CHARS if offset == 0 and top_slack else 0
+        position = bisect_right(self._keys, (page, offset + slack))
         if position == 0:
             return {}
         return self._headings[position - 1].metadata()
 
+    def top_starts(self, page: int) -> list[int]:
+        """Offsets of the top-level headings of one page, sorted, without duplicates."""
+        low, high = bisect_left(self._keys, (page, 0)), bisect_left(self._keys, (page + 1, 0))
+        return sorted({h.offset for h in self._headings[low:high] if h.level == 1})
 
-def page_metadata(page_index: int) -> dict:
+
+def page_metadata(page_index: int, last_page_index: Optional[int] = None) -> dict:
+    """Page fields of a chunk that starts on ``page_index`` and ends on ``last_page_index`` (default: the same page)."""
     number = page_index + 1
-    return {PAGE_NUMBER: number, PAGE_NUMBER_FROM: number, PAGE_NUMBER_TO: number}
+    last = number if last_page_index is None else last_page_index + 1
+    return {PAGE_NUMBER: number, PAGE_NUMBER_FROM: number, PAGE_NUMBER_TO: last}

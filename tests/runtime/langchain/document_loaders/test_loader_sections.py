@@ -26,6 +26,7 @@ from elitea_sdk.runtime.langchain.document_loaders.sections import (
     follows,
     heading_candidate,
     outline_headings,
+    page_metadata,
     split_heading_text,
 )
 from elitea_sdk.tools.chunkers.sematic.markdown_chunker import markdown_chunker
@@ -60,7 +61,30 @@ def _load_pdf(path, **kwargs):
 
 
 def _by_page(docs):
-    return {d.metadata["page_number"]: d.metadata for d in docs}
+    """Metadata of the first chunk that starts on each page (a page cut at a top section has several)."""
+    found = {}
+    for doc in docs:
+        found.setdefault(doc.metadata["page_number"], doc.metadata)
+    return found
+
+
+def _spans(docs):
+    return [(d.metadata["page_number_from"], d.metadata["page_number_to"]) for d in docs]
+
+
+def _two_sections_pdf(tmp_path, toc=None):
+    """One page: section 1 at the top, the top-level section 2 in the middle."""
+    return _pdf(tmp_path / "two.pdf", [["1 Scope", *_wrap(BODY), "2 Methods", *_wrap(BODY)]], toc)
+
+
+def _join_pdf(tmp_path):
+    """Six pages: page 5 ends with a short part of section 3 and page 6 continues it."""
+    pages = [["1 Scope", *_wrap(BODY)], _wrap(BODY), ["2 Methods", *_wrap(BODY)], _wrap(BODY),
+             [*_wrap(BODY), "3 Results", "Short tail text."], _wrap(BODY)]
+    return _pdf(tmp_path / "join.pdf", pages)
+
+
+TWO_TOC = [[1, "1 Scope", 1], [1, "2 Methods", 1]]
 
 
 def _wrap(text, width=90):
@@ -107,10 +131,10 @@ def numbered_pdf(tmp_path):
 class TestPdfPages:
     def test_page_number_is_one_based_and_page_is_unchanged(self, outline_pdf):
         docs = _load_pdf(outline_pdf)
-        assert [d.metadata["page"] for d in docs] == [0, 1, 2, 3]
-        assert [d.metadata["page_number"] for d in docs] == [1, 2, 3, 4]
-        assert all(d.metadata["page_number_from"] == d.metadata["page_number_to"] == d.metadata["page_number"]
-                   for d in docs)
+        # page 3 is cut at "2 Access control"; the running header of page 2 joins page 1
+        assert [d.metadata["page"] for d in docs] == [0, 1, 2, 2, 3]
+        assert [d.metadata["page_number"] for d in docs] == [1, 2, 3, 3, 4]
+        assert _spans(docs) == [(1, 2), (2, 2), (3, 3), (3, 3), (4, 4)]
 
     def test_fifth_viewer_page_has_page_number_five(self, tmp_path):
         path = _pdf(tmp_path / "six.pdf", [_wrap(BODY)] * 6)
@@ -188,10 +212,109 @@ class TestPdfHeadings:
 
     def test_production_path_carries_the_fields(self, outline_pdf):
         docs = list(process_content_by_type(outline_pdf.read_bytes(), "handbook.pdf"))
-        assert [d.metadata["page_number"] for d in docs] == [1, 2, 3, 4]
-        assert [d.metadata["page_number_from"] for d in docs] == [1, 2, 3, 4]
-        assert [d.metadata["page_number_to"] for d in docs] == [1, 2, 3, 4]
-        assert docs[3].metadata["section_title"] == "Access review"
+        assert [d.metadata["chunk_id"] for d in docs] == [0, 1, 2, 3, 4]
+        assert [d.metadata["page_number"] for d in docs] == [1, 2, 3, 3, 4]
+        assert [d.metadata["page_number_from"] for d in docs] == [1, 2, 3, 3, 4]
+        assert [d.metadata["page_number_to"] for d in docs] == [2, 2, 3, 3, 4]
+        assert [d.metadata["section_title"] for d in docs[2:]] == ["Scope", "Access control", "Access review"]
+
+
+class TestPdfSectionBounds:
+    def test_level_one_bookmark_mid_page_splits_the_page(self, tmp_path):
+        docs = _load_pdf(_two_sections_pdf(tmp_path, TWO_TOC))
+        assert len(docs) == 2
+        assert "2 Methods" not in docs[0].page_content and docs[1].page_content.startswith("2 Methods")
+
+    def test_level_one_numbered_heading_mid_page_splits_the_page(self, tmp_path):
+        docs = _load_pdf(_two_sections_pdf(tmp_path))
+        assert len(docs) == 2
+        assert "2 Methods" not in docs[0].page_content and docs[1].page_content.startswith("2 Methods")
+
+    def test_boundary_inside_one_page_gives_two_chunks_with_the_same_page(self, tmp_path):
+        docs = _load_pdf(_two_sections_pdf(tmp_path))
+        assert [d.metadata["chunk_id"] for d in docs] == [0, 1]
+        assert all(d.metadata["page"] == 0 and d.metadata["page_number"] == 1 for d in docs)
+        assert _spans(docs) == [(1, 1), (1, 1)]
+        assert _sections_of(docs) == [("1", "Scope"), ("2", "Methods")]
+
+    def test_token_chunks_never_hold_text_of_two_top_sections(self, tmp_path):
+        page = ["1 Scope", *_wrap(BODY), "closing zetamark", "2 Methods", "omegamark opens", *_wrap(BODY)]
+        docs = _load_pdf(_pdf(tmp_path / "marks.pdf", [page]), max_tokens=40)
+        assert len(docs) > 3
+        assert not any("zetamark" in d.page_content and "omegamark" in d.page_content for d in docs)
+        assert _sections_of([next(d for d in docs if "omegamark" in d.page_content)]) == [("2", "Methods")]
+
+    def test_level_two_heading_does_not_split(self, tmp_path):
+        path = _pdf(tmp_path / "l2.pdf", [["1 Scope", *_wrap(BODY), "1.1 Detail", *_wrap(BODY)]])
+        assert len(_load_pdf(path)) == 1
+
+    def test_text_before_a_top_of_page_heading_joins_the_previous_page(self, tmp_path):
+        path = _pdf(tmp_path / "header.pdf", [["1 Scope", *_wrap(BODY)], ["Running header", "2 Methods", *_wrap(BODY)]])
+        docs = _load_pdf(path)
+        assert len(docs) == 2
+        assert "Running header" in docs[0].page_content and "Running header" not in docs[1].page_content
+        assert docs[1].page_content.startswith("2 Methods")
+        assert _sections_of(docs) == [("1", "Scope"), ("2", "Methods")]
+
+    def test_no_headings_keeps_one_chunk_per_page(self, tmp_path):
+        docs = _load_pdf(_pdf(tmp_path / "short.pdf", [["Short page one."], ["Short page two."]]))
+        assert [d.metadata["chunk_id"] for d in docs] == [0, 1]
+        assert all(d.metadata[key] == value for i, d in enumerate(docs) for key, value in page_metadata(i).items())
+
+    def test_lone_part_before_a_top_of_page_heading_keeps_the_previous_section(self, tmp_path):
+        docs = _load_pdf(_pdf(tmp_path / "lone.pdf", [["Intro line", "1 Scope", *_wrap(BODY)]]))
+        assert len(docs) == 2
+        assert docs[0].page_content.startswith("Intro line")
+        assert not any(key in docs[0].metadata for key in SECTION_KEYS)
+        assert _sections_of(docs)[1] == ("1", "Scope")
+
+
+class TestPageRange:
+    def test_range_of_text_over_pages_five_and_six(self):
+        assert page_metadata(4, 5) == {"page_number": 5, "page_number_from": 5, "page_number_to": 6}
+        assert page_metadata(4) == {"page_number": 5, "page_number_from": 5, "page_number_to": 5}
+
+
+class TestPdfPageJoin:
+    def test_short_section_tail_joins_the_next_page(self, tmp_path):
+        docs = list(process_content_by_type(_join_pdf(tmp_path).read_bytes(), "doc.pdf"))
+        assert len(docs) == 6
+        assert _spans(docs) == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (5, 6)]
+        meta = docs[5].metadata
+        assert (meta["page"], meta["page_number"]) == (4, 5)
+        assert (meta["section_number"], meta["section_title"]) == ("3", "Results")
+        assert "Short tail text." in docs[5].page_content and BODY[:40] in docs[5].page_content
+
+    def test_short_part_at_page_start_joins_the_previous_page(self, tmp_path):
+        path = _pdf(tmp_path / "start.pdf", [["1 Scope", *_wrap(BODY)], ["end of one", "2 Methods", *_wrap(BODY)]])
+        docs = _load_pdf(path)
+        assert _spans(docs) == [(1, 2), (2, 2)]
+        assert [d.metadata["page_number"] for d in docs] == [1, 2]
+
+    def test_no_join_across_a_top_section_start(self, tmp_path):
+        pages = [["1 Scope", *_wrap(BODY), "2 Methods", "Short tail text."], ["3 Results", *_wrap(BODY)]]
+        assert _spans(_load_pdf(_pdf(tmp_path / "top.pdf", pages))) == [(1, 1), (1, 1), (2, 2)]
+
+    def test_long_parts_do_not_join(self, tmp_path):
+        pages = [["1 Scope", *_wrap(BODY)], [*_wrap(BODY), "2 Methods", *_wrap(BODY)]]
+        assert _spans(_load_pdf(_pdf(tmp_path / "long.pdf", pages))) == [(1, 1), (2, 2), (2, 2)]
+
+    def test_forward_join_wins_when_two_short_parts_share_a_page(self, tmp_path):
+        pages = [["1 Scope", *_wrap(BODY), "2 Methods", "Short tail text."], _wrap(BODY),
+                 ["Header line", "3 Results", *_wrap(BODY)]]
+        docs = _load_pdf(_pdf(tmp_path / "forward.pdf", pages))
+        assert _spans(docs) == [(1, 1), (1, 2), (3, 3), (3, 3)]
+        assert docs[2].page_content.startswith("Header line")
+        assert _sections_of(docs) == [("1", "Scope"), ("2", "Methods"), ("2", "Methods"), ("3", "Results")]
+
+    def test_token_chunk_over_a_page_break_gets_both_pages(self, tmp_path):
+        pages = [["1 Scope", *_wrap(BODY), "2 Methods", "Short tail text."], _wrap(BODY)]
+        docs = _load_pdf(_pdf(tmp_path / "token.pdf", pages), max_tokens=40)
+        assert (1, 2) in _spans(docs)
+        later = [d for d in docs if d.metadata["page_number_from"] == 2]
+        assert later and all(d.metadata["page_number_to"] == 2 for d in later)
+        assert set(_sections_of(later)) == {("2", "Methods")}
+        assert all("start_index" not in d.metadata for d in docs)
 
 
 # --------------------------------------------------------------------------- heuristic and bounds
@@ -327,6 +450,14 @@ class TestDocx:
         docs = EliteADocxMammothLoader(file_path=str(path), max_tokens=40).load()
         assert len(docs) > 2
         assert set(_sections_of(docs)) == {("5", "Operations")}
+
+    def test_top_sections_never_share_a_chunk(self, tmp_path):
+        path = _docx(tmp_path / "tops.docx", [(1, "1 Alpha"), (0, BODY * 3 + " alphaend"),
+                                              (1, "2 Beta"), (0, "betastart " + BODY * 3)])
+        docs = EliteADocxMammothLoader(file_path=str(path), max_tokens=40).load()
+        assert len(docs) > 4
+        assert not any("alphaend" in d.page_content and "betastart" in d.page_content for d in docs)
+        assert set(_sections_of(docs)) == {("1", "Alpha"), ("2", "Beta")}
 
 
 # --------------------------------------------------------------------------- chunkers

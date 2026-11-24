@@ -112,8 +112,8 @@ Chunks of PDF and Word files carry these metadata fields. Search results return 
 | Field | Files | Value |
 |---|---|---|
 | `page` | PDF | Zero-based page index (unchanged). |
-| `page_number` | PDF | `page + 1`: the page number a PDF viewer shows. Page labels printed in the text do not change it. |
-| `page_number_from`, `page_number_to` | PDF | First and last page of the chunk. The loader makes one chunk per page, and splits a page by _max_tokens_ into parts, so both fields equal `page_number`. |
+| `page_number` | PDF | `page + 1` of the page where the chunk starts: the page number a PDF viewer shows. Page labels printed in the text do not change it. |
+| `page_number_from`, `page_number_to` | PDF | First and last page of the chunk. Most chunks lie on one page, so both equal `page_number`. A chunk that crosses a page break has `page_number_to` greater than `page_number_from` (for example 5 and 6). |
 | `section_number`, `section_title` | PDF, Word | The closest heading above the start of the chunk. |
 
 How the section is found:
@@ -123,9 +123,16 @@ How the section is found:
 - When several headings are above the chunk, the deepest one is used (for example `2.1`, not `2`).
 - A field is absent when it is unknown. A chunk before the first heading has the page fields only. Word files have no page fields.
 
+### Where a PDF chunk starts and ends
+
+- A PDF page is one chunk, or several when _max_tokens_ is set. A page is also cut where a top-level heading starts in the middle of it (a top-level bookmark, or a number such as `2`, `Chapter 4` or `Appendix B`). No chunk holds text of two top-level sections. Headings of level two or deeper do not cut a page.
+- A short part, under 200 characters of text, joins its neighbour page: the end of a section at the bottom of a page joins the next page, and a few lines at the top of a page, before the first top-level heading, join the previous page. The chunk then spans two pages, for example `page_number_from` 5 and `page_number_to` 6. A page with no cut is never joined only because it is short.
+- A running header line above a chapter title is such a short part. It joins the previous page, so the range of that chunk can end on a page that adds only that line.
+- A chunk starts on the first page of its text and takes the section at that start.
+
 ### Existing indexes
 
-An index run without `clean_index` skips files that did not change (see step 3). Their old chunks keep the fields they had when they were indexed: chunks from before these fields have `page` only. Nothing breaks, because a reader gets a chunk with fewer fields.
+An index run without `clean_index` skips files that did not change (see step 3). Their old chunks keep the bounds and the fields they had when they were indexed: chunks from before these fields have `page` only, and older PDF chunks are one per page. Nothing breaks, because a reader gets a chunk with fewer fields.
 
 To add the new fields to old chunks, run the index with `clean_index` set to _true_ (Clean index in the UI). It removes the old chunks and indexes every file again. A reader of these fields must handle a missing key.
 
