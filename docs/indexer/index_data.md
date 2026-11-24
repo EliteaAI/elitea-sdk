@@ -126,9 +126,10 @@ How the section is found:
 ### Where a PDF chunk starts and ends
 
 - A PDF page is one chunk, or several when _max_tokens_ is set. A page is also cut where a top-level heading starts in the middle of it (a top-level bookmark, or a number such as `2`, `Chapter 4` or `Appendix B`). No chunk holds text of two top-level sections. Headings of level two or deeper do not cut a page.
-- A short part, under 200 characters of text, joins its neighbour page: the end of a section at the bottom of a page joins the next page, and a few lines at the top of a page, before the first top-level heading, join the previous page. The chunk then spans two pages, for example `page_number_from` 5 and `page_number_to` 6. A page with no cut is never joined only because it is short.
+- A short part, under 200 characters of text, joins its neighbour page: a short part at the bottom of a page that starts a new top-level section joins the next page, and a few lines at the top of a page, before the first top-level heading, join the previous page. The chunk then spans two pages, for example `page_number_from` 5 and `page_number_to` 6. A page with no cut is never joined only because it is short.
 - One short line above the first top-level heading of a page is a running header (`Page 4 of 10`). It does not cut the page: it stays with the chapter that starts below it, and the section tail above it is not joined to the previous page. The cost: a one-line tail of the previous section at the top of a page takes the section of the new chapter. Two or more lines above the heading, or a line of 200 characters or more, cut the page.
 - At most 10 top-level headings of one page cut it; the rest stay in the last part.
+- A PDF whose outline has one level-1 root bookmark (often the document title) over all chapters is not split at chapters: only level-1 entries cut a page.
 - A numbered keyword heading keeps its dotted parts (`Appendix D.2`, `Annex A.1.2`). `Appendix D` is top level, `Appendix D.2` is level two and does not cut a page.
 - An outline title is looked up at the start of a line of its page, also when it wraps over two lines. When no line starts with it, the entry names the top of its page and does not cut the page.
 - A chunk starts on the first page of its text and takes the section at that start.

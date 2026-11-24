@@ -83,7 +83,8 @@ class Heading:
 
 
 def _clean(text: str) -> str:
-    return _SPACE_RE.sub(' ', text or '').strip()
+    # PostgreSQL rejects a NUL character, and only page_content is sanitized before the write.
+    return _SPACE_RE.sub(' ', (text or '').replace('\x00', '')).strip()
 
 
 def split_heading_text(text: str) -> tuple[Optional[str], Optional[str]]:

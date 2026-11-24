@@ -466,6 +466,11 @@ class TestHeuristic:
         assert split_heading_text("Overview") == (None, "Overview")
         assert split_heading_text("  ") == (None, None)
 
+    def test_nul_byte_is_removed_from_heading_text(self):
+        assert split_heading_text("4.2 Access\x00 review") == ("4.2", "Access review")
+        assert split_heading_text("Over\x00view") == (None, "Overview")
+        assert split_heading_text("\x00") == (None, None)
+
 
 # --------------------------------------------------------------------------- DOCX
 
