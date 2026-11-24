@@ -614,12 +614,23 @@ class LLMNode(BaseTool):
             return extracted
 
         content = completion.content if hasattr(completion, 'content') else str(completion)
-        if isinstance(content, list):
-            content = ''.join(
-                b.get('text', '') for b in content
-                if isinstance(b, dict) and b.get('type') == 'text'
-            )
-        return self._create_fallback_completion(str(content).strip(), struct_model)
+        return self._create_fallback_completion(self._structured_text(content).strip(), struct_model)
+
+    @staticmethod
+    def _structured_text(content: Any) -> str:
+        """Text of a reply to parse as JSON: text blocks and bare strings, joined.
+
+        With thinking on, Claude 5.5 can return the answer as a bare string beside
+        the thinking block (``['', {'type': 'thinking', ...}, '{...}']``) instead
+        of a ``{'type': 'text'}`` block (#7623).
+        """
+        if not isinstance(content, list):
+            return str(content)
+        return ''.join(
+            block if isinstance(block, str) else block.get('text', '')
+            for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get('type') == 'text')
+        )
 
     def _build_json_instruction(self, struct_model: Any) -> str:
         """
@@ -658,12 +669,7 @@ class LLMNode(BaseTool):
         """
         try:
             content = completion.content if hasattr(completion, 'content') else str(completion)
-            if isinstance(content, list):
-                content = ''.join(
-                    block.get('text', '') for block in content
-                    if isinstance(block, dict) and block.get('type') == 'text'
-                )
-            content = content.strip()
+            content = self._structured_text(content).strip()
             if not content:
                 return None
             parsed = extract_json_content(content)
@@ -728,7 +734,9 @@ class LLMNode(BaseTool):
                 # Optional fields: use actual default, but guard against PydanticUndefined
                 field_default = field.default
                 result_dict[k] = None if field_default is PydanticUndefined else field_default
-        return struct_model.model_construct(**result_dict)
+        # Only the raw text counts as set, so the caller can tell these
+        # placeholder values from ones the model returned (#7623).
+        return struct_model.model_construct(_fields_set={ELITEA_RS}, **result_dict)
 
     def _handle_structured_output_fallback(self, llm_client: Any, messages: List, struct_model: Any,
                                           config: RunnableConfig, original_error: Exception) -> Any:
@@ -1799,6 +1807,19 @@ class LLMNode(BaseTool):
             # Google / extraction-fallback all yield Pydantic instances.
             # Either way, the consumer wants a dict.
             result = completion if isinstance(completion, dict) else completion.model_dump()
+
+            # A reply that could not be parsed comes back from
+            # ``_create_fallback_completion`` with only ELITEA_RS set. Its other
+            # fields are placeholders, so drop them rather than overwrite state
+            # values set by earlier nodes with None (#7623).
+            if not isinstance(completion, dict) and completion.model_fields_set <= {ELITEA_RS}:
+                unparsed = [k for k, v in result.items() if k != ELITEA_RS and v is None]
+                if unparsed:
+                    logger.warning(
+                        "Structured output could not be parsed; keeping existing state for %s",
+                        unparsed,
+                    )
+                    result = {k: v for k, v in result.items() if k not in unparsed}
 
             # Anthropic's dict-schema path (see __get_struct_output_model) hands
             # back the raw tool-call arguments with no Pydantic model to filter
