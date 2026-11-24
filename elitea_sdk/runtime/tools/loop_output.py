@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from .loop import process_response
 from ..langchain.utils import _extract_json, create_pydantic_model, propagate_the_input_mapping
 from ..tool_outcome import run_failure_message
+from ..utils.safe_templates import safe_format as safe_str_format
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ Answer must be JSON only extractable by JSON.LOADS."""
                 last_message[var] = state[var]
         logger.debug(f"ToolNode input: {input_}")
         if self.task:
-            task = self.task.format(**last_message, last_message=dumps(last_message))
+            task = safe_str_format(self.task, **last_message, last_message=dumps(last_message))
         else:
             task = 'Input from user: {last_message}'.format(last_message=dumps(last_message))
         input_ += [
