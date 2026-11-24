@@ -144,3 +144,19 @@ def test_description_has_the_new_program_rules():
     assert "Each program runs in a fresh process" in desc
     assert "Never print a whole result" in desc
     assert "Do not import them" in desc
+
+
+def test_text_result_just_over_the_limit_is_refused_before_parsing(monkeypatch):
+    # Text size is exact, so it gets no tolerance: a 1.2 MB JSON string against a 1 MB limit must not be
+    # parsed and re-serialized just to be refused.
+    text = json.dumps(["x" * 100] * 12_000)
+    tool = _wrap(StructuredTool.from_function(func=lambda: text, name="dump", description="x",
+                                              metadata={"toolkit_name": "art", "toolkit_type": "artifact"}))
+    d = dispatcher_for([tool], limits={"max_result_bytes": 1_000_000})
+
+    def _boom(*a, **k):
+        raise AssertionError("must be refused before parsing")
+    monkeypatch.setattr(code_mode, "parse_json_text", _boom)
+    with pytest.raises(RuntimeError, match=r"art.dump result was over .* limit 977 KB"):
+        asyncio.run(d("art.dump", "{}"))
+    assert d.call_log[0]["error_class"] == "result_too_large"

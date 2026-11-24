@@ -397,10 +397,13 @@ class BridgeDispatcher:
         if error_text:
             self._refuse(entry, "tool_error", f"{name} failed: {error_text}")
         limit = self.limits["max_result_bytes"]
-        # Refuse obvious oversize before json.dumps copies it; the estimate can run ~3x high on small ints.
-        estimate = estimate_chars(result, ceiling=3 * limit + 1)
-        if estimate > 3 * limit:
-            entry["bytes"] = len(result) if isinstance(result, (str, bytes)) else estimate // 3
+        # Refuse oversize before json.dumps copies it: exact for text, 3x tolerance for structures (small ints over-count).
+        if isinstance(result, (str, bytes)):
+            estimate, cutoff = len(result), limit
+        else:
+            estimate, cutoff = estimate_chars(result, ceiling=3 * limit + 1), 3 * limit
+        if estimate > cutoff:
+            entry["bytes"] = estimate if cutoff == limit else estimate // 3
             self._refuse_too_large(entry, name, entry["bytes"], limit, at_least=True)
         result = parse_json_text(result)
         try:
