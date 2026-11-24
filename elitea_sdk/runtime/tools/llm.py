@@ -34,6 +34,7 @@ from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
     extract_json_content,
+    has_open_object,
     make_anthropic_compatible_schema,
     normalize_null_tool_call_ids,
     prepare_messages_for_model,
@@ -538,6 +539,12 @@ class LLMNode(BaseTool):
         from the text response.
         """
         if self._client_is_openai_compatible(self.client):
+            return self._structured_via_json_prompt(llm_client, synth_messages, struct_model, config)
+
+        # Thinking Anthropic goes through json_schema (see __get_struct_output_model),
+        # which can only return {} for an open object (#7623); parse via Pydantic instead.
+        if (self._is_anthropic_thinking_client(self.client)
+                and has_open_object(make_anthropic_compatible_schema(struct_model))):
             return self._structured_via_json_prompt(llm_client, synth_messages, struct_model, config)
 
         try:

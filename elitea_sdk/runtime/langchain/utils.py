@@ -730,6 +730,23 @@ def make_anthropic_compatible_schema(pydantic_model: Any) -> dict:
         schema.pop("$defs", None)
     return schema
 
+def has_open_object(node: Any) -> bool:
+    """True when ``node`` (a JSON schema) contains an object with no declared
+    ``properties`` — the shape ``dict`` / ``list`` / ``any`` pipeline types emit.
+
+    Anthropic's ``output_config.format`` (``method='json_schema'``) runs the
+    schema through ``anthropic.transform_schema``, which forces
+    ``additionalProperties: false`` on every object; an object with no
+    properties then only admits ``{}`` and the model's keys are dropped (#7623).
+    """
+    if isinstance(node, dict):
+        if node.get("type") == "object" and not node.get("properties"):
+            return True
+        return any(has_open_object(value) for value in node.values())
+    if isinstance(node, list):
+        return any(has_open_object(item) for item in node)
+    return False
+
 def safe_serialize(obj: Any) -> str:
     """
     Safely serialize any object to a JSON string.
