@@ -6,6 +6,8 @@ nodes, which backstop the tools the middleware never wraps. Idempotent, so both
 layers together produce exactly one truncation marker (#6140).
 """
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Optional, Tuple
 
 from .tool_outcome import ToolOutcome, ToolResultStatus, record_outcome
@@ -29,6 +31,22 @@ HITL_DEFERRED_KEY = '__hitl_deferred__'
 # Matched by name so this module stays importable without langgraph, and so a
 # ToolMessage/Command from any version is recognised.
 _PASSTHROUGH_TYPE_NAMES = frozenset({'ToolMessage', 'Command', 'AIMessage', 'BaseMessage'})
+
+# Set around Code Mode bridged calls: the program, not the LLM, receives the result.
+_unbounded: ContextVar[bool] = ContextVar('elitea_tool_results_unbounded', default=False)
+
+
+@contextmanager
+def unbounded_tool_results():
+    token = _unbounded.set(True)
+    try:
+        yield
+    finally:
+        _unbounded.reset(token)
+
+
+def tool_results_unbounded() -> bool:
+    return _unbounded.get()
 
 
 def _is_control_flow(value: Any) -> bool:
@@ -110,6 +128,8 @@ def bound_and_record(
 
     A guard that can raise is worse than no guard: this runs on every tool call.
     """
+    if _unbounded.get():
+        return value
     try:
         bounded, original = bound_tool_result(value, tool_name, toolkit_type)
     except Exception:  # pylint: disable=W0703
