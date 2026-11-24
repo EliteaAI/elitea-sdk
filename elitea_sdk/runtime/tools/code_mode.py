@@ -18,7 +18,9 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ...tools.elitea_base import INDEX_TOOL_NAMES
 from ...tools.utils.serialization import serialize_tool_result
+from ..tool_result_bounds import unbounded_tool_results
 from ..utils.toolkit_utils import get_args_json_schema
+from ..utils.trace_limits import estimate_chars
 from .lazy_tools import ToolRegistry, reraise_control_flow, resolve_registry_tool, strip_null_args
 
 logger = logging.getLogger(__name__)
@@ -381,7 +383,8 @@ class BridgeDispatcher:
                 self._refuse(entry, "tool_error", f"Invalid arguments for {name}: {problems}")
 
         try:
-            result = await tool.ainvoke(args, config=self.config)
+            with unbounded_tool_results():
+                result = await tool.ainvoke(args, config=self.config)
         except Exception as exc:  # pylint: disable=broad-except
             try:
                 reraise_control_flow(exc)
@@ -394,11 +397,14 @@ class BridgeDispatcher:
         if error_text:
             self._refuse(entry, "tool_error", f"{name} failed: {error_text}")
         limit = self.limits["max_result_bytes"]
-        # Refuse obvious oversize before building more copies of the result.
-        estimate = _size_lower_bound(result)
-        if estimate > limit:
-            entry["bytes"] = estimate
-            self._refuse_too_large(entry, name, estimate, limit, at_least=True)
+        # Refuse oversize before json.dumps copies it: exact for text, 3x tolerance for structures (small ints over-count).
+        if isinstance(result, (str, bytes)):
+            estimate, cutoff = len(result), limit
+        else:
+            estimate, cutoff = estimate_chars(result, ceiling=3 * limit + 1), 3 * limit
+        if estimate > cutoff:
+            entry["bytes"] = estimate if cutoff == limit else estimate // 3
+            self._refuse_too_large(entry, name, entry["bytes"], limit, at_least=True)
         result = parse_json_text(result)
         try:
             value = json.dumps(result)
@@ -468,19 +474,6 @@ def value_shape(value: Any, depth: int = 0) -> str:
     return {bool: "bool", int: "int", float: "float"}.get(type(value), "null" if value is None else type(value).__name__)
 
 
-def _size_lower_bound(value: Any, depth: int = 0) -> int:
-    """A cheap lower bound of the serialized size, so huge results are refused before json.dumps copies them."""
-    if isinstance(value, (str, bytes)):
-        return len(value)
-    if depth >= 2:
-        return 0
-    if isinstance(value, dict):
-        return sum(len(str(k)) + _size_lower_bound(v, depth + 1) for k, v in value.items())
-    if isinstance(value, (list, tuple)):
-        return sum(_size_lower_bound(v, depth + 1) for v in value)
-    return 0
-
-
 def _size(n: int) -> str:
     return f"{n / (1024 * 1024):.1f} MB" if n >= 1024 * 1024 else f"{n / 1024:.0f} KB"
 
@@ -543,8 +536,10 @@ Rules:
 - The toolkit classes below are already defined in the program's globals. Do not import them; call their \
 static methods directly: `{example}`. Top-level await works.
 - Arguments are keyword-only. Results are JSON values (dict, list, str); their exact shape is reported in "calls" \
-after each run, so if unsure, print a small part first rather than guessing.
-- Only what you print() comes back to you, so print just what you need, compactly.
+after each run, so if unsure, print one or two items rather than guessing.
+- Only what you print() comes back to you. Never print a whole result; print counts, aggregates or one or two items.
+- Each program runs in a fresh process: variables and results from earlier programs are gone. Fetch what you need \
+inside the same program.
 - A failed call raises ToolError; catch it to continue.
 - No network or files; only toolkit methods reach the outside world.
 - Each program must finish within {timeout_seconds} s, tool calls included (they run one at a time), and make at most \
