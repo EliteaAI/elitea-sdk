@@ -327,7 +327,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Optional[Callable[[str], None]] = None,
+                       on_listing_gap: Optional[Callable[[str], None]] = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder; otherwise lists
@@ -351,6 +352,11 @@ class SharepointRestWrapper(BaseSharepointWrapper):
             skip_reporter,
             normalize_extension_filters,
         )
+
+        def _report_gap(reason: str) -> None:
+            if on_listing_gap:
+                on_listing_gap(reason)
+
         try:
             _t_start = time.perf_counter()
 
@@ -363,7 +369,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         include_extensions=include_extensions,
                         skip_extensions=skip_extensions,
                         form_name=form_name,
-                        on_file_skipped=on_file_skipped)
+                        on_file_skipped=on_file_skipped,
+                        on_listing_gap=on_listing_gap)
                     logging.info(
                         "[SP-REST][get_files_list] Graph fast path — files=%d time=%.3fs",
                         len(graph_result), time.perf_counter() - _t_graph)
@@ -373,6 +380,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         "[SP-REST][get_files_list] Graph fast path failed (%.3fs): %s — "
                         "falling back to REST BFS.",
                         time.perf_counter() - _t_start, graph_fast_e)
+                    # The REST listing gives other item ids than Graph, so a later run could not match them.
+                    _report_gap("the listing fell back from Graph to REST")
 
             # Slow path: REST parallel BFS
             all_libraries = (
@@ -432,6 +441,7 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                 except Exception as lib_e:
                     logging.warning("Skipping library '%s' — %s", library_type, lib_e)
                     lib_access_failures += 1
+                    _report_gap("a document library could not be listed")
                     continue
 
                 for file in files:
@@ -458,6 +468,9 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         'id': file.properties['UniqueId'],
                     })
 
+            if len(result) >= limit_files:
+                _report_gap("the file limit was reached before the listing ended")
+
             if not result and lib_attempted > 0 and lib_access_failures == lib_attempted:
                 logging.warning(
                     "[SP-REST][get_files_list] All %d REST libraries failed — "
@@ -469,7 +482,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         include_extensions=include_extensions,
                         skip_extensions=skip_extensions,
                         form_name=form_name,
-                        on_file_skipped=on_file_skipped)
+                        on_file_skipped=on_file_skipped,
+                        on_listing_gap=on_listing_gap)
                     logging.info(
                         "[SP-REST][get_files_list] Graph fallback — files=%d time=%.3fs",
                         len(graph_result), time.perf_counter() - _t_graph)
@@ -499,11 +513,13 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                 "trying Graph API fallback.", time.perf_counter() - _t_start, e)
             try:
                 _t_graph = time.perf_counter()
+                _report_gap("the listing fell back from REST to Graph")
                 files = self._graph_helper().get_files_list(
                     self.site_url, folder_name, limit_files,
                     include_extensions=include_extensions,
                     skip_extensions=skip_extensions,
-                    form_name=form_name)
+                    form_name=form_name,
+                    on_listing_gap=on_listing_gap)
                 logging.info(
                     "[SP-REST][get_files_list] Graph fallback — files=%d time=%.3fs",
                     len(files), time.perf_counter() - _t_graph)

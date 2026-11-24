@@ -32,8 +32,14 @@ from .read_guidance import build_excel_over_limit_response
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ...runtime.utils.utils import IndexerKeywords
 from ..base_indexer_toolkit import DEPENDENT_DOC_META_KEY
+from .. import index_change_check
 from ..utils.tool_groups import tool_group, with_tool_groups
 from ..utils.source_info import join_location, reuse_url, web_base
+
+# Settings that decide which files an index run covers. A run that covers other files than the
+# run before it must not remove rows, because the rows of the earlier scope look absent.
+INDEX_SCOPE_KEYS = ('path', 'form_name', 'include_extensions', 'skip_extensions',
+                    'library_lists', 'categories', 'include_onenote', 'onenote_filter')
 
 # ------------------------------------------------------------------ #
 #  Read-safety: block executable / binary files (read_document only)  #
@@ -466,6 +472,9 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     """
     index_source_type = "sharepoint"
 
+    # The loader attests a complete listing only under the gates of _run_may_remove_orphans.
+    loader_attests_completion = True
+
     index_item_labels = ('file', 'files')
 
     site_url: str
@@ -656,7 +665,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Optional[Callable[[str], None]] = None,
+                       on_listing_gap: Optional[Callable[[str], None]] = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder path; otherwise lists
@@ -676,7 +686,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.get_files_list(
             folder_name, limit_files, form_name, include_extensions, skip_extensions,
-            on_file_skipped=on_file_skipped)
+            on_file_skipped=on_file_skipped, on_listing_gap=on_listing_gap)
 
     @tool_group('read')
     def read_file(self, path: str,
@@ -1157,54 +1167,137 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         }
 
         limit_files = kwargs.get('limit_files', 10000)
-        include_extensions = kwargs.get('include_extensions') or None
-        skip_extensions = kwargs.get('skip_extensions') or None
-        form_name = kwargs.get('form_name') or None
 
         if limit_files > 0:
-            library = self._library_join_context(
-                kwargs.get('library_lists'), kwargs.get('metadata_fields'), kwargs.get('categories'))
-            # The categories filter drops files after listing: list up to the library bound and keep
-            # limit_files of the files that pass, so selected files beyond the first limit_files listed
-            # are not lost.
-            list_limit = (max(limit_files, LIBRARY_LISTING_LIMIT)
-                          if library is not None and library[0].categories else limit_files)
-            self._log_tool_event(
-                message="Starting SharePoint files extraction", tool_name="loader")
-            try:
-                all_files = self.get_files_list(
-                    kwargs.get('path'), list_limit,
-                    form_name=form_name,
-                    include_extensions=include_extensions,
-                    skip_extensions=skip_extensions,
-                    on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered"))
-                self._log_tool_event(
-                    message="List of the files has been extracted", tool_name="loader")
-            except Exception as e:
-                raise ToolException(f"Unable to extract files: {e}")
-            if list_limit > limit_files and len(all_files) >= list_limit:
-                raise LibraryMetadataError(
-                    f"The categories filter looks at most {list_limit} files and the library has more. "
-                    "Narrow the scope with Path or Form Name.")
+            all_files, library, list_limit, gaps = self._list_files_for_index(kwargs, track_skipped=True)
 
             kept = 0
             for file in all_files:
                 if kept >= limit_files:
                     break
-                metadata = {
-                    ("updated_on" if k == "Modified" else k): str(v)
-                    for k, v in file.items()
-                }
+                metadata = self._file_metadata(file)
                 if library is not None and not self._apply_library_metadata(metadata, *library):
                     continue
                 kept += 1
                 yield Document(page_content="", metadata=metadata)
             if library is not None:
                 logging.info("[SP-library] join: %s", library[2].as_dict())
+            if kept < limit_files and self._run_may_remove_orphans(kwargs, gaps, len(all_files), list_limit):
+                self._attest_loader_completion()
 
         # ── OneNote pages ─────────────────────────────────────────────
         if kwargs.get('include_onenote'):
             yield from self._onenote_base_loader(self._onenote_cfg)
+
+    @staticmethod
+    def _file_metadata(file: Dict[str, Any]) -> Dict[str, str]:
+        return {("updated_on" if k == "Modified" else k): str(v) for k, v in file.items()}
+
+    def _list_files_for_index(self, kwargs: Dict[str, Any], track_skipped: bool):
+        """The files an index run covers: (files, library join context, listing cap, listing gaps).
+
+        The indexing loader and the change check both list through here, so they see the same files.
+        The check passes ``track_skipped=False`` because it must not touch the indexing statistics.
+        """
+        limit_files = kwargs.get('limit_files', 10000)
+        library = self._library_join_context(
+            kwargs.get('library_lists'), kwargs.get('metadata_fields'), kwargs.get('categories'))
+        # The categories filter drops files after listing: list up to the library bound and keep
+        # limit_files of the files that pass, so selected files beyond the first limit_files listed
+        # are not lost.
+        list_limit = (max(limit_files, LIBRARY_LISTING_LIMIT)
+                      if library is not None and library[0].categories else limit_files)
+        self._log_tool_event(
+            message="Starting SharePoint files extraction", tool_name="loader")
+        gaps: List[str] = []
+        try:
+            all_files = self.get_files_list(
+                kwargs.get('path'), list_limit,
+                form_name=kwargs.get('form_name') or None,
+                include_extensions=kwargs.get('include_extensions') or None,
+                skip_extensions=kwargs.get('skip_extensions') or None,
+                on_file_skipped=(lambda name: self._track_skipped_document(name, reason="filtered"))
+                if track_skipped else None,
+                on_listing_gap=gaps.append)
+            self._log_tool_event(
+                message="List of the files has been extracted", tool_name="loader")
+        except Exception as e:
+            raise ToolException(f"Unable to extract files: {e}")
+        if list_limit > limit_files and len(all_files) >= list_limit:
+            raise LibraryMetadataError(
+                f"The categories filter looks at most {list_limit} files and the library has more. "
+                "Narrow the scope with Path or Form Name.")
+        return all_files, library, list_limit, gaps
+
+    # ------------------------------------------------------------------ #
+    #  Change check and orphan removal                                     #
+    # ------------------------------------------------------------------ #
+
+    def _index_scope(self, index_configuration):
+        scope = {}
+        for key in INDEX_SCOPE_KEYS:
+            value = (index_configuration or {}).get(key)
+            if isinstance(value, (list, tuple, set)):
+                value = sorted(str(item) for item in value)
+            scope[key] = None if value in (None, '', [], {}, False) else value
+        return scope
+
+    def _run_may_remove_orphans(self, kwargs: Dict[str, Any], gaps: List[str], listed: int, list_limit: int) -> bool:
+        """True when this run's listing proves which files are gone, so the clean-up may remove rows."""
+        run = getattr(self, '_index_run', None)
+        if run is None or gaps or kwargs.get('include_onenote') or listed >= list_limit:
+            return False
+        return not run.meta_existed or run.run_scope == run.last_run_scope
+
+    def _stored_marker(self, metadata):
+        marker = str(metadata.get('updated_on') or '')
+        digest = metadata.get('library_digest')
+        if digest is None:
+            # A row indexed before the digest existed: take the listing's value, so only
+            # an edit made after the next index run shows as a change.
+            digest = getattr(self, '_listed_digests', {}).get(metadata.get('id'))
+        return f"{marker}|{digest}" if digest else marker
+
+    def _indexed_item(self, key, entry):
+        metadata = entry.get('metadata') or {}
+        return index_change_check.ListedItem(
+            key=key, name=str(metadata.get('Name') or ''), path=str(metadata.get('Path') or ''),
+            marker=self._stored_marker(metadata))
+
+    def _is_unchecked_row(self, entry) -> bool:
+        return (entry.get('metadata') or {}).get('source_type') == 'onenote'
+
+    def _list_source_items(self, index_configuration):
+        self._sync_backend_context()
+        kwargs = dict(index_configuration)
+        limit_files = kwargs.get('limit_files', 10000)
+        items: List[index_change_check.ListedItem] = []
+        gaps: List[str] = []
+        self._listed_digests = {}
+        if limit_files > 0:
+            files, library, _, gaps = self._list_files_for_index(kwargs, track_skipped=False)
+            for file in files:
+                metadata = self._file_metadata(file)
+                if library is not None and not apply_library_metadata(metadata, library[1], library[0], JoinCounts()):
+                    continue
+                key = metadata.get('id')
+                if not key:
+                    continue
+                if len(items) >= limit_files:
+                    gaps.append("the file limit was reached before the listing ended")
+                    break
+                self._listed_digests[key] = metadata.get('library_digest')
+                items.append(index_change_check.ListedItem(
+                    key=key, name=metadata.get('Name', ''), path=metadata.get('Path', ''),
+                    marker=self._stored_marker(metadata)))
+        blockers = list(gaps)
+        if kwargs.get('include_onenote'):
+            blockers.append("OneNote pages are included in the index and are not checked")
+        return index_change_check.SourceListing(
+            items=items, complete=not gaps, gaps=gaps, id_family=type(self._backend).__name__,
+            attest_blockers=blockers,
+            unchecked_note="OneNote pages are not checked",
+            unchecked_reason="OneNote pages are not checked, so changes there are not reported.")
 
     # ------------------------------------------------------------------ #
     #  OneNote helpers                                                     #

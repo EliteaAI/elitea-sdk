@@ -22,6 +22,7 @@ Safety properties, each covered by a test:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -74,7 +75,7 @@ STATUS_AMBIGUOUS = "ambiguous"
 # Keys the toolkit owns in document metadata; a list field never overwrites them.
 RESERVED_KEYS = frozenset({
     "id", "updated_on", "created_on", "name", "path", "created", "modified", "link", "source",
-    "metadata_status", "metadata_match", "library_list", "library_item_id", "web_url", "file_name",
+    "metadata_status", "metadata_match", "library_list", "library_item_id", "library_digest", "web_url", "file_name",
     "chunk_id", "chunk_type", "method_name", "collection", "type", "page", "page_number",
     # keys the indexer itself reads from document metadata (grouping, deletion, content routing)
     "parent_id", "dependent_docs", "loader_content", "loader_content_type", "filename", "file_path",
@@ -650,7 +651,22 @@ def _categories_of(metadata: Dict[str, Any]) -> List[str]:
 
 def apply_library_metadata(file_meta: Dict[str, Any], index: LibraryIndex, settings: LibrarySettings,
                            counts: JoinCounts) -> bool:
-    """Merge list fields into ``file_meta`` in place; False when the categories filter drops the file."""
+    """Merge list fields into ``file_meta`` in place; False when the categories filter drops the file.
+
+    A kept file also gets ``library_digest``, a hash of everything the join added. A change check
+    compares it, because an edit of a list field leaves the file's own modified time alone.
+    """
+    before = set(file_meta)
+    kept = _join_library_metadata(file_meta, index, settings, counts)
+    if kept:
+        added = {key: file_meta[key] for key in sorted(set(file_meta) - before)}
+        file_meta["library_digest"] = hashlib.sha256(
+            json.dumps(added, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+    return kept
+
+
+def _join_library_metadata(file_meta: Dict[str, Any], index: LibraryIndex, settings: LibrarySettings,
+                           counts: JoinCounts) -> bool:
     entry, how = index.match(file_meta)
     file_meta["web_url"] = file_meta.get("Link") or file_meta.get("web_url") or ""
     file_meta["file_name"] = file_meta.get("Name") or file_meta.get("file_name") or ""
