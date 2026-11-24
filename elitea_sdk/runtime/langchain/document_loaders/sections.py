@@ -284,7 +284,7 @@ class SectionIndex:
         return sorted({h.offset for h in self._headings[low:high] if h.level == 1})
 
 
-def page_metadata(page_index: int, last_page_index: Optional[int] = None) -> dict:
+def page_metadata(page_index: int, last_page_index: int | None = None) -> dict:
     """Page fields of a chunk that starts on ``page_index`` and ends on ``last_page_index`` (default: the same page)."""
     number = page_index + 1
     last = number if last_page_index is None else last_page_index + 1
