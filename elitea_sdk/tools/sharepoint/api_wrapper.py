@@ -1271,8 +1271,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         kwargs = dict(index_configuration)
         limit_files = kwargs.get('limit_files', 10000)
-        items: List[index_change_check.ListedItem] = []
-        gaps: List[str] = []
+        items = []
+        gaps = []
         self._listed_digests = {}
         if limit_files > 0:
             files, library, _, gaps = self._list_files_for_index(kwargs, track_skipped=False)

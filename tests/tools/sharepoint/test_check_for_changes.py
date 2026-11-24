@@ -123,7 +123,18 @@ class TestListingHook:
         comparison = check.compare(listing, stored, {})
         report = check.build_report("idx", comparison, listing, True)
         assert report["counts"]["removed"] == 0
-        assert "a document library could not be listed" in report["reason"] or report["warnings"]
+        assert report["listing_complete"] is False
+
+    def test_the_reason_names_the_cause_when_a_clean_reindex_cannot_attest(self):
+        toolkit = toolkit_with(Backend([listed_file(modified="2026-02-02")],
+                                       gaps=["a document library could not be listed"]))
+        listing = toolkit._list_source_items({"limit_files": 50})
+        stored = {"f1": check.ListedItem("f1", "a.docx", "/sites/x/Lib/a.docx", "2026-01-01")}
+
+        report = check.build_report("idx", check.compare(listing, stored, {}), listing, True)
+
+        assert report["status"] == check.STATUS_NEEDS_CLEAN_REINDEX
+        assert "a document library could not be listed" in report["reason"]
 
 
 class TestListFieldMarker:
