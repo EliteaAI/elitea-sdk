@@ -1288,7 +1288,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
             input_mapping={},
             output_variables=["question"],
             structured_output=True,
-            structured_output_dict={"question": {"type": "list", "description": "Questions"}},
+            structured_output_dict={"question": {"type": "str", "description": "Questions"}},
             available_tools=[_make_data_fetch_tool()],
             tool_names=["data_fetch"],
         )
@@ -1306,7 +1306,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         llm = _AnthropicThinkingLLM()
         node = self._make_node_for_anthropic_thinking(llm)
 
-        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+        struct_model = _make_struct_model({"question": {"type": "str", "description": "Q"}})
 
         # Simulate: first LLM call returns a tool-calling AIMessage (thinking blocks)
         tool_call_msg = AIMessage(
@@ -1389,7 +1389,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         """
         # 1. Demonstrate the stub raises on bare AIMessage-terminated input.
         bare_stub = _StructuredOutputStub(
-            _make_struct_model({"question": {"type": "list"}}),
+            _make_struct_model({"question": {"type": "str"}}),
             method="json_schema",
         )
         with pytest.raises(_AnthropicPrefillRejection):
@@ -1403,7 +1403,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         # is satisfied at the boundary the real gateway enforces.
         llm = _AnthropicThinkingLLM()
         node = self._make_node_for_anthropic_thinking(llm)
-        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+        struct_model = _make_struct_model({"question": {"type": "str", "description": "Q"}})
 
         tool_call_msg = AIMessage(
             content=[
@@ -1729,6 +1729,78 @@ class TestSynthesizeStructuredRouting:
             node._synthesize_structured(
                 MagicMock(), [HumanMessage(content="q")], struct_model, {}
             )
+
+
+class TestThinkingAnthropicOpenObject:
+    """#7623: json_schema forces additionalProperties=false, so a dict field comes
+    back as {} on thinking Anthropic; such schemas must use the JSON-prompt path."""
+
+    def _node(self, client):
+        node = _make_llm_node()
+        node.client = client
+        return node
+
+    def test_dict_field_uses_json_prompt_and_keeps_object(self):
+        llm = _AnthropicThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({
+            "custom_text": {"type": "str", "description": ""},
+            "custom_json": {"type": "dict", "description": ""},
+        })
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(
+            content='{"custom_text": "ok", "custom_json": {"status": "ready", "source": "user"}}'
+        )
+
+        result = node._synthesize_structured(llm_client, [HumanMessage(content="q")], struct_model, {})
+
+        assert result.custom_json == {"status": "ready", "source": "user"}
+        assert llm.with_structured_output_calls == []
+
+    def test_list_field_also_uses_json_prompt(self):
+        # The inlined JsonValue union carries an open {"type": "object"} branch too.
+        llm = _AnthropicThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({"items": {"type": "list", "description": ""}})
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(content='{"items": [{"n": 1}]}')
+
+        result = node._synthesize_structured(llm_client, [HumanMessage(content="q")], struct_model, {})
+
+        assert result.items == [{"n": 1}]
+        assert llm.with_structured_output_calls == []
+
+    def test_closed_schema_keeps_json_schema_route(self):
+        llm = _AnthropicThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({"answer": {"type": "str", "description": ""}})
+
+        node._synthesize_structured(llm, [HumanMessage(content="q")], struct_model, {})
+
+        assert llm.with_structured_output_calls == ["json_schema"]
+
+    def test_non_thinking_anthropic_keeps_function_calling(self):
+        # Forced tool calling does not apply transform_schema, so dict values survive.
+        llm = _AnthropicNonThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({"custom_json": {"type": "dict", "description": ""}})
+
+        node._synthesize_structured(llm, [HumanMessage(content="q")], struct_model, {})
+
+        assert llm.with_structured_output_calls == ["function_calling"]
+
+
+class TestHasOpenObject:
+    def test_detects_dict_and_jsonvalue_object_branch(self):
+        from elitea_sdk.runtime.langchain.utils import has_open_object, make_anthropic_compatible_schema
+
+        dict_model = create_pydantic_model("M", {"d": {"type": "dict"}})
+        list_model = create_pydantic_model("M", {"l": {"type": "list"}})
+        str_model = create_pydantic_model("M", {"s": {"type": "str"}, "n": {"type": "int"}})
+
+        assert has_open_object(make_anthropic_compatible_schema(dict_model)) is True
+        assert has_open_object(make_anthropic_compatible_schema(list_model)) is True
+        assert has_open_object(make_anthropic_compatible_schema(str_model)) is False
 
 
 class TestStructuredOutputResultFiltering:
