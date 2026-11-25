@@ -502,6 +502,11 @@ def test_get_app_version_details_project_id(monkeypatch):
 
 # --- real Pyodide ---------------------------------------------------------------------------------------------------
 
+# The offline sandbox runs with --no-npm, so pin the repo entrypoint (no npm: imports) like the
+# other offline-sandbox tests, instead of the container's PYODIDE_SANDBOX_PKG.
+MAIN_TS = Path(__file__).resolve().parents[2] / "infra" / "data" / "sandbox" / "main.ts"
+
+
 def _sandbox_base():
     for base in (os.environ.get("SANDBOX_BASE"), "/app"):
         if base and os.path.isfile(os.path.join(base, "pyodide", "pyodide.mjs")):
@@ -509,14 +514,15 @@ def _sandbox_base():
     return None
 
 
-@pytest.mark.skipif(not shutil.which("deno") or _sandbox_base() is None or not os.environ.get("PYODIDE_SANDBOX_PKG"),
-                    reason="needs Deno, a Pyodide distribution and PYODIDE_SANDBOX_PKG")
+@pytest.mark.skipif(not shutil.which("deno") or _sandbox_base() is None,
+                    reason="needs Deno and a Pyodide distribution")
 @pytest.mark.integration
 @pytest.mark.timeout(300)
 def test_real_pyodide_stub(monkeypatch):
     from elitea_sdk.runtime.langchain.pyodide_sandbox import PyodideSandbox
     from elitea_sdk.runtime.tools.sandbox import local_sandbox_permissions
     monkeypatch.setenv("SANDBOX_BASE", _sandbox_base())
+    monkeypatch.setenv("PYODIDE_SANDBOX_PKG", str(MAIN_TS))
     dispatcher = bridge.ClientBridgeDispatcher(lambda pid: FakeClient(pid), caller="code_node", project_id=3,
                                                audit=lambda **kw: None)
     code = bridge.build_client_stub("http://platform", 3) + '''
