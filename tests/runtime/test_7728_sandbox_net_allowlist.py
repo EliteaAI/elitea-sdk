@@ -13,6 +13,7 @@ from elitea_sdk.runtime.tools import sandbox as sandbox_mod
 from elitea_sdk.runtime.tools.sandbox import (
     PyodideSandboxTool,
     StatefulPyodideSandboxTool,
+    platform_host,
     resolve_allow_net,
     sandbox_allowed_hosts,
 )
@@ -138,3 +139,36 @@ def test_invalid_entry_warned_once(monkeypatch, caplog):
     monkeypatch.setenv("SANDBOX_ALLOWED_HOSTS", "*.example.com")
     sandbox_allowed_hosts(); sandbox_allowed_hosts()
     assert sum("Ignoring sandbox" in r.message for r in caplog.records) == 1
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com,internal:80/",
+    "https://example.com,internal/",
+    "https://user@example.com,internal:80/",
+    "https://exa mple.com/",
+    "https://example.com:99999/",
+    "https://[::1]:8080/",
+    "ftp://example.com/",
+    "example.com",
+    "",
+    None,
+])
+def test_platform_host_rejects_anything_but_one_plain_host(url):
+    # Reviewer finding: a crafted base_url must never serialize into extra --allow-net grants.
+    assert platform_host(url) is None
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://Platform.Example.org/", "platform.example.org"),
+    ("http://platform.example.org:8443/api", "platform.example.org:8443"),
+    ("https://user:pw@platform.example.org/", "platform.example.org"),
+])
+def test_platform_host_valid(url, expected):
+    assert platform_host(url) == expected
+
+
+def test_crafted_base_url_adds_no_grants(monkeypatch):
+    monkeypatch.delenv("SANDBOX_CLIENT_BRIDGE", raising=False)
+    client = type("C", (), {"base_url": "https://example.com,internal:80/", "project_id": 3})()
+    cmd = _built_command(PyodideSandboxTool(elitea_client=client))
+    assert "--allow-net=" + ",".join(DEFAULTS) in cmd

@@ -363,9 +363,16 @@ def _cached_allowed_hosts(raw: str) -> tuple:
 
 
 def platform_host(base_url) -> Optional[str]:
-    """host[:port] of the platform URL the in-sandbox SandboxClient calls over HTTP."""
-    netloc = urlsplit(str(base_url or "")).netloc.rpartition("@")[2].lower()
-    return netloc or None
+    """Exact host[:port] of the platform URL the in-sandbox SandboxClient calls over HTTP, or None if it is not a plain host."""
+    try:
+        parts = urlsplit(str(base_url or ""))
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host or parts.scheme not in ("http", "https"):
+        return None
+    valid = _valid_hosts([f"{host}:{port}" if port else host])
+    return valid[0] if valid else None
 
 
 def resolve_allow_net(value):
