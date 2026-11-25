@@ -487,7 +487,7 @@ class TestEveryIndexerRecordsItsScope:
 
     def test_ado_wiki_names_project_and_wiki(self):
         wiki = wrapper(AdoWikiWrapper, organization_url="https://dev.azure.com/org", project="Proj",
-                       default_wiki_identifier=None)
+                       default_wiki_identifier=None, _client=None)
         assert recorded_source(wiki, wiki._base_loader, wiki_identifier="OpsWiki")["location"] == \
             "dev.azure.com / Proj / OpsWiki"
 
