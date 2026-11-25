@@ -26,7 +26,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, PrivateAttr
 
-from ..exceptions import SkillBodyUnavailable
+from ..exceptions import SkillBodyUnavailable, SkillFileUnavailable
 from ...tools.utils.file_metadata import bound_read_result
 from ..langchain.constants import (
     INSTRUCTION_REFERENCED_HINT,
@@ -642,6 +642,12 @@ class ReadSkillFileTool(SkillFileTool):
                 matched.get('skill_version_id', matched.get('version_id')), path,
             )
         except SkillBodyUnavailable as e:
+            if isinstance(e, SkillFileUnavailable) and e.missing:
+                return None, (
+                    "its content is missing, for example because the project was restored from a backup without "
+                    "skill attachments. Reading it again will not help: tell the user to upload the file again (to a "
+                    "new version if this one is published) or restore a backup that includes skill attachments"
+                )
             return None, SKILL_FILE_UNAVAILABLE_DENIED if e.denied else SKILL_FILE_UNAVAILABLE_TRANSIENT
         except Exception as e:  # pylint: disable=W0703
             logger.warning("[Skills] file fetch for %r/%r failed: %s", matched.get('name'), path, e)

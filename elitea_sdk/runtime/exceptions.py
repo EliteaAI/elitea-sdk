@@ -184,4 +184,9 @@ class SkillBodyUnavailable(Exception):
 
 
 class SkillFileUnavailable(SkillBodyUnavailable):
-    """A skill file the run cannot fetch; ``denied`` when access was refused rather than failing transiently."""
+    """A skill file the run cannot fetch; ``denied`` when access was refused and ``missing`` when the platform no
+    longer stores its content, rather than failing transiently."""
+
+    def __init__(self, message: str, denied: bool = False, missing: bool = False):
+        super().__init__(message, denied=denied)
+        self.missing = missing

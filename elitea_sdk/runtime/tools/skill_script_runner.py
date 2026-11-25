@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.callbacks.manager import dispatch_custom_event
 
-from ..exceptions import SandboxAdmissionRefused, SkillBodyUnavailable
+from ..exceptions import SandboxAdmissionRefused, SkillBodyUnavailable, SkillFileUnavailable
 from ..tool_outcome import ToolErrorClass, ToolOutcome, ToolResultStatus, record_outcome
 from .sandbox import _read_sandbox_limits_from_env, build_offline_pyodide_sandbox, enforce_sandbox_admission
 
@@ -88,9 +88,11 @@ class ScriptRunRefused(Exception):
     """A step of a run stopped it; the message is what the model reads instead of a result, and the facts are set
     when the sandbox ran the script before stopping it."""
 
-    def __init__(self, message: str, facts: Optional[dict] = None):
+    def __init__(self, message: str, facts: Optional[dict] = None,
+                 error_class: ToolErrorClass = ToolErrorClass.INFRASTRUCTURE):
         super().__init__(message)
         self.facts = facts
+        self.error_class = error_class
 
 
 class ScratchUnavailable(Exception):
@@ -261,7 +263,7 @@ class SkillScriptRunner:
         except ScriptRunRefused as refusal:
             record_outcome(ToolOutcome(
                 status=ToolResultStatus.ERROR, message=str(refusal).splitlines()[0], tool_name=TOOL_NAME,
-                error_class=ToolErrorClass.INFRASTRUCTURE,
+                error_class=refusal.error_class,
             ))
             return str(refusal), refusal.facts
         trailer, shared = self._sync_files(call_id, payload, callbacks)
@@ -321,6 +323,27 @@ class SkillScriptRunner:
                 ) from exc
         return staged
 
+    def _skill_file_bytes(self, skill: dict, path: str) -> bytes:
+        """One file of the skill as the sandbox stages it; a file whose content the platform no longer stores refuses
+        the run naming it, since no retry brings it back."""
+        try:
+            data = self.file_fetcher(
+                skill.get('skill_project_id'), skill.get('skill_id'),
+                skill.get('skill_version_id', skill.get('version_id')), path,
+            )
+        except SkillFileUnavailable as exc:
+            if not exc.missing:
+                raise
+            logger.warning("[Skills] staging %r: %s", skill.get('name'), exc)
+            raise ScriptRunRefused(
+                f"The script could not be run: the skill's file \"{path}\" is missing, for example because the "
+                "project was restored from a backup without skill attachments. Running it again will not help: tell "
+                "the user to upload the file again (to a new version if this one is published) or restore a backup "
+                "that includes skill attachments.",
+                error_class=ToolErrorClass.TOOL_INTERNAL,
+            ) from exc
+        return data.encode('utf-8') if isinstance(data, str) else bytes(data or b'')
+
     def _program(self, skill, files, script_path, args, scratch, inputs) -> str:
         """This file's sibling program, called with everything the sandbox needs to rebuild the run's filesystem."""
         name = skill.get('name')
@@ -328,12 +351,7 @@ class SkillScriptRunner:
         try:
             with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
                 for entry in files:
-                    data = self.file_fetcher(
-                        skill.get('skill_project_id'), skill.get('skill_id'),
-                        skill.get('skill_version_id', skill.get('version_id')), entry['path'],
-                    )
-                    content = data.encode('utf-8') if isinstance(data, str) else bytes(data or b'')
-                    archive.writestr(f"skills/{name}/{entry['path']}", content)
+                    archive.writestr(f"skills/{name}/{entry['path']}", self._skill_file_bytes(skill, entry['path']))
                 for path, data in scratch.items():
                     archive.writestr(f"work/{path}", data)
                 for input_name, data in inputs.items():
