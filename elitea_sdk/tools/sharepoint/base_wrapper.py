@@ -66,7 +66,7 @@ class BaseSharepointWrapper(ABC):
         include_extensions: Optional[List[str]] = None,
         skip_extensions: Optional[List[str]] = None,
         on_file_skipped: Optional[Callable[[str], None]] = None,
-        on_listing_gap: Optional[Callable[[str], None]] = None,
+        on_listing_gap: Callable[[str], None] | None = None,
     ):
         """Return a list of file metadata dicts from document libraries,
         including files from subfolders.

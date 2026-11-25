@@ -10,9 +10,12 @@ from unittest.mock import patch
 
 import pytest
 import requests
+from langchain_core.tools import ToolException
 
 from elitea_sdk.tools.sharepoint import library_metadata
-from elitea_sdk.tools.sharepoint.authorization_helper import SharepointAuthorizationHelper
+from elitea_sdk.tools.sharepoint.authorization_helper import (
+    SharepointAuthorizationHelper,
+)
 from elitea_sdk.tools.sharepoint.graph_wrapper import SharepointGraphWrapper
 
 GRAPH_MODULE = "elitea_sdk.tools.sharepoint.graph_wrapper"
@@ -23,7 +26,7 @@ FILE = {"id": "f1", "name": "a.txt", "file": {}, "webUrl": "https://x/a.txt",
         "parentReference": {"path": "/drives/drive-1/root:"}}
 
 
-def _response(status: int, body: dict = None, headers: dict = None) -> requests.Response:
+def _response(status: int, body: dict | None = None, headers: dict | None = None) -> requests.Response:
     resp = requests.Response()
     resp.status_code = status
     resp._content = json.dumps(body if body is not None else {}).encode()
@@ -66,16 +69,20 @@ class TestGraphListing:
         assert sleeps == [7.0]
 
     def test_a_listing_that_stays_throttled_raises_after_the_attempts(self, sleeps):
-        with patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(429)) as get:
-            with pytest.raises(Exception):
-                _graph().get_files_list()
+        with (
+            patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(429)) as get,
+            pytest.raises(ToolException),
+        ):
+            _graph().get_files_list()
 
         assert get.call_count == library_metadata.MAX_RETRIES + 1
 
     def test_other_reads_do_not_retry(self, sleeps):
-        with patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(429)) as get:
-            with pytest.raises(requests.HTTPError):
-                _graph()._get("https://graph.microsoft.com/v1.0/sites/x")
+        with (
+            patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(429)) as get,
+            pytest.raises(requests.HTTPError),
+        ):
+            _graph()._get("https://graph.microsoft.com/v1.0/sites/x")
 
         assert get.call_count == 1
         assert sleeps == []

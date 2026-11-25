@@ -30,7 +30,12 @@ import pytest
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.tools import index_change_check as check
 from elitea_sdk.tools.sharepoint.api_wrapper import SharepointApiWrapper
-from tests.tools.sharepoint.helpers import Backend, listed_file, stored_row, toolkit_with
+from tests.tools.sharepoint.helpers import (
+    Backend,
+    listed_file,
+    stored_row,
+    toolkit_with,
+)
 
 ITEM_COUNT = 2000
 TIME_BOUND_SECONDS = 5.0

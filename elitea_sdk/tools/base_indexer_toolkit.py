@@ -982,12 +982,12 @@ class _IndexRunState:
     chunks_written: int = 0
     # Scope of the last successful run, read from the meta row at run start; None
     # when the row has none (an index built before the scope was recorded).
-    last_run_scope: Optional[Dict[str, Any]] = None
+    last_run_scope: dict[str, Any] | None = None
     meta_existed: bool = False
     # Scope of this run, written to the meta row only when the run succeeds.
-    run_scope: Optional[Dict[str, Any]] = None
+    run_scope: dict[str, Any] | None = None
     # Base documents the loader yielded that ended with no row: {key: marker}.
-    unindexed_items: Dict[str, str] = field(default_factory=dict)
+    unindexed_items: dict[str, str] = field(default_factory=dict)
 
 
 _ACTIVE_INDEXING_STATS: "contextvars.ContextVar[Optional[IndexingStats]]" = contextvars.ContextVar(
@@ -1259,7 +1259,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return
         run.unindexed_items[str(key)] = self._document_marker(base_doc)
 
-    def _unindexed_items_to_record(self) -> Dict[str, str]:
+    def _unindexed_items_to_record(self) -> dict[str, str]:
         run = self._index_run
         items = run.unindexed_items
         if len(items) > MAX_UNINDEXED_ITEMS:
@@ -2192,7 +2192,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         )
 
     @staticmethod
-    def _dependent_keys(indexed_data: Dict[str, Dict[str, Any]]) -> Set[str]:
+    def _dependent_keys(indexed_data: dict[str, dict[str, Any]]) -> set[str]:
         dependent_keys = set()
         for entry in indexed_data.values():
             for dependent_key in entry.get(IndexerKeywords.DEPENDENT_DOCS.value) or []:
@@ -2200,7 +2200,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         return dependent_keys
 
     @staticmethod
-    def _is_base_row(doc_key: str, entry: Dict[str, Any], dependent_keys: Set[str]) -> bool:
+    def _is_base_row(doc_key: str, entry: dict[str, Any], dependent_keys: set[str]) -> bool:
         """True for a row that stands for a source item, not for a part of one."""
         if doc_key in dependent_keys:
             return False
@@ -2211,8 +2211,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         # in seen_keys) marks a dependent row that falls with its parent.
         return entry.get(IndexerKeywords.PARENT.value, -1) == -1
 
-    def _collect_orphan_candidates(self, indexed_data: Dict[str, Dict[str, Any]],
-                                   seen_keys: Set[str]) -> Tuple[List[str], int]:
+    def _collect_orphan_candidates(self, indexed_data: dict[str, dict[str, Any]],
+                                   seen_keys: set[str]) -> tuple[list[str], int]:
         dependent_keys = self._dependent_keys(indexed_data)
         orphan_ids: List[str] = []
         orphan_doc_count = 0
@@ -3075,7 +3075,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         return (f"Index '{index_name}' has been removed from the vector store.\n"
                 f"{self._available_indexes_note()}")
 
-    def _list_source_items(self, index_configuration: Dict[str, Any]) -> index_change_check.SourceListing:
+    def _list_source_items(self, index_configuration: dict[str, Any]) -> index_change_check.SourceListing:
         """List the source with the scope of the saved index configuration.
 
         A toolkit that overrides this gets the `check_for_changes` tool. The listing
@@ -3095,7 +3095,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             key=key, name=name, path=str(metadata.get('path') or name), marker=self._stored_marker(metadata),
         )
 
-    def _stored_marker(self, metadata: Dict[str, Any]) -> str:
+    def _stored_marker(self, metadata: dict[str, Any]) -> str:
         """The change marker of a stored row. Must match what the listing gives for the same item."""
         return str(metadata.get('updated_on') or '')
 
@@ -3103,11 +3103,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """The change marker of a base document the loader yielded."""
         return self._stored_marker(document.metadata)
 
-    def _is_unchecked_row(self, entry: Dict[str, Any]) -> bool:
+    def _is_unchecked_row(self, entry: dict[str, Any]) -> bool:
         """True for a base row that the source listing does not cover; the check leaves it out."""
         return False
 
-    def _run_scope_keys(self, index_configuration: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _run_scope_keys(self, index_configuration: dict[str, Any]) -> dict[str, Any] | None:
         """The keys of an index configuration that decide which source items a run covers.
 
         None means the toolkit does not track a scope. The name differs from `_index_scope`
@@ -3161,8 +3161,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             index_name, comparison, listing, unindexed_recorded, excluded_rows
         )
 
-    def _add_scope_blocker(self, listing: index_change_check.SourceListing, configuration: Dict[str, Any],
-                           metadata: Dict[str, Any]):
+    def _add_scope_blocker(self, listing: index_change_check.SourceListing, configuration: dict[str, Any],
+                           metadata: dict[str, Any]):
         """Name the scope cause when the next full run cannot confirm which source items are gone."""
         current = self._run_scope_keys(configuration)
         if current is None:
@@ -3664,9 +3664,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     def index_meta_update(self, index_name: str, state: str, result: int, error: Optional[str] = None,
                           skipped: Optional[Dict] = None, docs_count: Optional[int] = None,
-                          report: Optional[Dict] = None,
-                          last_run_scope: Optional[Dict[str, Any]] = None,
-                          unindexed_items: Optional[Dict[str, str]] = None):
+                          report: dict | None = None,
+                          last_run_scope: dict[str, Any] | None = None,
+                          unindexed_items: dict[str, str] | None = None):
         """Patch the SDK-owned keys of the `index_meta` document.
 
         Mid-run progress no longer comes through here — it rides the run

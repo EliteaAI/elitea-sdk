@@ -21,18 +21,22 @@ Lives outside tests/tools/index/ because CI skips that directory.
 
 import json
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.tools import base_indexer_toolkit
 from elitea_sdk.tools import index_change_check as check
-from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit, IndexingStatus, _IndexRunState
+from elitea_sdk.tools.base_indexer_toolkit import (
+    BaseIndexerToolkit,
+    IndexingStatus,
+    _IndexRunState,
+)
 from tests.tools.test_6585_document_failure_isolation import (
     StagingToolkit,
     build_staged_toolkit,
     make_documents,
-    run_index_data,
 )
 
 # The keys the platform keeps when it rebuilds the meta row for a new run
@@ -168,7 +172,7 @@ def dispatch_reset(stored, index_configuration):
 class TestScopeSurvivesTheDispatchReset:
     """The platform rebuilds the meta row before every run; the scope must still reach the next run."""
 
-    CONFIG = {"path": "/lib"}
+    CONFIG: ClassVar[dict[str, str]] = {"path": "/lib"}
 
     @pytest.fixture
     def toolkit(self, monkeypatch):

@@ -38,8 +38,10 @@ from .graph_retry import (  # re-exported: the tests and the library loader read
     BACKOFF_BASE_SECONDS,
     MAX_RETRIES,
     MAX_RETRY_AFTER_SECONDS,
-    TRANSIENT_ERRORS as _TRANSIENT_ERRORS,
     send_with_retry,
+)
+from .graph_retry import (
+    TRANSIENT_ERRORS as _TRANSIENT_ERRORS,
 )
 from .graph_wrapper import _is_graph_url as is_graph_url
 
@@ -624,7 +626,7 @@ def apply_library_metadata(file_meta: Dict[str, Any], index: LibraryIndex, setti
     return kept
 
 
-def _join_library_metadata(file_meta: Dict[str, Any], index: LibraryIndex, settings: LibrarySettings,
+def _join_library_metadata(file_meta: dict[str, Any], index: LibraryIndex, settings: LibrarySettings,
                            counts: JoinCounts) -> bool:
     entry, how = index.match(file_meta)
     file_meta["web_url"] = file_meta.get("Link") or file_meta.get("web_url") or ""

@@ -327,8 +327,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None,
-                       on_listing_gap: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Callable[[str], None] | None = None,
+                       on_listing_gap: Callable[[str], None] | None = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder; otherwise lists

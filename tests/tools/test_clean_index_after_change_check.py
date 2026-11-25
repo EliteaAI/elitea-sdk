@@ -30,7 +30,6 @@ from langchain_core.documents import Document
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.runtime.utils.utils import IndexerKeywords
 from elitea_sdk.tools import index_change_check as check
-from elitea_sdk.tools.base_indexer_toolkit import BaseIndexerToolkit
 from elitea_sdk.tools.chunkers import __all__ as chunkers
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 from elitea_sdk.tools.vector_adapters.VectorStoreAdapter import VectorStoreAdapter

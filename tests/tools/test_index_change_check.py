@@ -25,7 +25,11 @@ from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.tools import index_change_check as check
-from elitea_sdk.tools.base_indexer_toolkit import IndexTools, SDK_OWNED_META_KEYS, _IndexRunState
+from elitea_sdk.tools.base_indexer_toolkit import (
+    SDK_OWNED_META_KEYS,
+    IndexTools,
+    _IndexRunState,
+)
 from elitea_sdk.tools.elitea_base import INDEX_TOOL_NAMES
 from elitea_sdk.tools.non_code_indexer_toolkit import NonCodeIndexerToolkit
 

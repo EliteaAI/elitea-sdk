@@ -16,7 +16,13 @@ from elitea_sdk.tools.base_indexer_toolkit import _IndexRunState
 from elitea_sdk.tools.sharepoint import library_metadata as lm
 from elitea_sdk.tools.sharepoint.api_wrapper import SharepointApiWrapper
 from elitea_sdk.tools.sharepoint.rest_wrapper import SharepointRestWrapper
-from tests.tools.sharepoint.helpers import SITE, Backend, listed_file, stored_row, toolkit_with
+from tests.tools.sharepoint.helpers import (
+    SITE,
+    Backend,
+    listed_file,
+    stored_row,
+    toolkit_with,
+)
 
 LIB_FILE_URL = f"{SITE}/Lib/a.docx"
 

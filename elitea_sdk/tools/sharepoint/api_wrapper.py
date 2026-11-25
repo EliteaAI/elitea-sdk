@@ -666,8 +666,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None,
-                       on_listing_gap: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Callable[[str], None] | None = None,
+                       on_listing_gap: Callable[[str], None] | None = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder path; otherwise lists
@@ -1191,10 +1191,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             yield from self._onenote_base_loader(self._onenote_cfg)
 
     @staticmethod
-    def _file_metadata(file: Dict[str, Any]) -> Dict[str, str]:
+    def _file_metadata(file: dict[str, Any]) -> dict[str, str]:
         return {("updated_on" if k == "Modified" else k): str(v) for k, v in file.items()}
 
-    def _list_files_for_index(self, kwargs: Dict[str, Any], track_skipped: bool):
+    def _list_files_for_index(self, kwargs: dict[str, Any], track_skipped: bool):
         """The files an index run covers: (files, library join context, listing cap, listing gaps).
 
         The indexing loader and the change check both list through here, so they see the same files.
@@ -1210,7 +1210,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                       if library is not None and library[0].categories else limit_files)
         self._log_tool_event(
             message="Starting SharePoint files extraction", tool_name="loader")
-        gaps: List[str] = []
+        gaps: list[str] = []
         try:
             all_files = self.get_files_list(
                 kwargs.get('path'), list_limit,
@@ -1248,7 +1248,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             scope[key] = None if unset else value
         return scope
 
-    def _run_may_remove_orphans(self, kwargs: Dict[str, Any], gaps: List[str], listed: int, list_limit: int) -> bool:
+    def _run_may_remove_orphans(self, kwargs: dict[str, Any], gaps: list[str], listed: int, list_limit: int) -> bool:
         """True when this run's listing proves which files are gone, so the clean-up may remove rows."""
         run = getattr(self, '_index_run', None)
         if run is None or gaps or kwargs.get('include_onenote') or listed >= list_limit:

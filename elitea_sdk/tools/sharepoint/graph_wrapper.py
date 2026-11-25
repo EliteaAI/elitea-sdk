@@ -225,7 +225,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             logging.warning("SharePoint: token refresh error: %s", type(e).__name__)  # never the request (secret, token)
             return False
 
-    def _get(self, url: str, params: Optional[dict] = None, retry_throttled: bool = False) -> dict:
+    def _get(self, url: str, params: dict | None = None, retry_throttled: bool = False) -> dict:
         # Only listings retry a throttled answer: a retry of other reads would slow a failing call for nothing.
         def send() -> requests.Response:
             return requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
@@ -703,8 +703,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None,
-                       on_listing_gap: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Callable[[str], None] | None = None,
+                       on_listing_gap: Callable[[str], None] | None = None):
         """
         Lists all files including files from subfolders across **all document
         libraries** on the site.
