@@ -1,3 +1,4 @@
+import html
 import logging
 import re
 import string
@@ -155,6 +156,33 @@ def svg_to_px_drawing(svg_content: bytes):
     return drawing
 
 
+_SVG_PROLOG_RE = re.compile(r"\s*(?:<\?xml[^>]*\?>|<!DOCTYPE[^>]*>|<!--.*?-->|\s)*", re.DOTALL)
+_SVG_ELEMENT_RE = re.compile(r"<svg\b.*</svg>", re.DOTALL | re.IGNORECASE)
+_FOREIGN_OBJECT_RE = re.compile(r"<foreignObject\b([^>]*)>(.*?)</foreignObject>", re.DOTALL)
+_ZERO_DASHARRAY_RE = re.compile(r"(stroke-dasharray\s*(?::|=\s*[\"']))\s*0+(?:\.0*)?(?:[\s,]+0+(?:\.0*)?)*\s*(?=[\"';}!])")
+_FOREIGN_OBJECT_FONT_PX = 14
+
+
+def _svg_number_attr(attrs: str, name: str) -> float:
+    match = re.search(rf'\b{name}\s*=\s*["\']\s*(-?[\d.]+)', attrs)
+    try:
+        return float(match.group(1)) if match else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _foreign_object_to_text(match) -> str:
+    # svglib drops <foreignObject> (HTML labels, e.g. Mermaid), so keep its text as a centered <text>.
+    attrs, body = match.group(1), match.group(2)
+    label = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", body)).split())
+    if not label:
+        return ""
+    x = _svg_number_attr(attrs, "x") + _svg_number_attr(attrs, "width") / 2
+    y = _svg_number_attr(attrs, "y") + _svg_number_attr(attrs, "height") / 2 + _FOREIGN_OBJECT_FONT_PX * 0.35
+    return (f'<text x="{x:g}" y="{y:g}" text-anchor="middle" '
+            f'font-size="{_FOREIGN_OBJECT_FONT_PX}">{html.escape(label, quote=False)}</text>')
+
+
 def preprocess_svg_for_rendering(svg_content: bytes) -> bytes:
     """Fix known svglib rendering issues in SVG content.
 
@@ -164,11 +192,24 @@ def preprocess_svg_for_rendering(svg_content: bytes) -> bytes:
     - ``clip-path="url(#…)"`` attributes – svglib often silently clips away
       all content; the attribute and matching ``<clipPath>`` definitions are
       removed so the paths remain visible.
+    - ``<svg>`` wrapped in HTML (browser "save diagram" exports) – svglib reads
+      the wrapper as the root and fails on CSS sizes like ``auto``; only the
+      ``<svg>`` element is kept.
+    - all-zero ``stroke-dasharray`` – cairo rejects it; replaced with ``none``.
+    - ``<foreignObject>`` labels – svglib drops them; their text is kept as
+      ``<text>`` so node labels survive.
     """
     text = svg_content.decode("utf-8", errors="replace")
+    body = text[_SVG_PROLOG_RE.match(text).end():]
+    if not body[:4].lower() == "<svg":
+        svg_element = _SVG_ELEMENT_RE.search(body)
+        if svg_element:
+            text = svg_element.group(0)
     text = text.replace("currentColor", "black")
     text = re.sub(r'\s*clip-path="url\([^)]*\)"', "", text)
     text = re.sub(r"<clipPath[^>]*>.*?</clipPath>", "", text, flags=re.DOTALL)
+    text = _ZERO_DASHARRAY_RE.sub(r"\1none", text)
+    text = _FOREIGN_OBJECT_RE.sub(_foreign_object_to_text, text)
     return text.encode("utf-8")
 
 
