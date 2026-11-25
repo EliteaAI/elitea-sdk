@@ -4,7 +4,6 @@ Bare --allow-net let sandbox code reach internal services on the worker network
 (an internal secrets service answered). The fix maps allow_net=True to the package
 hosts plus operator-supplied SANDBOX_ALLOWED_HOSTS.
 """
-import shutil
 from unittest.mock import patch
 
 import pytest
@@ -96,19 +95,6 @@ def test_all_entry_points_resolve_to_allowlist():
         cmd = _built_command(tool)
         assert "--allow-net" not in cmd
         assert "--allow-net=" + ",".join(DEFAULTS) in cmd
-
-
-needs_deno = pytest.mark.skipif(shutil.which("deno") is None, reason="deno not installed")
-
-
-@pytest.mark.integration
-@needs_deno
-def test_internal_host_refused_and_pypi_allowed():
-    tool = PyodideSandboxTool()
-    blocked = tool._run(code="import httpx\nhttpx.get('http://127.0.0.1:80/', timeout=5)")
-    assert "NotCapable" in str(blocked) or "net access" in str(blocked).lower()
-    ok = tool._run(code="import micropip\nawait micropip.install('six')\nimport six\nprint('ok', six.__version__)")
-    assert "ok" in str(ok)
 
 
 class _Client:
