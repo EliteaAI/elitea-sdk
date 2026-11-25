@@ -419,6 +419,73 @@ class TestCheckTool:
             _NoListing.model_construct().check_for_changes("idx")
 
 
+class TestCheckReadsAndGuards:
+
+    def test_a_check_during_a_run_is_refused_before_the_source_is_listed(self, indexed_toolkit):
+        indexed_toolkit.stored_meta["metadata"]["state"] = "in_progress"
+
+        with pytest.raises(ToolException, match="being indexed now"):
+            indexed_toolkit.check_for_changes("idx")
+
+        assert indexed_toolkit.seen_configuration is None
+
+    def test_skipped_items_come_from_the_history_after_the_dispatch_reset(self, indexed_toolkit):
+        indexed_toolkit.listing_items = [item("empty-file", marker="5")]
+        indexed_toolkit.stored_meta["metadata"] = {
+            "index_configuration": {"path": "/lib"},
+            "history": json.dumps([
+                {"state": "completed", "unindexed_items": {"empty-file": "5"}},
+                {"state": "failed"},
+            ]),
+        }
+
+        report = indexed_toolkit.check_for_changes("idx")
+
+        assert report["counts"]["not_indexed"] == 1
+        assert report["counts"]["added"] == 0
+        assert check.UNINDEXED_NOT_RECORDED_WARNING not in report["warnings"]
+
+    def test_run_facts_stored_as_json_strings_are_read(self, indexed_toolkit, monkeypatch):
+        monkeypatch.setattr(_Indexed, "_run_scope_keys", lambda self, cfg: {"path": cfg.get("path")})
+        indexed_toolkit.listing_items = [item("a", marker="2"), item("empty-file", marker="5")]
+        indexed_toolkit.stored_rows = {"a": row("a", "1")}
+        indexed_toolkit.stored_meta["metadata"].update({
+            "last_run_scope": json.dumps({"path": "/lib"}), "unindexed_items": json.dumps({"empty-file": "5"}),
+        })
+
+        report = indexed_toolkit.check_for_changes("idx")
+
+        assert "scope" not in report["reason"]
+        assert report["counts"]["not_indexed"] == 1
+
+    def test_an_empty_listing_of_a_non_empty_index_is_incomplete_and_removes_nothing(self):
+        comparison, report = run_compare([], [item("a"), item("b")], unindexed={})
+
+        assert comparison.removed == []
+        assert report["counts"]["removed"] == 0
+        assert report["listing_complete"] is False
+        assert check.EMPTY_LISTING_WARNING in report["warnings"]
+
+    def test_an_empty_listing_of_an_empty_index_stays_up_to_date(self):
+        _, report = run_compare([], [], unindexed={})
+
+        assert report["listing_complete"] is True
+        assert report["status"] == check.STATUS_UP_TO_DATE
+
+    def test_the_reason_for_changed_items_does_not_demand_clean_index_for_every_change(self):
+        _, report = run_compare([item("a", marker="2")], [item("a", marker="1")], unindexed={})
+
+        assert report["status"] == check.STATUS_NEEDS_CLEAN_REINDEX
+        assert "plain index_data run re-indexes" in report["reason"]
+        assert "Removed items" not in report["reason"]
+
+    def test_the_reason_for_removed_items_names_clean_index(self):
+        _, report = run_compare([item("a")], [item("a"), item("gone")], unindexed={})
+
+        assert "Removed items found: run index_data with clean_index" in report["reason"]
+        assert "Changed items" not in report["reason"]
+
+
 class _RecordingAdapter:
     supports_run_staging = True
 
@@ -449,7 +516,7 @@ def meta_toolkit(monkeypatch):
 
 class TestRunFacts:
 
-    def test_a_successful_write_keeps_unindexed_items_out_of_history_and_the_scope_in_the_last_entry(
+    def test_a_successful_write_stores_both_facts_as_json_strings_and_in_the_last_history_entry(
             self, meta_toolkit):
         toolkit, adapter = meta_toolkit
 
@@ -458,10 +525,37 @@ class TestRunFacts:
         )
 
         patch = adapter.patches[-1]
-        assert patch["last_run_scope"] == {"path": "/new"}
-        assert patch["unindexed_items"] == {"k": "5"}
+        assert json.loads(patch["last_run_scope"]) == {"path": "/new"}
+        assert json.loads(patch["unindexed_items"]) == {"k": "5"}
         history = json.loads(patch["history"])
         assert history[-1]["last_run_scope"] == {"path": "/new"}
+        assert history[-1]["unindexed_items"] == {"k": "5"}
+
+    def test_an_older_history_entry_loses_its_skipped_items_when_a_newer_run_records_them(self, meta_toolkit):
+        toolkit, adapter = meta_toolkit
+        stored = VectorStoreWrapperBase.get_index_meta(toolkit, "idx")
+        stored["metadata"]["history"] = json.dumps([
+            {"state": "completed", "unindexed_items": {"old": "1"}},
+            {"state": "in_progress"},
+        ])
+
+        toolkit.index_meta_update("idx", "completed", 3, unindexed_items={"k": "5"})
+
+        history = json.loads(adapter.patches[-1]["history"])
+        assert [entry.get("unindexed_items") for entry in history] == [None, {"k": "5"}]
+
+    def test_a_failed_write_keeps_the_skipped_items_of_the_last_good_entry(self, meta_toolkit):
+        toolkit, adapter = meta_toolkit
+        stored = VectorStoreWrapperBase.get_index_meta(toolkit, "idx")
+        stored["metadata"]["history"] = json.dumps([
+            {"state": "completed", "unindexed_items": {"old": "1"}},
+            {"state": "in_progress"},
+        ])
+
+        toolkit.index_meta_update("idx", "failed", 0, error="boom")
+
+        history = json.loads(adapter.patches[-1]["history"])
+        assert history[0]["unindexed_items"] == {"old": "1"}
         assert "unindexed_items" not in history[-1]
 
     def test_an_older_history_entry_loses_its_scope_when_a_newer_run_records_one(self, meta_toolkit):

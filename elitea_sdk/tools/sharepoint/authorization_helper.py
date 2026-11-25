@@ -13,6 +13,7 @@ from .file_filters import (
     normalize_extension_filters,
     skip_reporter,
 )
+from .graph_retry import send_with_retry
 
 
 class SharepointAuthorizationHelper:
@@ -158,7 +159,6 @@ class SharepointAuthorizationHelper:
                 on_listing_gap(reason)
 
         try:
-            from .library_metadata import send_with_retry  # imported here: library_metadata imports graph_wrapper
             access_token, site_id = self.generate_token_and_site_id(site_url)
             headers = {"Authorization": f"Bearer {access_token}"}
             drives_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
@@ -176,7 +176,7 @@ class SharepointAuthorizationHelper:
                 files = []
                 next_link = url
                 while next_link:
-                    response = send_with_retry(lambda: requests.get(next_link, headers=headers, timeout=60))
+                    response = send_with_retry(lambda url=next_link: requests.get(url, headers=headers, timeout=60))
                     if response.status_code != 200:
                         _report_gap("a folder page could not be read")
                         break

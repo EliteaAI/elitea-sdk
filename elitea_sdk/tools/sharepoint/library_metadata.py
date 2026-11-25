@@ -34,6 +34,13 @@ from urllib.parse import quote, unquote, urlsplit
 import requests
 from langchain_core.tools import ToolException
 
+from .graph_retry import (  # re-exported: the tests and the library loader read the limits from here
+    BACKOFF_BASE_SECONDS,
+    MAX_RETRIES,
+    MAX_RETRY_AFTER_SECONDS,
+    TRANSIENT_ERRORS as _TRANSIENT_ERRORS,
+    send_with_retry,
+)
 from .graph_wrapper import _is_graph_url as is_graph_url
 
 logger = logging.getLogger(__name__)
@@ -61,11 +68,6 @@ MAX_VALUE_CHARS = 1_000
 MAX_LIST_VALUE_ENTRIES = 50
 MAX_CATALOGUE_LISTS = 2_000
 REQUEST_TIMEOUT = (10, 60)          # connect, read (seconds)
-MAX_RETRIES = 4
-BACKOFF_BASE_SECONDS = 1.0
-MAX_RETRY_AFTER_SECONDS = 60.0
-RETRYABLE_STATUS = frozenset({429, 503, 504})
-_TRANSIENT_ERRORS = (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError)
 
 # Status values written to every file's metadata in library mode.
 STATUS_OK = "ok"
@@ -311,49 +313,6 @@ class FieldMapper:
 def _segment(value: str) -> str:
     """Percent-encode one URL path segment (no '/' survives, so a value can never add a segment)."""
     return quote(str(value), safe="")
-
-
-def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
-    header = (resp.headers or {}).get("Retry-After")
-    if header:
-        try:
-            return min(max(float(header), 0.0), MAX_RETRY_AFTER_SECONDS)
-        except ValueError:
-            pass
-    return min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS)
-
-
-def send_with_retry(send: Callable[[], requests.Response],
-                    sleep: Optional[Callable[[float], None]] = None) -> requests.Response:
-    """Call ``send`` until it answers with something other than a throttling status.
-
-    A timeout or a dropped connection is retried the same way. When the attempts
-    run out, a transient error is raised and a throttling answer is returned, so
-    the caller decides what a final 429 or 503 means.
-    """
-    sleep = sleep or time.sleep
-    attempt = 0
-    while True:
-        try:
-            resp = send()
-        except _TRANSIENT_ERRORS:
-            if attempt >= MAX_RETRIES:
-                raise
-            sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
-            attempt += 1
-            continue
-        if resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-            delay = _retry_after_seconds(resp, attempt)
-            logger.info("[SP-library] Graph answered %s; retrying in %.1fs (attempt %d)",
-                        resp.status_code, delay, attempt + 1)
-            # a streamed answer holds its connection until it is closed
-            close = getattr(resp, "close", None)
-            if callable(close):
-                close()
-            sleep(delay)
-            attempt += 1
-            continue
-        return resp
 
 
 class GraphListClient:

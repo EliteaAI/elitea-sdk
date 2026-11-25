@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from langchain_core.documents import Document
 
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.tools import index_change_check as check
@@ -135,19 +136,29 @@ class TestListFieldMarker:
     def test_an_unchanged_row_matches_its_listing_marker(self):
         toolkit, marker = self.listing_marker({"owner": "Ann"})
         digest = marker.split("|", 1)[1]
-        item = toolkit._list_source_items({"limit_files": 50, "library_lists": ["Docs"]}).items[0]
+        listing = toolkit._list_source_items({"limit_files": 50, "library_lists": ["Docs"]})
+        item = listing.items[0]
 
-        stored = toolkit._indexed_item("f1", stored_row(item, library_digest=digest))
+        stored = toolkit._indexed_item("f1", stored_row(item, library_digest=digest), listing)
 
         assert stored.marker == item.marker
 
     def test_a_row_without_a_digest_is_not_reported_as_changed(self):
         toolkit, _ = self.listing_marker({"owner": "Ann"})
-        item = toolkit._list_source_items({"limit_files": 50, "library_lists": ["Docs"]}).items[0]
+        listing = toolkit._list_source_items({"limit_files": 50, "library_lists": ["Docs"]})
+        item = listing.items[0]
 
-        stored = toolkit._indexed_item("f1", stored_row(item))
+        stored = toolkit._indexed_item("f1", stored_row(item), listing)
 
         assert stored.marker == item.marker
+
+    def test_a_check_leaves_no_digest_on_the_toolkit_for_a_later_run(self):
+        toolkit, _ = self.listing_marker({"owner": "Ann"})
+        toolkit._list_source_items({"limit_files": 50, "library_lists": ["Docs"]})
+        document = Document(page_content="x", metadata={"id": "f1", "updated_on": "2026-01-01"})
+
+        assert not hasattr(toolkit, "_listed_digests")
+        assert toolkit._document_marker(document) == "2026-01-01"
 
     def test_the_loader_writes_the_same_digest_the_check_computes(self):
         toolkit = toolkit_with(Backend([listed_file()]), library_context({"owner": "Ann"}))
@@ -271,6 +282,12 @@ class TestOrphanRemovalGates:
         assert toolkit._run_scope_keys({}) == toolkit._run_scope_keys({"limit_files": 10000})
         assert toolkit._run_scope_keys({"limit_files": 50}) != toolkit._run_scope_keys({})
         assert toolkit._run_scope_keys({"metadata_fields": ["a=b"]}) != toolkit._run_scope_keys({})
+
+    def test_a_limit_of_zero_stays_zero_and_differs_from_the_default(self):
+        toolkit = toolkit_with(Backend())
+
+        assert toolkit._run_scope_keys({"limit_files": 0})["limit_files"] == 0
+        assert toolkit._run_scope_keys({"limit_files": 0}) != toolkit._run_scope_keys({})
 
 
 class TestRunScopeLifecycle:

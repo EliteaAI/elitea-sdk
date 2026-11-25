@@ -89,6 +89,24 @@ class TestIndexDataRecordsRunFacts:
         assert final["last_run_scope"] == {"path": "/lib"}
         assert final["unindexed_items"] == {"d2": "1"}
 
+    def test_a_run_without_staging_records_the_same_facts(self, monkeypatch):
+        toolkit = build_staged_toolkit(monkeypatch, ListingToolkit)
+        calls = spy_on_meta_update(monkeypatch)
+        toolkit.vector_adapter.supports_run_staging = False
+        monkeypatch.setattr(ListingToolkit, "_staging_active", lambda self: False)
+        monkeypatch.setattr(StagingToolkit, "_base_loader", lambda self, **kw: iter(make_documents("d1", "d2")))
+        monkeypatch.setattr(StagingToolkit, "_save_index_generator",
+                            save_with(unindexed=("d2",), count=2, docs_count=1, failed_docs=0))
+
+        outcome = toolkit.index_data(index_name="x", path="/lib")
+
+        assert outcome["status"] == IndexingStatus.OK.value
+        assert calls[-1]["last_run_scope"] == {"path": "/lib"}
+        assert calls[-1]["unindexed_items"] == {"d2": "1"}
+        stored = toolkit._stored_meta["metadata"]
+        assert json.loads(stored["last_run_scope"]) == {"path": "/lib"}
+        assert json.loads(stored["unindexed_items"]) == {"d2": "1"}
+
     def test_a_failed_run_hands_over_neither_so_the_last_good_values_stay(self, monkeypatch):
         failing_save = save_with(failed_keys=("d1", "d2"), unindexed=("d2",), count=0, docs_count=0, failed_docs=2)
 

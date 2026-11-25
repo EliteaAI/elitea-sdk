@@ -29,6 +29,7 @@ from ...runtime.utils.mcp_oauth import McpAuthorizationRequired, is_entra_url
 
 from .base_wrapper import BaseSharepointWrapper
 from .browser_url import NOT_A_FILE_URL_MESSAGE, SharepointFileUrl, parse_sharepoint_file_url
+from .graph_retry import send_with_retry
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
 from ..utils.content_parser import parse_file_content, parse_content_from_bytes
 from ..utils.file_metadata import bound_read_result, describe_requested_range
@@ -230,7 +231,6 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             return requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
 
         if retry_throttled:
-            from .library_metadata import send_with_retry  # imported here: library_metadata imports this module
             resp = send_with_retry(send)
         else:
             resp = send()

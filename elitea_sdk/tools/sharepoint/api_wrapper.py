@@ -1243,7 +1243,9 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 value = DEFAULT_LIMIT_FILES
             if isinstance(value, (list, tuple, set)):
                 value = sorted(str(item) for item in value)
-            scope[key] = None if value in (None, '', [], {}, False) else value
+            # `0 in (..., False)` is true, so a plain membership test would turn limit_files 0 into None.
+            unset = value is None or value is False or (isinstance(value, (str, list, dict)) and not value)
+            scope[key] = None if unset else value
         return scope
 
     def _run_may_remove_orphans(self, kwargs: Dict[str, Any], gaps: List[str], listed: int, list_limit: int) -> bool:
@@ -1257,20 +1259,20 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             return False
         return not run.meta_existed or run.run_scope == run.last_run_scope
 
-    def _stored_marker(self, metadata):
+    def _stored_marker(self, metadata, listed_digest=None):
         marker = str(metadata.get('updated_on') or '')
         digest = metadata.get('library_digest')
         if digest is None:
             # A row indexed before the digest existed: take the listing's value, so only
             # an edit made after the next index run shows as a change.
-            digest = getattr(self, '_listed_digests', {}).get(metadata.get('id'))
+            digest = listed_digest
         return f"{marker}|{digest}" if digest else marker
 
-    def _indexed_item(self, key, entry):
+    def _indexed_item(self, key, entry, listing):
         metadata = entry.get('metadata') or {}
         return index_change_check.ListedItem(
             key=key, name=str(metadata.get('Name') or ''), path=str(metadata.get('Path') or ''),
-            marker=self._stored_marker(metadata))
+            marker=self._stored_marker(metadata, listing.digests.get(key)))
 
     def _is_unchecked_row(self, entry) -> bool:
         return (entry.get('metadata') or {}).get('source_type') == 'onenote'
@@ -1281,7 +1283,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         limit_files = kwargs.get('limit_files', 10000)
         items = []
         gaps = []
-        self._listed_digests = {}
+        digests = {}
         if limit_files > 0:
             files, library, _, gaps = self._list_files_for_index(kwargs, track_skipped=False)
             for file in files:
@@ -1294,7 +1296,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 if len(items) >= limit_files:
                     gaps.append("the file limit was reached before the listing ended")
                     break
-                self._listed_digests[key] = metadata.get('library_digest')
+                digests[key] = metadata.get('library_digest')
                 items.append(index_change_check.ListedItem(
                     key=key, name=metadata.get('Name', ''), path=metadata.get('Path', ''),
                     marker=self._stored_marker(metadata)))
@@ -1303,7 +1305,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             blockers.append("OneNote pages are included in the index and are not checked")
         return index_change_check.SourceListing(
             items=items, complete=not gaps, gaps=gaps, id_family=type(self._backend).__name__,
-            attest_blockers=blockers,
+            attest_blockers=blockers, digests=digests,
             unchecked_note="OneNote pages are not checked",
             unchecked_reason=(
                 "OneNote pages are not checked, so changes there are not reported."

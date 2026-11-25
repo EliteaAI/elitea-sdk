@@ -4,7 +4,7 @@ The functions here are pure: the toolkit lists the source and reads the index, a
 this module only classifies the keys and builds the report.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 REPORT_SCHEMA_VERSION = 1
 MAX_LISTED_PER_GROUP = 200
@@ -16,6 +16,7 @@ STATUS_ADD_ONLY = "add_only"
 STATUS_NEEDS_CLEAN_REINDEX = "needs_clean_reindex"
 
 KEY_MISMATCH_WARNING = "item ids of the listing do not match the index"
+EMPTY_LISTING_WARNING = "the listing is empty but the index holds items"
 UNINDEXED_NOT_RECORDED_WARNING = "re-index once to record skipped items"
 
 
@@ -35,29 +36,32 @@ class SourceListing:
     `complete` is False when any part of the source may be missing from `items`;
     `gaps` then says why, one line each. `attest_blockers` are the reasons the next
     full index run cannot confirm the source, so it cannot remove rows either.
+    `digests` holds a per-key value that a toolkit may need to rebuild the marker of
+    a stored row; it lives on the listing, so no state outlives one check.
     """
-    items: List[ListedItem]
+    items: list[ListedItem]
     complete: bool = True
-    gaps: List[str] = field(default_factory=list)
+    gaps: list[str] = field(default_factory=list)
     id_family: str = ""
-    attest_blockers: List[str] = field(default_factory=list)
+    attest_blockers: list[str] = field(default_factory=list)
     unchecked_note: str = ""
     unchecked_reason: str = ""
+    digests: dict[str, str | None] = field(default_factory=dict)
 
 
 @dataclass
 class Comparison:
-    added: List[ListedItem] = field(default_factory=list)
-    changed: List[ListedItem] = field(default_factory=list)
-    removed: List[ListedItem] = field(default_factory=list)
+    added: list[ListedItem] = field(default_factory=list)
+    changed: list[ListedItem] = field(default_factory=list)
+    removed: list[ListedItem] = field(default_factory=list)
     unchanged: int = 0
     not_indexed: int = 0
     listing_complete: bool = True
-    warnings: List[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
-def compare(listing: SourceListing, indexed: Dict[str, ListedItem],
-            unindexed_items: Optional[Dict[str, str]] = None) -> Comparison:
+def compare(listing: SourceListing, indexed: dict[str, ListedItem],
+            unindexed_items: dict[str, str] | None = None) -> Comparison:
     """Classify every key of the listing and of the index.
 
     `indexed` holds the base rows only, keyed like the listing. A listing that is
@@ -68,7 +72,12 @@ def compare(listing: SourceListing, indexed: Dict[str, ListedItem],
     listed = {item.key: item for item in listing.items}
     complete = listing.complete and not listing.gaps
     result.warnings.extend(listing.gaps)
-    if indexed and listed and not (set(indexed) & set(listed)):
+    if indexed and not listed:
+        # The loader refuses to remove rows on an empty listing, because a renamed or
+        # removed library lists nothing; the check must not call every row removed.
+        complete = False
+        result.warnings.append(EMPTY_LISTING_WARNING)
+    elif indexed and listed and not (set(indexed) & set(listed)):
         # A different id family (REST UniqueId against Graph driveItem id) would
         # otherwise turn every indexed row into "removed".
         complete = False
@@ -97,7 +106,7 @@ def compare(listing: SourceListing, indexed: Dict[str, ListedItem],
     return result
 
 
-def _capped_lines(lines: List[str]) -> List[str]:
+def _capped_lines(lines: list[str]) -> list[str]:
     """Distinct lines in order, cut to MAX_REPORT_LINES with a '+N more' line."""
     distinct = list(dict.fromkeys(lines))
     if len(distinct) <= MAX_REPORT_LINES:
@@ -119,7 +128,14 @@ def _reason(status: str, comparison: Comparison, listing: SourceListing, exclude
     elif status == STATUS_ADD_ONLY:
         text = "New items found. Run index_data to add them."
     else:
-        text = "Changed or removed items found. Run index_data with clean_index to rebuild the index."
+        steps = []
+        if comparison.removed:
+            steps.append("Removed items found: run index_data with clean_index to remove them.")
+        if comparison.changed:
+            steps.append(
+                "Changed items found: a plain index_data run re-indexes an item whose modified time moved; "
+                "run index_data with clean_index when a change leaves it alone, such as an edit of a library list field.")
+        text = " ".join(steps)
         if listing.attest_blockers:
             text += (" Clean index will not remove the chunks of removed items, because "
                      + "; ".join(_capped_lines(listing.attest_blockers)) + ".")
@@ -130,12 +146,12 @@ def _reason(status: str, comparison: Comparison, listing: SourceListing, exclude
     return text
 
 
-def _paths(items: List[ListedItem]) -> List[str]:
+def _paths(items: list[ListedItem]) -> list[str]:
     return [item.path or item.name or item.key for item in items[:MAX_LISTED_PER_GROUP]]
 
 
 def build_report(index_name: str, comparison: Comparison, listing: SourceListing,
-                 unindexed_recorded: bool, excluded_rows: int = 0) -> Dict[str, Any]:
+                 unindexed_recorded: bool, excluded_rows: int = 0) -> dict[str, Any]:
     """The report of the check. Counts are always full; the path lists are capped."""
     status = _status(comparison)
     warnings = list(comparison.warnings)

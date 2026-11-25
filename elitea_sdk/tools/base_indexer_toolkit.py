@@ -1590,7 +1590,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             indexed_total = docs_count + unchanged_count
             # Only a run that published its corpus describes what the index covers. A
             # failed run leaves the stored scope and skipped items of the last good run.
-            record_run_facts = staging and final_state != IndexerKeywords.INDEX_META_FAILED.value
+            # A non-staging run writes the facts with its full row, so they do not depend on staging.
+            record_run_facts = final_state != IndexerKeywords.INDEX_META_FAILED.value
             written_state = self.index_meta_update(
                 index_name, final_state, succeeded_chunks_count,
                 error=message if status is not IndexingStatus.OK else None,
@@ -3085,8 +3086,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
     def _has_source_listing(self) -> bool:
         return type(self)._list_source_items is not BaseIndexerToolkit._list_source_items
 
-    def _indexed_item(self, key: str, entry: Dict[str, Any]) -> index_change_check.ListedItem:
-        """One indexed base row, in the shape of the source listing."""
+    def _indexed_item(self, key: str, entry: dict[str, Any],
+                      listing: index_change_check.SourceListing) -> index_change_check.ListedItem:
+        """One indexed base row, in the shape of the source listing; `listing` is the one being compared."""
         metadata = entry.get('metadata') or {}
         name = str(metadata.get('name') or '')
         return index_change_check.ListedItem(
@@ -3128,6 +3130,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         index_meta = super().get_index_meta(index_name)
         if not index_meta:
             raise ToolException(f"Index '{index_name}' not found. {self._available_indexes_note()}")
+        if (index_meta.get("metadata") or {}).get("state") == IndexerKeywords.INDEX_META_IN_PROGRESS.value:
+            # A run publishes its rows in steps, so a check now could report a half-published index.
+            raise ToolException(
+                f"Index '{index_name}' is being indexed now. Run check_for_changes when the run ends."
+            )
         configuration = self._stored_index_configuration(index_meta.get("metadata") or {})
         if not configuration:
             raise ToolException(
@@ -3138,7 +3145,7 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         self._add_scope_blocker(listing, configuration, index_meta.get("metadata") or {})
         indexed_data = self._get_indexed_data(index_name)
         dependent_keys = self._dependent_keys(indexed_data)
-        indexed: Dict[str, index_change_check.ListedItem] = {}
+        indexed: dict[str, index_change_check.ListedItem] = {}
         excluded_rows = 0
         for key, entry in indexed_data.items():
             if not self._is_base_row(key, entry, dependent_keys):
@@ -3146,17 +3153,10 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             if self._is_unchecked_row(entry):
                 excluded_rows += 1
                 continue
-            indexed[key] = self._indexed_item(key, entry)
-        unindexed_raw = (index_meta.get("metadata") or {}).get("unindexed_items")
-        if isinstance(unindexed_raw, str):
-            try:
-                unindexed_raw = json.loads(unindexed_raw)
-            except json.JSONDecodeError:
-                unindexed_raw = None
-        unindexed_recorded = isinstance(unindexed_raw, dict)
-        comparison = index_change_check.compare(
-            listing, indexed, unindexed_raw if unindexed_recorded else None
-        )
+            indexed[key] = self._indexed_item(key, entry, listing)
+        unindexed = self._stored_unindexed_items(index_meta.get("metadata") or {})
+        comparison = index_change_check.compare(listing, indexed, unindexed)
+        unindexed_recorded = unindexed is not None
         return index_change_check.build_report(
             index_name, comparison, listing, unindexed_recorded, excluded_rows
         )
@@ -3489,16 +3489,31 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         return configuration if isinstance(configuration, dict) else None
 
     @staticmethod
-    def _stored_last_run_scope(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """The scope of the last successful run, or None when no run recorded one.
+    def _stored_last_run_scope(metadata: dict[str, Any]) -> dict[str, Any] | None:
+        """The scope of the last successful run, or None when no run recorded one."""
+        return BaseIndexerToolkit._stored_run_fact(metadata, "last_run_scope")
+
+    @staticmethod
+    def _stored_unindexed_items(metadata: dict[str, Any]) -> dict[str, str] | None:
+        """The skipped items of the last successful run, or None when no run recorded them."""
+        return BaseIndexerToolkit._stored_run_fact(metadata, "unindexed_items")
+
+    @staticmethod
+    def _stored_run_fact(metadata: dict[str, Any], key: str) -> dict[str, Any] | None:
+        """A fact of the last successful run (`last_run_scope`, `unindexed_items`), or None.
 
         The platform rebuilds the row at every dispatch and keeps only its own keys and the
         history, so the row key is gone by the time a run starts. The history entry of the
-        successful run still carries the scope.
+        successful run still carries the fact. The row holds it as a JSON string.
         """
-        scope = metadata.get("last_run_scope")
-        if isinstance(scope, dict):
-            return scope
+        value = metadata.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = None
+        if isinstance(value, dict):
+            return value
         history_raw = metadata.get("history")
         if not isinstance(history_raw, str) or not history_raw.strip():
             return None
@@ -3510,8 +3525,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return None
         for entry in reversed(history):
             if (isinstance(entry, dict) and entry.get("state") in COMPLETED_INDEX_STATES
-                    and isinstance(entry.get("last_run_scope"), dict)):
-                return entry["last_run_scope"]
+                    and isinstance(entry.get(key), dict)):
+                return entry[key]
         return None
 
     def index_meta_init(self, index_name: str, index_configuration: dict[str, Any]):
@@ -3712,10 +3727,12 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 metadata["error"] = None
             if report is not None:
                 metadata["report"] = json.dumps(report)
+            # JSON strings like `history`: core reads row values with `.strip()`, and up to
+            # MAX_UNINDEXED_ITEMS entries would otherwise sit in the row as a native object.
             if last_run_scope is not None:
-                metadata["last_run_scope"] = last_run_scope
+                metadata["last_run_scope"] = json.dumps(last_run_scope)
             if unindexed_items is not None:
-                metadata["unindexed_items"] = unindexed_items
+                metadata["unindexed_items"] = json.dumps(unindexed_items)
             # Only a sample of each name list is persisted: this blob is copied into
             # every history entry and re-shipped by every indexes-list read. The counts
             # beside it stay exact.
@@ -3776,15 +3793,16 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 # The latest-run keys describe the row, not one run: a copy in every
                 # history entry would be re-shipped by every indexes-list read.
                 entry = {k: v for k, v in metadata.items() if k not in LATEST_RUN_META_KEYS}
-                if last_run_scope is not None:
-                    # The dispatch reset of the platform drops the row key but keeps the
-                    # history, so the successful run's entry is where the scope survives.
-                    entry["last_run_scope"] = last_run_scope
+                # The dispatch reset of the platform drops the row keys but keeps the
+                # history, so the successful run's entry is where the facts survive.
+                recorded = {"last_run_scope": last_run_scope, "unindexed_items": unindexed_items}
+                recorded = {name: value for name, value in recorded.items() if value is not None}
+                entry.update(recorded)
                 if history and isinstance(history, list):
-                    if last_run_scope is not None:
-                        for older in history[:-1]:
-                            if isinstance(older, dict):
-                                older.pop("last_run_scope", None)
+                    for older in history[:-1]:
+                        if isinstance(older, dict):
+                            for name in recorded:
+                                older.pop(name, None)
                     history[-1] = entry
                 else:
                     history = [entry]
