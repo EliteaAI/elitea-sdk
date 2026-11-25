@@ -4,6 +4,8 @@ import re
 import subprocess
 import os
 import time
+from functools import lru_cache
+from urllib.parse import urlsplit
 from typing import Any, Type, Optional, Dict, List, Literal, Union
 from copy import deepcopy
 from pathlib import Path
@@ -331,6 +333,50 @@ def local_sandbox_permissions() -> dict:
     }
 
 
+# Hosts micropip and the Pyodide package lockfile need; bare --allow-net would expose the worker's internal network
+_DEFAULT_SANDBOX_HOSTS = ("pypi.org", "files.pythonhosted.org", "cdn.jsdelivr.net")
+# Exact host[:port] only: wildcards, paths and schemes would widen the grant beyond the named host
+_HOST_ENTRY_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::\d{1,5})?$")
+
+
+def _valid_hosts(entries) -> list:
+    valid = []
+    for entry in entries:
+        host = entry.strip().lower()
+        if not host:
+            continue
+        port = host.rpartition(":")[2] if ":" in host else "1"
+        if _HOST_ENTRY_RE.match(host) and len(host.split(":")[0]) <= 253 and 0 < int(port) <= 65535:
+            valid.append(host)
+        else:
+            logger.warning("Ignoring sandbox network allowlist entry %r: only exact host[:port] is allowed", entry)
+    return list(dict.fromkeys(valid))
+
+
+def sandbox_allowed_hosts() -> list:
+    return list(_cached_allowed_hosts(os.environ.get("SANDBOX_ALLOWED_HOSTS", "")))
+
+
+@lru_cache(maxsize=8)
+def _cached_allowed_hosts(raw: str) -> tuple:
+    return tuple(_valid_hosts([*_DEFAULT_SANDBOX_HOSTS, *raw.split(",")]))
+
+
+def platform_host(base_url) -> Optional[str]:
+    """host[:port] of the platform URL the in-sandbox SandboxClient calls over HTTP."""
+    netloc = urlsplit(str(base_url or "")).netloc.rpartition("@")[2].lower()
+    return netloc or None
+
+
+def resolve_allow_net(value):
+    """True becomes the hostname allowlist; explicit lists are validated the same way."""
+    if value is True:
+        return sandbox_allowed_hosts()
+    if isinstance(value, list):
+        return _valid_hosts(value) or False
+    return value
+
+
 def build_offline_pyodide_sandbox():
     """The local sandbox third-party code runs in, with no network. Never the remote sandbox service, whose runner has
     network on and no per-call network setting."""
@@ -474,6 +520,14 @@ class PyodideSandboxTool(BaseTool):
 
         return f"#elitea simplified client\n{pyodide_predata}{code}"
 
+    def _resolved_allow_net(self):
+        allow_net = resolve_allow_net(self.allow_net)
+        # Without the #7719 bridge, the injected SandboxClient reaches the platform over HTTP from inside Deno
+        host = platform_host(getattr(self.elitea_client, "base_url", None)) if self.elitea_client else None
+        if isinstance(allow_net, list) and host and not self._bridge_mode():
+            allow_net = list(dict.fromkeys([*allow_net, host]))
+        return allow_net
+
     def _initialize_sandbox(self) -> None:
         """Initialize the PyodideSandbox instance with optimized settings"""
         try:
@@ -504,7 +558,7 @@ class PyodideSandboxTool(BaseTool):
 
             self._sandbox = PyodideSandbox(
                 stateful=self.stateful,
-                allow_net=self.allow_net,
+                allow_net=self._resolved_allow_net(),
                 node_modules_dir="auto",
                 **local_sandbox_permissions(),
             )
@@ -770,7 +824,7 @@ class SandboxToolkit(BaseToolkit):
         return create_model(
             'sandbox',
             stateful=(bool, Field(default=False, description="Whether to maintain state between executions")),
-            allow_net=(bool, Field(default=True, description="Whether to allow network access for package installation")),
+            allow_net=(bool, Field(default=True, description="Allow network to package hosts plus operator SANDBOX_ALLOWED_HOSTS")),
             selected_tools=(List[Literal[tuple(selected_tools)]],
                             Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
 
