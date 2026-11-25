@@ -490,6 +490,49 @@ class TestCheckReadsAndGuards:
         assert "Changed items" not in report["reason"]
 
 
+class TestIncompleteStatus:
+    """A listing that cannot be trusted never reads as up to date or add only."""
+
+    def test_a_listing_page_that_failed_is_incomplete_not_up_to_date(self):
+        _, report = run_compare([item("a")], [item("a")], unindexed={}, complete=False, gaps=["page 2 could not be read"])
+
+        assert report["status"] == check.STATUS_INCOMPLETE
+        assert "page 2 could not be read" in report["warnings"]
+        assert "incomplete" in report["reason"]
+
+    def test_the_file_limit_reached_is_incomplete_even_with_a_new_item(self):
+        _, report = run_compare([item("a"), item("new")], [item("a")], unindexed={}, complete=False,
+                                gaps=["the listing stopped at the file limit"])
+
+        assert report["status"] == check.STATUS_INCOMPLETE
+        assert report["counts"]["added"] == 1
+        assert "1 item(s)" in report["reason"]
+
+    def test_ids_of_another_family_are_incomplete_not_add_only(self):
+        _, report = run_compare([item("graph-1")], [item("rest-1")], unindexed={})
+
+        assert report["status"] == check.STATUS_INCOMPLETE
+        assert check.KEY_MISMATCH_WARNING in report["warnings"]
+
+    def test_an_empty_listing_of_a_non_empty_index_is_incomplete(self):
+        _, report = run_compare([], [item("a")], unindexed={})
+
+        assert report["status"] == check.STATUS_INCOMPLETE
+        assert check.EMPTY_LISTING_WARNING in report["warnings"]
+
+    def test_a_change_the_partial_listing_did_show_still_needs_a_clean_reindex(self):
+        _, report = run_compare([item("a", marker="2")], [item("a", marker="1")], unindexed={}, complete=False,
+                                gaps=["gap"])
+
+        assert report["status"] == check.STATUS_NEEDS_CLEAN_REINDEX
+        assert "listing is incomplete" in report["reason"]
+
+    def test_a_complete_listing_never_reads_as_incomplete(self):
+        _, report = run_compare([item("a"), item("new")], [item("a")], unindexed={})
+
+        assert report["status"] == check.STATUS_ADD_ONLY
+
+
 class _RecordingAdapter:
     supports_run_staging = True
 

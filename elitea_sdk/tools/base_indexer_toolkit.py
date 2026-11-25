@@ -3120,6 +3120,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """Compares the source with an existing index and reports which items were added, changed or removed.
 
         It reads the source listing and the stored index only: nothing is indexed, deleted or rewritten.
+        The status is `up_to_date`, `add_only`, `needs_clean_reindex`, or `incomplete` when the source
+        listing cannot be trusted (a file limit, a failed listing page, ids that do not match the index,
+        or an empty listing of an index that holds items).
         """
         if not index_name or not str(index_name).strip():
             raise ToolException(

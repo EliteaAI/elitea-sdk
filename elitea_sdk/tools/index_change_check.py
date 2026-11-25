@@ -14,6 +14,8 @@ MAX_REPORT_LINES = 20
 STATUS_UP_TO_DATE = "up_to_date"
 STATUS_ADD_ONLY = "add_only"
 STATUS_NEEDS_CLEAN_REINDEX = "needs_clean_reindex"
+# The listing cannot be trusted, so "nothing to do" and "only additions" would be guesses.
+STATUS_INCOMPLETE = "incomplete"
 
 KEY_MISMATCH_WARNING = "item ids of the listing do not match the index"
 EMPTY_LISTING_WARNING = "the listing is empty but the index holds items"
@@ -115,8 +117,12 @@ def _capped_lines(lines: list[str]) -> list[str]:
 
 
 def _status(comparison: Comparison) -> str:
+    # A changed or removed item that the listing did show is a fact even when the listing is
+    # partial, and the next step is the same. Only "up to date" and "add only" need a full listing.
     if comparison.changed or comparison.removed:
         return STATUS_NEEDS_CLEAN_REINDEX
+    if not comparison.listing_complete:
+        return STATUS_INCOMPLETE
     if comparison.added:
         return STATUS_ADD_ONLY
     return STATUS_UP_TO_DATE
@@ -127,6 +133,11 @@ def _reason(status: str, comparison: Comparison, listing: SourceListing, exclude
         text = "No added, changed or removed item found."
     elif status == STATUS_ADD_ONLY:
         text = "New items found. Run index_data to add them."
+    elif status == STATUS_INCOMPLETE:
+        text = ("The listing of the source is incomplete, so the check cannot say whether the index is up to date. "
+                "See the warnings, fix the cause and run check_for_changes again.")
+        if comparison.added:
+            text += f" {len(comparison.added)} item(s) of the partial listing are not in the index."
     else:
         steps = []
         if comparison.removed:
@@ -139,7 +150,7 @@ def _reason(status: str, comparison: Comparison, listing: SourceListing, exclude
         if listing.attest_blockers:
             text += (" Clean index will not remove the chunks of removed items, because "
                      + "; ".join(_capped_lines(listing.attest_blockers)) + ".")
-    if not comparison.listing_complete:
+    if not comparison.listing_complete and status != STATUS_INCOMPLETE:
         text += " The listing is incomplete, so removed items cannot be found."
     if excluded_rows and listing.unchecked_reason:
         text += " " + listing.unchecked_reason

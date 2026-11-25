@@ -114,6 +114,26 @@ class TestListingHook:
         assert report["counts"]["removed"] == 0
         assert report["listing_complete"] is False
 
+    def test_a_backend_gap_on_an_unchanged_library_reads_as_incomplete_not_up_to_date(self):
+        toolkit = toolkit_with(Backend([listed_file()], gaps=["a document library could not be listed"]))
+        listing = toolkit._list_source_items({"limit_files": 50})
+        stored = {"f1": check.ListedItem("f1", "a.docx", "/sites/x/Lib/a.docx", "2026-01-01")}
+
+        report = check.build_report("idx", check.compare(listing, stored, {}), listing, True)
+
+        assert report["status"] == check.STATUS_INCOMPLETE
+
+    def test_the_file_limit_on_an_unchanged_library_reads_as_incomplete_not_up_to_date(self):
+        toolkit = toolkit_with(Backend([listed_file(file_id="f1"), listed_file("b.docx", file_id="f2")]))
+        backend_files = toolkit._backend.files
+        toolkit._backend.get_files_list = lambda *a, **k: backend_files
+        listing = toolkit._list_source_items({"limit_files": 1})
+        stored = {"f1": check.ListedItem("f1", "a.docx", "/sites/x/Lib/a.docx", "2026-01-01")}
+
+        report = check.build_report("idx", check.compare(listing, stored, {}), listing, True)
+
+        assert report["status"] == check.STATUS_INCOMPLETE
+
     def test_the_reason_names_the_cause_when_a_clean_reindex_cannot_attest(self):
         toolkit = toolkit_with(Backend([listed_file(modified="2026-02-02")],
                                        gaps=["a document library could not be listed"]))
