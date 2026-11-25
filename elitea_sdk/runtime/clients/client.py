@@ -1371,6 +1371,10 @@ class EliteAClient:
                 f"Skill file {project_id}/{skill_id}/{version_id}/{path} is not accessible ({response.status_code})",
                 denied=True,
             )
+        if response.status_code == 410:
+            raise SkillFileUnavailable(
+                f"Skill file {project_id}/{skill_id}/{version_id}/{path} has no stored content (410)", missing=True,
+            )
         if not response.ok:
             raise SkillFileUnavailable(
                 f"Skill file {project_id}/{skill_id}/{version_id}/{path} fetch failed ({response.status_code})"

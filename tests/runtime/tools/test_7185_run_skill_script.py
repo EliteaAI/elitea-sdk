@@ -11,9 +11,10 @@ from unittest.mock import MagicMock
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
+from elitea_sdk.runtime.exceptions import SkillFileUnavailable
 from elitea_sdk.runtime.langchain.constants import SKILL_FILES_RUN_SCRIPTS_NOTE, SKILL_FILES_SCRIPTS_NOTE
 from elitea_sdk.runtime.langchain.sandbox_types import CodeExecutionResult
-from elitea_sdk.runtime.tool_outcome import ToolResultStatus, outcome_sink
+from elitea_sdk.runtime.tool_outcome import ToolErrorClass, ToolResultStatus, outcome_sink, retriable_for
 from elitea_sdk.runtime.tools.llm import LLMNode
 from elitea_sdk.runtime.tools.skill_script_runner import (
     INLINE_OUTPUT_CHARS,
@@ -684,6 +685,32 @@ def test_a_sandbox_that_never_ran_the_program_is_reported_as_unavailable(tmp_pat
 
     assert result == 'The script could not be run: the sandbox is not available right now.'
     assert [outcome.status for outcome in recorded] == [ToolResultStatus.ERROR]
+
+
+@pytest.mark.parametrize('missing, expected, error_class', [
+    (True, 'The script could not be run: the skill\'s file "scripts/helper.py" is missing, for example because the '
+           'project was restored from a backup without skill attachments. Running it again will not help: tell the '
+           'user to upload the file again (to a new version if this one is published) or restore a backup that '
+           'includes skill attachments.', ToolErrorClass.TOOL_INTERNAL),
+    (False, "The script could not be run: the skill's files could not be fetched right now.",
+     ToolErrorClass.INFRASTRUCTURE),
+], ids=['missing', 'transient'])
+def test_a_skill_file_that_cannot_be_staged_refuses_the_run_saying_whether_a_retry_helps(
+        tmp_path, missing, expected, error_class):
+    runner, client = _runner(tmp_path=tmp_path)
+
+    def failing_on_the_script(skill_project_id, skill_id, version_id, path):
+        if path == 'scripts/helper.py':
+            raise SkillFileUnavailable(f'{path} unavailable', missing=missing)
+        return client.get_skill_file(skill_project_id, skill_id, version_id, path)
+    runner.file_fetcher = failing_on_the_script
+
+    with outcome_sink() as recorded:
+        result = _content(_run_tool(runner).invoke({'skill': 'demo', 'path': 'scripts/helper.py'}))
+
+    assert result == expected
+    assert [(outcome.status, outcome.error_class) for outcome in recorded] == [(ToolResultStatus.ERROR, error_class)]
+    assert retriable_for(recorded[0].error_class) is (not missing)
 
 
 def _node(client, **fields):

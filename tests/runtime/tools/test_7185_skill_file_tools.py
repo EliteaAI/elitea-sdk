@@ -334,6 +334,10 @@ def test_a_binary_file_is_described_and_never_fetched():
 @pytest.mark.parametrize('error, reason', [
     (SkillFileUnavailable('gone', denied=True), 'it is no longer accessible'),
     (SkillFileUnavailable('flaky'), 'it could not be fetched right now'),
+    (SkillFileUnavailable('no content', missing=True),
+     'its content is missing, for example because the project was restored from a backup without skill attachments. '
+     'Reading it again will not help: tell the user to upload the file again (to a new version if this one is published) '
+     'or restore a backup that includes skill attachments'),
     (RuntimeError('boom'), 'it could not be fetched right now'),
 ])
 def test_a_failed_fetch_names_the_reason_and_the_file_stays_readable(error, reason):
