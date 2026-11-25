@@ -171,3 +171,10 @@ def test_loader_svg_pipeline_renders_clip_path_and_gradient_on_svglib_2():
 
     assert (drawing.width, drawing.height) == (40, 40)
     assert image.size == (40, 40)
+
+
+def test_svg_to_px_drawing_rejects_unparseable_svg():
+    from elitea_sdk.runtime.langchain.document_loaders.utils import svg_to_px_drawing
+
+    with pytest.raises(ValueError):
+        svg_to_px_drawing(b"")

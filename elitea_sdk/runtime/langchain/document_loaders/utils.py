@@ -146,11 +146,12 @@ def svg_to_px_drawing(svg_content: bytes):
     from svglib.svglib import PX_TO_PT, svg2rlg
 
     drawing = svg2rlg(BytesIO(svg_content))
-    if drawing is not None:
-        _drop_direct_draw_nodes(drawing)
-        drawing.width /= PX_TO_PT
-        drawing.height /= PX_TO_PT
-        drawing.scale(1 / PX_TO_PT, 1 / PX_TO_PT)
+    if drawing is None:
+        raise ValueError("Unable to parse SVG content")
+    _drop_direct_draw_nodes(drawing)
+    drawing.width /= PX_TO_PT
+    drawing.height /= PX_TO_PT
+    drawing.scale(1 / PX_TO_PT, 1 / PX_TO_PT)
     return drawing
 
 
