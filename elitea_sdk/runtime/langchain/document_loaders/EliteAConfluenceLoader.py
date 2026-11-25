@@ -8,9 +8,9 @@ from langchain_community.document_loaders.confluence import ContentFormat
 from langchain_core.messages import HumanMessage
 from pdf2image import convert_from_bytes
 from reportlab.graphics import renderPM
-from svglib.svglib import svg2rlg
 
 from ..tools.utils import encode_image_for_llm, bytes_to_base64
+from .utils import preprocess_svg_for_rendering, svg_to_px_drawing
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
 
@@ -196,7 +196,7 @@ class EliteAConfluenceLoader(ConfluenceLoader):
             ):
                 return text
 
-            drawing = svg2rlg(BytesIO(response.content))
+            drawing = svg_to_px_drawing(preprocess_svg_for_rendering(response.content))
 
             img_data = BytesIO()
             renderPM.drawToFile(drawing, img_data, fmt="PNG")
