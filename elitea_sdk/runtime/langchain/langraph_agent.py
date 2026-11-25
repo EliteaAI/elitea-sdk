@@ -894,7 +894,7 @@ class StateModifierNode(Runnable):
         import json
         import base64
         from jinja2.exceptions import SecurityError, UndefinedError
-        from ..utils.safe_templates import HardenedSandboxedEnvironment
+        from ..utils.safe_templates import HardenedSandboxedEnvironment, TemplateRejectedError
 
         def from_json(value):
             """Convert JSON string to Python object"""
@@ -931,8 +931,8 @@ class StateModifierNode(Runnable):
             template = env.from_string(self.template)
             rendered_message = template.render(**input_data)
         except SecurityError:
-            logger.warning('State modifier template rejected by sandbox: %s', self.template)
-            raise Exception("Template rejected: unsafe attribute access is not allowed")
+            logger.warning('State modifier template rejected by sandbox: %.200s', self.template)
+            raise TemplateRejectedError("Template rejected: unsafe attribute access is not allowed")
         except UndefinedError as exc:
             logger.warning('State modifier template referenced an unavailable value: %s', exc)
             raise Exception(
