@@ -633,6 +633,7 @@ def test_the_python_sandbox_tool_can_write_nothing_read_only_pyodide_and_fetch_n
     monkeypatch.setenv('SANDBOX_BASE', '/sandbox')
     monkeypatch.setenv('DENO_DIR', '/sandbox/.deno_dir')
     monkeypatch.delenv('SANDBOX_SERVICE_URL', raising=False)
+    monkeypatch.delenv('SANDBOX_ALLOWED_HOSTS', raising=False)
     monkeypatch.setattr(module.shutil, 'which', lambda name: '/usr/bin/deno')
     monkeypatch.setattr(sandbox_module, '_is_deno_available', lambda: True)
     tool = sandbox_module.PyodideSandboxTool(allow_net=allow_net)
@@ -643,7 +644,10 @@ def test_the_python_sandbox_tool_can_write_nothing_read_only_pyodide_and_fetch_n
     assert not [flag for flag in command if flag.startswith('--allow-write')]
     assert [flag for flag in command if flag.startswith('--allow-read')] == ['--allow-read=/sandbox/pyodide']
     assert {'--no-remote', '--no-npm'} <= set(command)
-    assert ('--allow-net' in command) is allow_net
+    # allow_net=True is the package-host allowlist (#7728), never a bare --allow-net
+    assert '--allow-net' not in command
+    net_flags = [flag for flag in command if flag.startswith('--allow-net')]
+    assert net_flags == (['--allow-net=pypi.org,files.pythonhosted.org,cdn.jsdelivr.net'] if allow_net else [])
 
 
 def test_the_offline_sandbox_ignores_the_remote_sandbox_service(monkeypatch):
