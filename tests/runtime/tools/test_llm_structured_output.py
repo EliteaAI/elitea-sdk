@@ -1870,3 +1870,94 @@ class TestStructuredOutputResultFiltering:
         )
 
         assert result["story"] == "Once upon a time..."
+
+
+class TestBareStringStructuredContent:
+    """#7623: with thinking on, Claude 5.5 can return the JSON as a bare string
+    next to the thinking block instead of a ``{'type': 'text'}`` block."""
+
+    CONTENT = [
+        '',
+        {'type': 'thinking', 'thinking': 'Use exactly these keys.', 'signature': 's'},
+        '{"custom_text": "ok", "custom_json": {"status": "ready"}}',
+    ]
+
+    def _struct_model(self):
+        return _make_struct_model({
+            "custom_text": {"type": "str", "description": ""},
+            "custom_json": {"type": "dict", "description": ""},
+        })
+
+    def test_extract_reads_bare_string_item(self):
+        node = _make_llm_node()
+        result = node._extract_structured_from_content(_make_completion(self.CONTENT), self._struct_model())
+        assert result is not None
+        assert result.custom_text == "ok"
+        assert result.custom_json == {"status": "ready"}
+
+    def test_extract_joins_text_blocks_and_bare_strings(self):
+        node = _make_llm_node()
+        content = [{'type': 'text', 'text': '{"custom_text": "ok", '}, '"custom_json": {"a": 1}}']
+        result = node._extract_structured_from_content(_make_completion(content), self._struct_model())
+        assert result.custom_json == {"a": 1}
+
+    def test_json_prompt_path_parses_bare_string_reply(self):
+        llm = _AnthropicThinkingLLM()
+        node = _make_llm_node()
+        node.client = llm
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(content=self.CONTENT)
+
+        result = node._synthesize_structured(llm_client, [HumanMessage(content="q")], self._struct_model(), {})
+
+        assert result.custom_json == {"status": "ready"}
+        assert llm.with_structured_output_calls == []
+
+    def test_fallback_marks_only_raw_text_as_set(self):
+        node = _make_llm_node()
+        result = node._create_fallback_completion("raw", self._struct_model())
+        assert result.model_fields_set == {ELITEA_RS}
+
+
+class TestUnparsedStructuredOutputKeepsState:
+    """#7623: an unparseable reply must not overwrite existing state with None."""
+
+    def _node(self):
+        node = LLMNode(
+            name="LLM 1",
+            description="test",
+            input_variables=["input"],
+            input_mapping={
+                "chat_history": {"type": "fixed", "value": []},
+                "system": {"type": "fixed", "value": "fill the state"},
+                "task": {"type": "fixed", "value": "fill the state"},
+            },
+            output_variables=["custom_text", "custom_json"],
+            structured_output=True,
+            structured_output_dict={"custom_text": "str", "custom_json": "dict"},
+        )
+        node.client = MagicMock()
+        return node
+
+    def _run(self, node, make_completion):
+        node._invoke_with_structured_output = lambda llm_client, messages, struct_model, config: (
+            make_completion(node, struct_model), None, messages
+        )
+        return node._invoke_llm_internal(
+            {"input": "go", "messages": [], "custom_text": "old", "custom_json": {"k": "v"}},
+            {},
+            [],
+        )
+
+    def test_fallback_completion_drops_none_fields(self):
+        result = self._run(self._node(), lambda node, m: node._create_fallback_completion("not json", m))
+        assert "custom_text" not in result
+        assert "custom_json" not in result
+        assert result[ELITEA_RS] == "not json"
+
+    def test_parsed_completion_keeps_returned_none(self):
+        result = self._run(self._node(), lambda node, m: m.model_construct(
+            custom_text=None, custom_json={"a": 1}, **{ELITEA_RS: "done"}
+        ))
+        assert result["custom_text"] is None
+        assert result["custom_json"] == {"a": 1}
