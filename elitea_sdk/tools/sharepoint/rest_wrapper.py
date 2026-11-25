@@ -96,8 +96,13 @@ class SharepointRestWrapper(BaseSharepointWrapper):
 
         return GraphListClient(self.site_url, get_token=get_token, refresh=refresh)
 
-    def _rest_bfs_files(self, root_folder_url: str, limit_files: int) -> list:
-        """Enumerate files using parallel BFS with non-recursive per-folder REST calls."""
+    def _rest_bfs_files(self, root_folder_url: str, limit_files: int,
+                        on_listing_gap: Callable[[str], None] | None = None) -> list:
+        """Enumerate files using parallel BFS with non-recursive per-folder REST calls.
+
+        A folder that cannot be read is skipped so the rest of the listing survives, but the
+        files below it are then missing, so each skipped folder is reported as a listing gap.
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
@@ -141,6 +146,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                         logging.warning(
                             "[SP-REST][BFS] skipping %r — %s: %s",
                             futures[future], type(e).__name__, e)
+                        if on_listing_gap:
+                            on_listing_gap("a folder could not be read")
 
         _total = time.perf_counter() - _t_start
         logging.info(
@@ -434,7 +441,8 @@ class SharepointRestWrapper(BaseSharepointWrapper):
                 lib_attempted += 1
                 try:
                     _t_lib = time.perf_counter()
-                    files = self._rest_bfs_files(target_folder_url, limit_files - len(result))
+                    files = self._rest_bfs_files(
+                        target_folder_url, limit_files - len(result), on_listing_gap=on_listing_gap)
                     logging.info(
                         "[SP-REST][get_files_list] library '%s' — files=%d time=%.3fs",
                         library_type, len(files), time.perf_counter() - _t_lib)

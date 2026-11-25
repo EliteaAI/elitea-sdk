@@ -165,6 +165,16 @@ class TestAuthorizationHelperPaging:
 
         assert len(gaps) == 1
 
+    def test_an_item_without_a_name_reports_a_gap_and_is_not_listed(self):
+        nameless = {"id": "f2", "webUrl": "https://x/b.txt"}
+        pages = [self._drives(), _response(200, {"value": [self._item(), nameless]})]
+        gaps = []
+        with patch(f"{AUTH_MODULE}.requests.get", side_effect=pages):
+            result = self._helper().get_files_list(SITE, on_listing_gap=gaps.append)
+
+        assert [item["Name"] for item in result] == ["a.txt"]
+        assert gaps == ["an item came back without a name, path or id"]
+
     def test_the_limit_reports_a_gap(self):
         pages = [self._drives(), _response(200, {"value": [self._item()]})]
         gaps = []

@@ -200,7 +200,9 @@ class SharepointAuthorizationHelper:
                             'id': file.get('id')
                         }
                         if not all([temp_props['Name'], temp_props['Path'], temp_props['id']]):
-                            continue  # skip files with missing required fields
+                            # The item cannot be listed, so a run must not read its absence as a removal.
+                            _report_gap("an item came back without a name, path or id")
+                            continue
                         if 'folder' in file:
                             # Recursively extract files from this folder
                             inner_folder = parent_folder + '/' + file_name if parent_folder else file_name

@@ -1242,7 +1242,9 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 # The loader treats a missing limit as the default, so both forms compare equal.
                 value = DEFAULT_LIMIT_FILES
             if isinstance(value, (list, tuple, set)):
-                value = sorted(str(item) for item in value)
+                # The order of the metadata fields decides which mapping wins, so it is part of the scope.
+                items = [str(item) for item in value]
+                value = items if key == 'metadata_fields' and not isinstance(value, set) else sorted(items)
             # `0 in (..., False)` is true, so a plain membership test would turn limit_files 0 into None.
             unset = value is None or value is False or (isinstance(value, (str, list, dict)) and not value)
             scope[key] = None if unset else value

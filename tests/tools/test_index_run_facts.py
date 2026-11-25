@@ -109,7 +109,10 @@ class TestIndexDataRecordsRunFacts:
         assert calls[-1]["unindexed_items"] == {"d2": "1"}
         stored = toolkit._stored_meta["metadata"]
         assert json.loads(stored["last_run_scope"]) == {"path": "/lib"}
-        assert json.loads(stored["unindexed_items"]) == {"d2": "1"}
+        # The history entry is the one stored copy of the skipped items; the row holds none.
+        assert stored["unindexed_items"] is None
+        assert json.loads(stored["history"])[-1]["unindexed_items"] == {"d2": "1"}
+        assert toolkit._stored_unindexed_items(stored) == {"d2": "1"}
 
     def test_a_failed_run_hands_over_neither_so_the_last_good_values_stay(self, monkeypatch):
         failing_save = save_with(failed_keys=("d1", "d2"), unindexed=("d2",), count=0, docs_count=0, failed_docs=2)
@@ -245,6 +248,45 @@ class TestScopeSurvivesTheDispatchReset:
 
         assert [bool(entry.get("last_run_scope")) for entry in history].count(True) == 1
         assert history[-1]["last_run_scope"] == {"path": "/lib"}
+
+    def finish_with_skipped(self, toolkit, skipped):
+        toolkit.index_meta_update("x", "completed", 3, last_run_scope=toolkit._index_run.run_scope,
+                                  unindexed_items=skipped)
+
+    def test_the_skipped_items_are_stored_once_in_the_history_and_not_in_the_row(self, toolkit):
+        self.start_run(toolkit, "r1")
+        self.finish_with_skipped(toolkit, {"a": "1", "b": "2"})
+        metadata = toolkit.store["meta"]["metadata"]
+
+        assert metadata["unindexed_items"] is None
+        assert json.loads(metadata["history"])[-1]["unindexed_items"] == {"a": "1", "b": "2"}
+
+    def test_the_next_run_reads_the_skipped_items_after_the_dispatch_reset(self, toolkit):
+        self.start_run(toolkit, "r1")
+        self.finish_with_skipped(toolkit, {"a": "1"})
+        self.reset(toolkit)
+        assert "unindexed_items" not in toolkit.store["meta"]["metadata"]
+
+        assert toolkit._stored_unindexed_items(toolkit.store["meta"]["metadata"]) == {"a": "1"}
+
+    def test_a_success_clears_a_row_copy_that_an_older_version_wrote(self, toolkit):
+        self.start_run(toolkit, "r1")
+        toolkit.store["meta"]["metadata"]["unindexed_items"] = json.dumps({"old": "0"})
+
+        self.finish_with_skipped(toolkit, {"a": "1"})
+
+        assert toolkit._stored_unindexed_items(toolkit.store["meta"]["metadata"]) == {"a": "1"}
+
+    def test_only_the_newest_history_entry_keeps_the_skipped_items(self, toolkit):
+        self.start_run(toolkit, "r1")
+        self.finish_with_skipped(toolkit, {"a": "1"})
+        self.reset(toolkit)
+        self.start_run(toolkit, "r2")
+        self.finish_with_skipped(toolkit, {"b": "2"})
+
+        history = json.loads(toolkit.store["meta"]["metadata"]["history"])
+
+        assert [entry.get("unindexed_items") for entry in history if entry.get("unindexed_items")] == [{"b": "2"}]
 
     def test_a_row_the_platform_created_for_a_first_run_counts_as_a_legacy_row(self, toolkit):
         created = {"state": "in_progress", "index_configuration": self.CONFIG, "created_on": 5.0}

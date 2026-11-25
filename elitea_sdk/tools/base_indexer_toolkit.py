@@ -853,12 +853,14 @@ SDK_OWNED_META_KEYS = (
     "error", "report", "skipped", "total", "indexed", "history",
     "last_run_scope", "unindexed_items",
 )
-# Describe the latest successful run only. They stay out of every history entry,
-# which is copied into each indexes-list read.
+# Describe the latest successful run only. The row keeps no copy in a history entry
+# built from it; the one entry of the last successful run gets them in index_meta_update,
+# and every older entry loses them, so the history holds one copy of each.
 LATEST_RUN_META_KEYS = ("last_run_scope", "unindexed_items")
-# lean: 10_000 entries; raise it when a real index records more skipped files.
-# Beyond the cap a skipped file shows as "added" in the change check.
-MAX_UNINDEXED_ITEMS = 10_000
+# The history is copied into each indexes-list read, so the one stored copy stays small:
+# about 100 bytes an entry, 200 KB at the cap. Beyond the cap a skipped file shows as
+# "added" in the change check; raise it when a real index records more skipped files.
+MAX_UNINDEXED_ITEMS = 2_000
 # Mirrors the core-side vault default for `task_disconnected_timeout_sec`; used
 # only when the meta row never carried the key (agent-invoked fresh runs).
 TASK_DISCONNECTED_TIMEOUT_DEFAULT = 7200.0
@@ -1256,6 +1258,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             return
         key = self.key_fn(base_doc)
         if key is None or str(key) == IDLESS_STAGING_KEY:
+            return
+        if str(key) in run.pipeline_failed_keys or str(key) in run.explicitly_failed_keys:
+            # A failed item is not a deliberate skip: it must show as new until a run indexes it.
             return
         run.unindexed_items[str(key)] = self._document_marker(base_doc)
 
@@ -3133,11 +3138,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         index_meta = super().get_index_meta(index_name)
         if not index_meta:
             raise ToolException(f"Index '{index_name}' not found. {self._available_indexes_note()}")
+        run_stopped = False
         if (index_meta.get("metadata") or {}).get("state") == IndexerKeywords.INDEX_META_IN_PROGRESS.value:
-            # A run publishes its rows in steps, so a check now could report a half-published index.
-            raise ToolException(
-                f"Index '{index_name}' is being indexed now. Run check_for_changes when the run ends."
-            )
+            run_stopped = self._index_run_looks_stopped(index_meta.get("metadata") or {})
+            if not run_stopped:
+                # A run publishes its rows in steps, so a check now could report a half-published index.
+                raise ToolException(
+                    f"Index '{index_name}' is being indexed now. Run check_for_changes when the run ends. "
+                    "If the run has stopped, start a new index run to recover the index."
+                )
         configuration = self._stored_index_configuration(index_meta.get("metadata") or {})
         if not configuration:
             raise ToolException(
@@ -3159,10 +3168,28 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             indexed[key] = self._indexed_item(key, entry, listing)
         unindexed = self._stored_unindexed_items(index_meta.get("metadata") or {})
         comparison = index_change_check.compare(listing, indexed, unindexed)
+        if run_stopped:
+            comparison.warnings.append(
+                "the last index run stopped before it finished; the check read the last published rows")
         unindexed_recorded = unindexed is not None
         return index_change_check.build_report(
             index_name, comparison, listing, unindexed_recorded, excluded_rows
         )
+
+    def _index_run_looks_stopped(self, metadata: dict[str, Any]) -> bool:
+        """True when a staged run has sent no heartbeat for the disconnect timeout, so its worker is gone.
+
+        A staged run writes `updated_on` to the meta row every minute and keeps its rows invisible
+        until it publishes, so the last published rows can still be read. An adapter without run
+        staging sends no heartbeat, so nothing there proves a run stopped.
+        """
+        if not getattr(getattr(self, "vector_adapter", None), "supports_run_staging", False):
+            return False
+        try:
+            last_tick = float(metadata.get("updated_on"))
+        except (TypeError, ValueError):
+            return False
+        return time.time() - last_tick > self._read_disconnected_timeout(metadata)
 
     def _add_scope_blocker(self, listing: index_change_check.SourceListing, configuration: dict[str, Any],
                            metadata: dict[str, Any]):
@@ -3730,12 +3757,15 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
                 metadata["error"] = None
             if report is not None:
                 metadata["report"] = json.dumps(report)
-            # JSON strings like `history`: core reads row values with `.strip()`, and up to
-            # MAX_UNINDEXED_ITEMS entries would otherwise sit in the row as a native object.
+            # A JSON string like `history`: core reads row values with `.strip()`.
             if last_run_scope is not None:
                 metadata["last_run_scope"] = json.dumps(last_run_scope)
             if unindexed_items is not None:
-                metadata["unindexed_items"] = json.dumps(unindexed_items)
+                # The platform rebuilds the row at each dispatch and keeps the history, so the
+                # history entry below is the copy that survives. A second copy in the row would
+                # only double the size of the meta row; None also clears a copy that an older
+                # version wrote, which `_stored_run_fact` would read before the history.
+                metadata["unindexed_items"] = None
             # Only a sample of each name list is persisted: this blob is copied into
             # every history entry and re-shipped by every indexes-list read. The counts
             # beside it stay exact.

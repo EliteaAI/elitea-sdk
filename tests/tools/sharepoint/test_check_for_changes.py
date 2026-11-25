@@ -134,7 +134,7 @@ class TestListingHook:
 
         assert report["status"] == check.STATUS_INCOMPLETE
 
-    def test_the_reason_names_the_cause_when_a_clean_reindex_cannot_attest(self):
+    def test_the_gap_shows_in_the_warnings_and_not_as_a_removal_blocker_of_changed_items(self):
         toolkit = toolkit_with(Backend([listed_file(modified="2026-02-02")],
                                        gaps=["a document library could not be listed"]))
         listing = toolkit._list_source_items({"limit_files": 50})
@@ -143,7 +143,8 @@ class TestListingHook:
         report = check.build_report("idx", check.compare(listing, stored, {}), listing, True)
 
         assert report["status"] == check.STATUS_NEEDS_CLEAN_REINDEX
-        assert "a document library could not be listed" in report["reason"]
+        assert "a document library could not be listed" in report["warnings"]
+        assert "will not remove" not in report["reason"]
 
 
 class TestListFieldMarker:
@@ -315,6 +316,14 @@ class TestOrphanRemovalGates:
         assert toolkit._run_scope_keys({"limit_files": 0})["limit_files"] == 0
         assert toolkit._run_scope_keys({"limit_files": 0}) != toolkit._run_scope_keys({})
 
+    def test_a_reorder_of_the_metadata_fields_is_a_scope_change(self):
+        toolkit = toolkit_with(Backend())
+
+        assert toolkit._run_scope_keys({"metadata_fields": ["a=x", "b=x"]}) != \
+            toolkit._run_scope_keys({"metadata_fields": ["b=x", "a=x"]})
+        assert toolkit._run_scope_keys({"library_lists": ["a", "b"]}) == \
+            toolkit._run_scope_keys({"library_lists": ["b", "a"]})
+
 
 class TestRunScopeLifecycle:
     """index_meta_init reads the stored scope; a failed run keeps it, a good run replaces it."""
@@ -371,6 +380,40 @@ class TestRestGapPoints:
         wrapper._client = client
         wrapper._graph_helper = lambda: graph_helper
         return wrapper
+
+    def test_a_folder_that_cannot_be_read_is_a_gap_that_blocks_removal_and_reads_as_incomplete(self):
+        def rest_file(name, unique_id):
+            return SimpleNamespace(properties={
+                "ServerRelativeUrl": f"/sites/x/Lib/{name}", "Name": name, "TimeCreated": "c",
+                "TimeLastModified": "2026-01-01", "LinkingUrl": f"{SITE}/Lib/{name}", "UniqueId": unique_id})
+
+        def folder(url):
+            ref = MagicMock()
+            if url == "Lib":
+                ref.files.get.return_value.execute_query.return_value = [rest_file("a.docx", "f1")]
+                ref.folders.get.return_value.execute_query.return_value = [
+                    SimpleNamespace(properties={"ServerRelativeUrl": "/sites/x/Lib/sub"})]
+            else:
+                ref.files.get.return_value.execute_query.side_effect = RuntimeError("429")
+            return ref
+
+        library = SimpleNamespace(properties={"EntityTypeName": "Lib", "Title": "Lib"})
+        client = MagicMock()
+        client.web.lists.filter.return_value.get.return_value.execute_query.return_value = [library]
+        client.web.get_folder_by_server_relative_path.side_effect = folder
+        toolkit = toolkit_with(self.rest(MagicMock(), client))
+
+        listing = toolkit._list_source_items({"limit_files": 50})
+        _, _, list_limit, gaps = toolkit._list_files_for_index({"limit_files": 50}, track_skipped=False)
+        toolkit._index_run = run_state(meta_existed=False, run_scope=toolkit._run_scope_keys({}))
+
+        assert listing.gaps == ["a folder could not be read"]
+        assert gaps == ["a folder could not be read"]
+        assert toolkit._run_may_remove_orphans({}, gaps, 1, list_limit) is False
+        assert toolkit._run_may_remove_orphans({}, [], 1, list_limit) is True
+        stored = {"f1": check.ListedItem("f1", "a.docx", "/sites/x/Lib/a.docx", "2026-01-01")}
+        assert check.build_report("idx", check.compare(listing, stored, {}), listing, True)["status"] == \
+            check.STATUS_INCOMPLETE
 
     def test_a_library_that_cannot_be_listed_is_a_gap(self):
         library = SimpleNamespace(properties={"EntityTypeName": "Lib", "Title": "Lib"})

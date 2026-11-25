@@ -18,6 +18,8 @@ Lives outside tests/tools/index/ because CI skips that directory.
 """
 
 import json
+import time
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.documents import Document
@@ -27,6 +29,7 @@ from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.tools import index_change_check as check
 from elitea_sdk.tools.base_indexer_toolkit import (
     SDK_OWNED_META_KEYS,
+    TASK_DISCONNECTED_TIMEOUT_DEFAULT,
     IndexTools,
     _IndexRunState,
 )
@@ -185,6 +188,17 @@ class TestReportCaps:
         assert "will not remove the chunks of removed items" in report["reason"]
         assert "the file limit was reached" in report["reason"]
 
+    def test_a_reason_for_changed_items_only_does_not_talk_about_removed_items(self):
+        _, report = run_compare(
+            [item("a", marker="2")], [item("a", marker="1")], unindexed={},
+            attest_blockers=["OneNote pages are included in the index and are not checked"],
+        )
+
+        assert report["status"] == check.STATUS_NEEDS_CLEAN_REINDEX
+        assert "Changed items found" in report["reason"]
+        assert "will not remove" not in report["reason"]
+        assert "OneNote" not in report["reason"]
+
     def test_excluded_rows_add_the_toolkit_note_and_reason(self):
         listing = check.SourceListing(
             items=[item("a")], unchecked_note="OneNote pages are not checked",
@@ -216,7 +230,7 @@ class TestReportBounds:
     def test_the_reason_lists_each_blocker_once_and_caps_the_rest(self):
         blockers = ["a folder page could not be read"] * 300 + [f"folder {n} failed" for n in range(40)]
 
-        _, report = run_compare([item("a", marker="2")], [item("a")], unindexed={}, attest_blockers=blockers)
+        _, report = run_compare([item("a")], [item("a"), item("gone")], unindexed={}, attest_blockers=blockers)
 
         assert report["reason"].count("a folder page could not be read") == 1
         assert "+21 more" in report["reason"]
@@ -320,7 +334,8 @@ class TestCheckTool:
     def scoped_toolkit(self, indexed_toolkit, monkeypatch):
         monkeypatch.setattr(_Indexed, "_run_scope_keys", lambda self, cfg: {"path": cfg.get("path")})
         indexed_toolkit.listing_items = [item("a", marker="2")]
-        indexed_toolkit.stored_rows = {"a": row("a", "1")}
+        # A removed row is what makes the scope cause matter: only then does the reason talk about removal.
+        indexed_toolkit.stored_rows = {"a": row("a", "1"), "gone": row("gone")}
         return indexed_toolkit
 
     def test_reason_names_a_scope_that_differs_from_the_last_run(self, scoped_toolkit):
@@ -428,10 +443,47 @@ class TestCheckReadsAndGuards:
     def test_a_check_during_a_run_is_refused_before_the_source_is_listed(self, indexed_toolkit):
         indexed_toolkit.stored_meta["metadata"]["state"] = "in_progress"
 
+        with pytest.raises(ToolException, match="being indexed now") as refused:
+            indexed_toolkit.check_for_changes("idx")
+
+        assert "start a new index run" in str(refused.value)
+        assert indexed_toolkit.seen_configuration is None
+
+    def stage(self, indexed_toolkit, ticked_ago, staging=True):
+        adapter = SimpleNamespace(supports_run_staging=staging)
+        object.__setattr__(indexed_toolkit.toolkit, "vector_adapter", adapter)
+        metadata = indexed_toolkit.stored_meta["metadata"]
+        metadata["state"] = "in_progress"
+        metadata["updated_on"] = time.time() - ticked_ago
+
+    def test_a_staged_run_without_a_heartbeat_for_the_timeout_no_longer_blocks_the_check(self, indexed_toolkit):
+        indexed_toolkit.listing_items = [item("a")]
+        indexed_toolkit.stored_rows = {"a": row("a")}
+        self.stage(indexed_toolkit, ticked_ago=2 * TASK_DISCONNECTED_TIMEOUT_DEFAULT)
+
+        report = indexed_toolkit.check_for_changes("idx")
+
+        assert report["status"] == check.STATUS_UP_TO_DATE
+        assert any("stopped before it finished" in warning for warning in report["warnings"])
+
+    def test_a_staged_run_with_a_fresh_heartbeat_still_blocks_the_check(self, indexed_toolkit):
+        self.stage(indexed_toolkit, ticked_ago=60)
+
         with pytest.raises(ToolException, match="being indexed now"):
             indexed_toolkit.check_for_changes("idx")
 
-        assert indexed_toolkit.seen_configuration is None
+    def test_a_run_without_staging_has_no_heartbeat_so_an_old_row_does_not_prove_it_stopped(self, indexed_toolkit):
+        self.stage(indexed_toolkit, ticked_ago=2 * TASK_DISCONNECTED_TIMEOUT_DEFAULT, staging=False)
+
+        with pytest.raises(ToolException, match="being indexed now"):
+            indexed_toolkit.check_for_changes("idx")
+
+    def test_a_staged_run_with_an_unreadable_heartbeat_still_blocks_the_check(self, indexed_toolkit):
+        self.stage(indexed_toolkit, ticked_ago=0)
+        indexed_toolkit.stored_meta["metadata"]["updated_on"] = None
+
+        with pytest.raises(ToolException, match="being indexed now"):
+            indexed_toolkit.check_for_changes("idx")
 
     def test_skipped_items_come_from_the_history_after_the_dispatch_reset(self, indexed_toolkit):
         indexed_toolkit.listing_items = [item("empty-file", marker="5")]
@@ -563,7 +615,7 @@ def meta_toolkit(monkeypatch):
 
 class TestRunFacts:
 
-    def test_a_successful_write_stores_both_facts_as_json_strings_and_in_the_last_history_entry(
+    def test_a_successful_write_keeps_the_scope_in_the_row_and_both_facts_in_the_last_history_entry(
             self, meta_toolkit):
         toolkit, adapter = meta_toolkit
 
@@ -573,7 +625,8 @@ class TestRunFacts:
 
         patch = adapter.patches[-1]
         assert json.loads(patch["last_run_scope"]) == {"path": "/new"}
-        assert json.loads(patch["unindexed_items"]) == {"k": "5"}
+        # The row holds no copy of the large skipped-items map; the history entry does.
+        assert patch["unindexed_items"] is None
         history = json.loads(patch["history"])
         assert history[-1]["last_run_scope"] == {"path": "/new"}
         assert history[-1]["unindexed_items"] == {"k": "5"}
@@ -650,6 +703,27 @@ class TestRunFacts:
         toolkit._note_unindexed_item(Document(page_content="", metadata={"id": "f1", "updated_on": "9"}))
 
         assert toolkit._index_run.unindexed_items == {"f1": "9"}
+
+    @pytest.mark.parametrize("failed_set", ["pipeline_failed_keys", "explicitly_failed_keys"])
+    def test_a_failed_document_is_not_noted_as_a_skipped_item(self, meta_toolkit, failed_set):
+        toolkit, _ = meta_toolkit
+        getattr(toolkit._index_run, failed_set).add("f1")
+
+        toolkit._note_unindexed_item(Document(page_content="", metadata={"id": "f1", "updated_on": "9"}))
+        toolkit._note_unindexed_item(Document(page_content="", metadata={"id": "f2", "updated_on": "9"}))
+
+        assert toolkit._index_run.unindexed_items == {"f2": "9"}
+
+    def test_a_failed_new_file_reads_as_added_not_as_not_indexed(self, meta_toolkit):
+        toolkit, _ = meta_toolkit
+        toolkit._index_run.explicitly_failed_keys.add("f1")
+        toolkit._note_unindexed_item(Document(page_content="", metadata={"id": "f1", "updated_on": "9"}))
+        listing = check.SourceListing(items=[item("f1", marker="9")])
+
+        comparison = check.compare(listing, {}, toolkit._index_run.unindexed_items)
+
+        assert [added.key for added in comparison.added] == ["f1"]
+        assert comparison.not_indexed == 0
 
     def test_a_toolkit_without_a_listing_notes_nothing(self):
         toolkit = _NoListing.model_construct()

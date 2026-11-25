@@ -147,7 +147,7 @@ def _reason(status: str, comparison: Comparison, listing: SourceListing, exclude
                 "Changed items found: a plain index_data run re-indexes an item whose modified time moved; "
                 "run index_data with clean_index when a change leaves it alone, such as an edit of a library list field.")
         text = " ".join(steps)
-        if listing.attest_blockers:
+        if comparison.removed and listing.attest_blockers:
             text += (" Clean index will not remove the chunks of removed items, because "
                      + "; ".join(_capped_lines(listing.attest_blockers)) + ".")
     if not comparison.listing_complete and status != STATUS_INCOMPLETE:
