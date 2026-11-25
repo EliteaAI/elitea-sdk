@@ -16,6 +16,7 @@ from ..langchain.utils import _extract_json, log_tool_result
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
 from ..tool_outcome import run_failure_message
 from ...tools.utils.serialization import serialize_tool_result
+from ..utils.safe_templates import safe_format
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ Answer must be JSON only extractable by JSON.LOADS."""
                 last_message[var] = state[var]
         logger.debug(f"ToolNode input: {input_}")
         if self.task:
-            task = self.task.format(**last_message, last_message=dumps(last_message))
+            task = safe_format(self.task, **last_message, last_message=dumps(last_message))
         else:
             task = 'Input from user: {last_message}'.format(last_message=dumps(last_message))
         input_ += [

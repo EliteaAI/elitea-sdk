@@ -898,7 +898,8 @@ class StateModifierNode(Runnable):
         # Render the template using Jinja
         import json
         import base64
-        from jinja2 import Environment
+        from jinja2.exceptions import SecurityError, UndefinedError
+        from ..utils.safe_templates import HardenedSandboxedEnvironment, TemplateRejectedError
 
         def from_json(value):
             """Convert JSON string to Python object"""
@@ -924,14 +925,25 @@ class StateModifierNode(Runnable):
             """Splits the provided string using the specified regex pattern."""
             return re.split(pattern, value)
 
-        env = Environment()
+        # Sandboxed: the node template is pipeline-author input (#7681).
+        env = HardenedSandboxedEnvironment()
         env.filters['from_json'] = from_json
         env.filters['base64_to_string'] = base64_to_string
         env.filters['split_by_words'] = split_by_words
         env.filters['split_by_regex'] = split_by_regex
 
-        template = env.from_string(self.template)
-        rendered_message = template.render(**input_data)
+        try:
+            template = env.from_string(self.template)
+            rendered_message = template.render(**input_data)
+        except SecurityError:
+            logger.warning('State modifier template rejected by sandbox: %.200s', self.template)
+            raise TemplateRejectedError("Template rejected: unsafe attribute access is not allowed")
+        except UndefinedError as exc:
+            logger.warning('State modifier template referenced an unavailable value: %s', exc)
+            raise Exception(
+                f"Jinja template referenced a value that is not available: {exc}. "
+                f"Available names: {sorted(input_data)}"
+            )
         result = {}
         # Store the rendered message in the state or messages
         if len(self.output_variables) > 0:

@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from ..langchain.utils import log_tool_result
 from ..tool_outcome import run_failure_message
 from ..tool_result_bounds import bound_and_record, toolkit_type_of
+from ..utils.safe_templates import safe_format
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ class AgentNode(BaseTool):
             if var != 'messages':
                 last_message[var] = state[var]
         if self.task:
-            task = self.task.format(**last_message, last_message=dumps(last_message))
+            task = safe_format(self.task, **last_message, last_message=dumps(last_message))
         else:
             task = 'Input from user: {last_message}'.format(last_message=dumps(last_message))
         try:
