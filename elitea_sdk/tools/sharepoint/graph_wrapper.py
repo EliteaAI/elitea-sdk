@@ -839,6 +839,9 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                                 typed_queue.append(
                                     (drive_id,
                                      f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/children"))
+                            elif on_listing_gap:
+                                # Without its id the folder cannot be walked, so its files are missing.
+                                on_listing_gap("a folder came back without an id")
                             continue
                         if 'file' not in item:
                             continue

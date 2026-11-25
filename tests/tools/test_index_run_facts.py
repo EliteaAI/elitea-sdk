@@ -155,6 +155,14 @@ class TestSkippedItemsCap:
 
         assert toolkit._unindexed_items_to_record() == {"k0": "1", "k1": "1", "k2": "1"}
 
+    def test_a_key_that_failed_after_it_was_noted_is_not_recorded(self):
+        toolkit = self.toolkit()
+        toolkit._index_run.unindexed_items.update({"k0": "1", "k1": "1", "k2": "1"})
+        toolkit._index_run.pipeline_failed_keys.add("k0")
+        toolkit._index_run.explicitly_failed_keys.add("k1")
+
+        assert toolkit._unindexed_items_to_record() == {"k2": "1"}
+
     def test_items_within_the_cap_are_all_recorded(self, monkeypatch):
         monkeypatch.setattr(base_indexer_toolkit, "MAX_UNINDEXED_ITEMS", 3)
         toolkit = self.toolkit()

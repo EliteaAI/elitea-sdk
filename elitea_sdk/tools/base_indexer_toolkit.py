@@ -1266,7 +1266,9 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
 
     def _unindexed_items_to_record(self) -> dict[str, str]:
         run = self._index_run
-        items = run.unindexed_items
+        # A key that failed after it was noted (a repeated key, a late flush failure) is not a skip.
+        failed = run.pipeline_failed_keys | run.explicitly_failed_keys
+        items = {key: marker for key, marker in run.unindexed_items.items() if key not in failed}
         if len(items) > MAX_UNINDEXED_ITEMS:
             logger.warning("Skipped items of the run exceed the record cap; the extra ones are not recorded.")
             return dict(itertools.islice(items.items(), MAX_UNINDEXED_ITEMS))
@@ -3185,8 +3187,11 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         """
         if not getattr(getattr(self, "vector_adapter", None), "supports_run_staging", False):
             return False
+        raw_tick = metadata.get("updated_on")
+        if raw_tick is None:
+            return False
         try:
-            last_tick = float(metadata.get("updated_on"))
+            last_tick = float(raw_tick)
         except (TypeError, ValueError):
             return False
         return time.time() - last_tick > self._read_disconnected_timeout(metadata)

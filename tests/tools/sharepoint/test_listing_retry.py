@@ -101,6 +101,15 @@ class TestGraphListing:
 
         assert len(gaps) == 1
 
+    def test_a_folder_without_an_id_reports_a_gap(self):
+        gaps = []
+        page = {"value": [FILE, {"name": "docs", "folder": {}}]}
+        with patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(200, page)):
+            result = _graph().get_files_list(limit_files=10, on_listing_gap=gaps.append)
+
+        assert [item["Name"] for item in result] == ["a.txt"]
+        assert gaps == ["a folder came back without an id"]
+
     def test_a_complete_listing_reports_no_gap(self):
         gaps = []
         with patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(200, {"value": [FILE]})):
