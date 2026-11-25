@@ -17,6 +17,10 @@
 Everything runs through the real `index_data`, `check_for_changes` and `search_index` of a toolkit.
 Only the vector store is faked (an in-memory table that keeps the rows and answers filtered searches),
 so what the run writes and deletes is what the check and the search later read.
+Two adapters run the same toolkit: one without run staging (Clean index empties the collection up front)
+and one with run staging, where a removed item's chunks go only when the promote step deletes them.
+The staged adapter is a fake of the pgvector contract: its `promote_run` deletes the ids it is handed,
+so the test proves which ids the toolkit hands over, not the SQL of the real promote.
 Lives outside tests/tools/index/ because CI skips that directory.
 """
 
@@ -149,6 +153,44 @@ class FakeAdapter(VectorStoreAdapter):
         raise AssertionError("a run without staging never discards")
 
 
+class StagedAdapter(FakeAdapter):
+    """The run-staging contract of the pgvector adapter: promote deletes what the toolkit hands over."""
+
+    supports_run_staging = True
+
+    def __init__(self):
+        self.promotes = []
+
+    def ensure_index_runs_table(self, wrapper):
+        return None
+
+    def register_index_run(self, wrapper, index_name, run_id, task_id=None, meta_lock_id=None):
+        return (True, None)
+
+    def sweep_stale_index_runs(self, wrapper, index_name, stale_before, except_run_id=None):
+        return []
+
+    def heartbeat_index_run(self, wrapper, index_name, run_id, meta_id, chunks_written=None):
+        return None
+
+    def update_index_meta_keys(self, wrapper, meta_id, run_id, patch):
+        row = wrapper.vectorstore.rows.get(meta_id)
+        if row is None:
+            return 0
+        row["metadata"].update(patch)
+        return 1
+
+    def promote_run(self, wrapper, index_name, run_id, superseded_ids, orphan_ids, damaged_ids):
+        rows = wrapper.vectorstore.rows
+        for row_id in dict.fromkeys([*superseded_ids, *orphan_ids, *damaged_ids]):
+            rows.pop(row_id, None)
+        self.promotes.append({"superseded": list(superseded_ids), "orphans": list(orphan_ids)})
+        return "promoted"
+
+    def discard_run(self, *args, **kwargs):
+        raise AssertionError("a run that completes never discards")
+
+
 class Source:
     """The mutable source the toolkit lists and loads."""
 
@@ -178,6 +220,16 @@ class SourceToolkit(NonCodeIndexerToolkit):
                                      "updated_on": item["modified"]})
 
 
+class AttestingSourceToolkit(SourceToolkit):
+    """A listing toolkit whose loader confirms it enumerated the whole source, as SharePoint does."""
+
+    loader_attests_completion = True
+
+    def _base_loader(self, **kwargs):
+        yield from super()._base_loader(**kwargs)
+        self._attest_loader_completion()
+
+
 def split_by_line(file_content_generator, config, *args, **kwargs):
     """A chunker with no tokenizer download: one chunk per line, so every item holds several chunks."""
     for document in file_content_generator:
@@ -187,12 +239,11 @@ def split_by_line(file_content_generator, config, *args, **kwargs):
             yield Document(page_content=line, metadata=metadata)
 
 
-@pytest.fixture
-def world(monkeypatch):
+def build_world(monkeypatch, toolkit_class, adapter):
     source = Source()
-    toolkit = SourceToolkit.model_construct()
+    toolkit = toolkit_class.model_construct()
     store = FakeVectorStore()
-    for name, value in (("vectorstore", store), ("vector_adapter", FakeAdapter()), ("source", source),
+    for name, value in (("vectorstore", store), ("vector_adapter", adapter), ("source", source),
                         ("toolkit_id", None), ("max_docs_per_add", 100), ("embeddings", None), ("llm", None)):
         object.__setattr__(toolkit, name, value)
     monkeypatch.setitem(chunkers, "by_line", split_by_line)
@@ -207,6 +258,22 @@ def world(monkeypatch):
     source.put("roadmap", "roadmap item one\nroadmap item two", "2026-01-01")
     source.put("faq", "faq answer one\nfaq answer two", "2026-01-01")
     return toolkit, source, store
+
+
+@pytest.fixture
+def world(monkeypatch):
+    return build_world(monkeypatch, SourceToolkit, FakeAdapter())
+
+
+@pytest.fixture
+def staged_world(monkeypatch):
+    """Run staging on, and a loader that cannot confirm source deletions (the default)."""
+    return build_world(monkeypatch, SourceToolkit, StagedAdapter())
+
+
+@pytest.fixture
+def attested_staged_world(monkeypatch):
+    return build_world(monkeypatch, AttestingSourceToolkit, StagedAdapter())
 
 
 def index(toolkit, clean_index=False):
@@ -247,13 +314,16 @@ class TestCleanIndexAfterTheCheck:
         assert report["items"]["removed"] == ["/lib/faq.txt"]
         assert report["items"]["changed"] == ["/lib/budget.txt"]
 
-    def test_chunks_of_the_removed_and_edited_items_are_searchable_until_the_clean_run(self, world):
+    def test_chunks_the_check_reports_as_removed_or_changed_are_searchable_until_the_clean_run(self, world):
         toolkit, source, _ = world
         index(toolkit)
 
         source.remove("faq")
         source.put("budget", "budget plan revised", "2026-03-03")
+        report = toolkit.check_for_changes(INDEX_NAME)
 
+        assert report["items"]["removed"] == ["/lib/faq.txt"]
+        assert report["items"]["changed"] == ["/lib/budget.txt"]
         assert found(toolkit, "faq") == {"faq"}
         assert found(toolkit, "plan one") == {"budget"}
 
@@ -288,6 +358,7 @@ class TestCleanIndexAfterTheCheck:
         assert {row["metadata"]["id"] for row in store.data_rows()} == {"handbook", "budget", "roadmap"}
         assert len(store.chunks_of("handbook")) == 3
         assert len(store.chunks_of("budget")) == 1
+        assert toolkit.check_for_changes(INDEX_NAME)["counts"]["unchanged"] == 3
 
     def test_the_check_after_the_clean_run_is_up_to_date(self, world):
         toolkit, source, _ = world
@@ -310,3 +381,56 @@ class TestCleanIndexAfterTheCheck:
 
         meta_rows = [row for row in store.rows.values() if row["metadata"].get("type") == META_TYPE]
         assert len(meta_rows) == 1
+
+
+def change_the_source(source):
+    source.remove("faq")
+    source.put("budget", "budget plan revised", "2026-03-03")
+
+
+class TestStagedCleanIndexAfterTheCheck:
+    """With run staging nothing is emptied up front: the promote step deletes the old chunks."""
+
+    def test_a_loader_that_attests_lets_the_promote_delete_the_chunks_of_a_removed_item(
+            self, attested_staged_world):
+        toolkit, source, store = attested_staged_world
+        index(toolkit)
+        assert len(store.chunks_of("faq")) == 2
+        change_the_source(source)
+        assert toolkit.check_for_changes(INDEX_NAME)["status"] == check.STATUS_NEEDS_CLEAN_REINDEX
+
+        index(toolkit, clean_index=True)
+
+        assert store.chunks_of("faq") == []
+        assert found(toolkit, "faq") == set()
+        assert len(toolkit.vector_adapter.promotes[-1]["orphans"]) == 2
+        assert {row["metadata"]["id"] for row in store.data_rows()} == {"handbook", "budget", "roadmap"}
+
+    def test_a_loader_that_attests_leaves_no_chunk_of_an_edited_item_and_the_check_agrees(
+            self, attested_staged_world):
+        toolkit, source, store = attested_staged_world
+        index(toolkit)
+        change_the_source(source)
+
+        index(toolkit, clean_index=True)
+
+        assert [row["content"] for row in store.chunks_of("budget")] == ["budget plan revised"]
+        assert found(toolkit, "plan one") == set()
+        assert len(store.chunks_of("handbook")) == 3
+        report = toolkit.check_for_changes(INDEX_NAME)
+        assert report["status"] == check.STATUS_UP_TO_DATE
+        assert report["counts"]["unchanged"] == 3
+
+    def test_a_loader_that_cannot_attest_keeps_the_chunks_of_a_removed_item(self, staged_world):
+        toolkit, source, store = staged_world
+        index(toolkit)
+        change_the_source(source)
+        assert toolkit.check_for_changes(INDEX_NAME)["counts"]["removed"] == 1
+
+        index(toolkit, clean_index=True)
+
+        # The documented risk: Clean index cannot remove what the loader cannot confirm is gone.
+        assert len(store.chunks_of("faq")) == 2
+        assert found(toolkit, "faq") == {"faq"}
+        assert toolkit.vector_adapter.promotes[-1]["orphans"] == []
+        assert [row["content"] for row in store.chunks_of("budget")] == ["budget plan revised"]

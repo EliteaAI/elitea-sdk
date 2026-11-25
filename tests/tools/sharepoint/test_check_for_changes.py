@@ -15,39 +15,9 @@ from elitea_sdk.tools.base_indexer_toolkit import _IndexRunState
 from elitea_sdk.tools.sharepoint import library_metadata as lm
 from elitea_sdk.tools.sharepoint.api_wrapper import SharepointApiWrapper
 from elitea_sdk.tools.sharepoint.rest_wrapper import SharepointRestWrapper
+from tests.tools.sharepoint.helpers import SITE, Backend, listed_file, stored_row, toolkit_with
 
-SITE = "https://tenant.sharepoint.com/sites/x"
 LIB_FILE_URL = f"{SITE}/Lib/a.docx"
-
-
-def listed_file(name="a.docx", modified="2026-01-01", file_id="f1", link=None):
-    return {"Name": name, "Path": f"/sites/x/Lib/{name}", "Created": "c", "Modified": modified,
-            "Link": link or f"{SITE}/Lib/{name}", "id": file_id}
-
-
-class Backend:
-    """Backend double: it can list, and it has no way to read file content."""
-
-    def __init__(self, files=(), gaps=()):
-        self.files = list(files)
-        self.gaps = list(gaps)
-        self.calls = []
-
-    def get_files_list(self, folder_name=None, limit_files=100, form_name=None, include_extensions=None,
-                       skip_extensions=None, on_file_skipped=None, on_listing_gap=None):
-        self.calls.append({"folder": folder_name, "limit": limit_files, "form": form_name,
-                           "include": include_extensions, "skip": skip_extensions})
-        for reason in self.gaps:
-            on_listing_gap(reason)
-        return self.files[:limit_files]
-
-
-def toolkit_with(backend, library=None):
-    toolkit = SharepointApiWrapper.model_construct(site_url=SITE)
-    toolkit._backend = backend
-    toolkit._log_tool_event = lambda *a, **k: None
-    toolkit._library_join_context = lambda *a, **k: library
-    return toolkit
 
 
 def library_context(metadata, categories=None):
@@ -56,12 +26,6 @@ def library_context(metadata, categories=None):
                               metadata=metadata))
     settings = lm.LibrarySettings.from_settings(library_lists=["Docs"], categories=categories)
     return settings, index, lm.JoinCounts()
-
-
-def stored_row(listing_item, **extra):
-    """A base row as the indexer stores it for a listed file."""
-    return {"metadata": {"id": listing_item.key, "Name": listing_item.name, "Path": listing_item.path,
-                         "updated_on": "2026-01-01", **extra}}
 
 
 class TestListingHook:
@@ -77,6 +41,7 @@ class TestListingHook:
 
         assert backend.calls == [{"folder": "Lib/sub", "limit": 50, "form": "Lib",
                                   "include": ["docx"], "skip": ["tmp"]}]
+        assert backend.content_reads == []
         assert [(i.key, i.name, i.path, i.marker) for i in listing.items] == [
             ("f1", "a.docx", "/sites/x/Lib/a.docx", "2026-01-01")]
         assert listing.complete is True

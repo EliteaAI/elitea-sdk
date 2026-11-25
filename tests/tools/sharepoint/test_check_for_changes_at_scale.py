@@ -15,7 +15,10 @@
 """`check_for_changes` on a SharePoint index of 2000 files.
 
 The source is a faked `get_files_list`: no network and no file content. The run goes through the
-listing hook, the stored-row read and the comparison, so a slow step shows up as a missed time bound.
+listing hook, the stored-row read and the comparison.
+Only the in-memory part is timed: the Graph listing and the pgvector read of the stored rows are
+faked, so the time bound shows that the comparison and the report scale, not that a real
+2000-file library lists fast.
 Lives beside the other SharePoint tests, outside tests/tools/index/ because CI skips that directory.
 """
 
@@ -27,7 +30,7 @@ import pytest
 from elitea_sdk.runtime.tools.vectorstore_base import VectorStoreWrapperBase
 from elitea_sdk.tools import index_change_check as check
 from elitea_sdk.tools.sharepoint.api_wrapper import SharepointApiWrapper
-from tests.tools.sharepoint.test_check_for_changes import Backend, listed_file, stored_row, toolkit_with
+from tests.tools.sharepoint.helpers import Backend, listed_file, stored_row, toolkit_with
 
 ITEM_COUNT = 2000
 TIME_BOUND_SECONDS = 5.0
@@ -86,7 +89,7 @@ def run_check(monkeypatch):
 
 class TestTwoThousandFiles:
 
-    def test_an_unchanged_index_is_up_to_date_within_the_time_bound(self, run_check):
+    def test_an_unchanged_index_is_up_to_date_and_the_comparison_stays_under_the_time_bound(self, run_check):
         files = [listed(number) for number in range(ITEM_COUNT)]
 
         outcome = run_check(files, stored_from(files))
@@ -98,7 +101,8 @@ class TestTwoThousandFiles:
         assert report["listing_complete"] is True
         assert outcome.seconds < TIME_BOUND_SECONDS
 
-    def test_added_changed_and_removed_files_are_counted_within_the_time_bound(self, run_check):
+    def test_added_changed_and_removed_files_are_counted_and_the_comparison_stays_under_the_time_bound(
+            self, run_check):
         indexed_files = [listed(number) for number in range(ITEM_COUNT)]
         stored = stored_from(indexed_files)
         # Source now: files 0..1997 kept (10, 20 and 30 edited), 1998 and 1999 gone, two new files.
@@ -128,7 +132,7 @@ class TestTwoThousandFiles:
 
         assert [call["folder"] for call in outcome.backend.calls] == ["Lib"]
         assert outcome.backend.calls[0]["form"] == "Lib"
-        assert not hasattr(outcome.backend, "get_file_content")
+        assert outcome.backend.content_reads == []
 
     def test_every_file_removed_from_a_large_source_is_reported_as_removed(self, run_check):
         # One kept file keeps the listing and the index sharing a key, so the mismatch guard stays out of the way.
