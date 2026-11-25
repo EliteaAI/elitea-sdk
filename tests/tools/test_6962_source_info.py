@@ -305,6 +305,16 @@ class TestSearchResults:
         assert result == [{"metadata": {"source_info": {"type": "jira", "location": "AB-1", "id": "AB-1",
                                                         "url": "https://jira.corp/browse/AB-1"}}}]
 
+    def test_page_only_chunk_comes_back_from_search(self, monkeypatch):
+        stored = {"name": "Handbook.pdf", "page": 5, "chunk_id": 3}
+        docs = [{"page_content": "x", "score": 0.9, "metadata": dict(stored)}]
+        monkeypatch.setattr(VectorStoreWrapperBase, "search_documents", lambda self, *a, **kw: json.loads(json.dumps(docs)))
+        monkeypatch.setattr(BaseIndexerToolkit, "list_indexes", lambda self: ["idx"])
+        artifact = wrapper(ArtifactWrapper, elitea=SimpleNamespace(public_url="https://elitea.corp", base_url="x"))
+        metadata = artifact.search_index("q", index_name="idx")[0]["metadata"]
+        assert {key: metadata[key] for key in stored} == stored
+        assert not any(key.startswith(("page_number", "section_")) for key in metadata)
+
     def test_stepback_search_index_adds_source_info(self, found):
         text = found.stepback_search_index("q", index_name="idx")
         assert json.loads(text.split("\n", 1)[1])[0]["metadata"]["source_info"]["type"] == "jira"
