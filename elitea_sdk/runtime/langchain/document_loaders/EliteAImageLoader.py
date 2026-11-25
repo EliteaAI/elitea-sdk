@@ -7,9 +7,8 @@ from PIL import Image
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 from reportlab.graphics import renderPM
-from svglib.svglib import svg2rlg
 
-from .utils import perform_llm_prediction_for_image_bytes, ensure_min_image_size, scale_svg_drawing, preprocess_svg_for_rendering
+from .utils import perform_llm_prediction_for_image_bytes, ensure_min_image_size, scale_svg_drawing, preprocess_svg_for_rendering, svg_to_px_drawing
 from ..constants import DEFAULT_MULTIMODAL_PROMPT
 from ..tools.utils import encode_image_for_llm, encode_image_bytes_for_llm
 
@@ -81,7 +80,7 @@ class EliteAImageLoader(BaseLoader):
         try:
             if Path(filename).suffix.lower() == ".svg":
                 svg_content = preprocess_svg_for_rendering(file_content)
-                drawing = svg2rlg(BytesIO(svg_content))
+                drawing = svg_to_px_drawing(svg_content)
                 return int(drawing.width), int(drawing.height)
             with Image.open(BytesIO(file_content)) as image:
                 return image.width, image.height
@@ -165,7 +164,7 @@ class EliteAImageLoader(BaseLoader):
         if self.llm:
             return self.__process_svg_with_llm(svg_content, self.llm, self.prompt)
         else:
-            drawing = svg2rlg(BytesIO(svg_content))
+            drawing = svg_to_px_drawing(svg_content)
             self._original_dimensions = (int(drawing.width), int(drawing.height))
             drawing, self._was_scaled = scale_svg_drawing(drawing)
             return ""
@@ -211,7 +210,7 @@ class EliteAImageLoader(BaseLoader):
 
     def __process_svg_with_llm(self, svg_content: bytes, llm, prompt: str) -> str:
         """Processes SVG content using LLM with automatic upscaling for small SVGs."""
-        drawing = svg2rlg(BytesIO(svg_content))
+        drawing = svg_to_px_drawing(svg_content)
         self._original_dimensions = (int(drawing.width), int(drawing.height))
         drawing, self._was_scaled = scale_svg_drawing(drawing)
         image = self.__render_svg_drawing(drawing)

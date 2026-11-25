@@ -130,6 +130,31 @@ def scale_svg_drawing(drawing, min_dim: int = MIN_IMAGE_DIMENSION_FOR_LLM):
     return drawing, True
 
 
+def _drop_direct_draw_nodes(group) -> None:
+    # svglib 2.x gradients are PDF-only DirectDraw nodes that crash renderPM; 1.x ignored them too.
+    from reportlab.graphics.shapes import DirectDraw
+
+    group.contents = [node for node in group.contents if not isinstance(node, DirectDraw)]
+    for node in group.contents:
+        if hasattr(node, "contents"):
+            _drop_direct_draw_nodes(node)
+
+
+def svg_to_px_drawing(svg_content: bytes):
+    """Parse SVG into a drawing sized in px (svglib 2.x emits points: 1 px = 0.75 pt)."""
+    from io import BytesIO
+    from svglib.svglib import PX_TO_PT, svg2rlg
+
+    drawing = svg2rlg(BytesIO(svg_content))
+    if drawing is None:
+        raise ValueError("Unable to parse SVG content")
+    _drop_direct_draw_nodes(drawing)
+    drawing.width /= PX_TO_PT
+    drawing.height /= PX_TO_PT
+    drawing.scale(1 / PX_TO_PT, 1 / PX_TO_PT)
+    return drawing
+
+
 def preprocess_svg_for_rendering(svg_content: bytes) -> bytes:
     """Fix known svglib rendering issues in SVG content.
 
