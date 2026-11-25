@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langgraph.graph import add_messages
 
 from ...runtime.langchain.constants import ELITEA_RS, PRINTER_NODE_RS
-from ...runtime.utils.safe_templates import safe_format as safe_str_format
+from ...runtime.utils import safe_templates
 
 logger = logging.getLogger(__name__)
 
@@ -578,7 +578,7 @@ def propagate_the_input_mapping(input_mapping: dict[str, dict], input_variables:
 
         if value['type'] == 'fstring':
             try:
-                input_data[key] = safe_str_format(value['value'], **var_dict)
+                input_data[key] = safe_templates.safe_format(value['value'], **var_dict)
             except (KeyError, IndexError) as e:
                 # KeyError: named placeholder not found in var_dict
                 # IndexError: positional placeholder {0} or {} used but no positional args provided

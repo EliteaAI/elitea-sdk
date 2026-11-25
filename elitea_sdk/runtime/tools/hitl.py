@@ -16,7 +16,7 @@ from typing import Any, Optional, TypedDict
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.types import interrupt, Command
-from ..utils.safe_templates import safe_format as safe_str_format
+from ..utils.safe_templates import safe_format
 
 logger = logging.getLogger(__name__)
 
@@ -142,14 +142,14 @@ class HITLNode(Runnable):
                 if key != "messages":
                     input_data[key] = state.get(key, "")
             try:
-                return safe_str_format(msg_value, **input_data)
+                return safe_format(msg_value, **input_data)
             except KeyError as e:
                 logger.warning(f"HITL node '{self.name}': missing state key {e} in fstring template, "
                               f"trying full state fallback")
                 try:
                     # Fallback: try with full state (excluding messages to avoid serialization issues)
                     safe_state = {k: v for k, v in state.items() if k != "messages"}
-                    return safe_str_format(msg_value, **safe_state)
+                    return safe_format(msg_value, **safe_state)
                 except KeyError:
                     logger.error(f"HITL node '{self.name}': cannot resolve fstring template, returning raw")
                     return msg_value

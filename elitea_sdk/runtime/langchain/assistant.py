@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Iterable, Optional, Tuple, Union
 
 from jinja2 import DebugUndefined
-from jinja2.sandbox import SandboxedEnvironment
+from ..utils.safe_templates import HardenedSandboxedEnvironment
 from langgraph.errors import GraphBubbleUp
 
 from ..exceptions import InputGuardrailBlocked, budget_exceeded_from
@@ -669,11 +669,11 @@ class Assistant:
                 context.update(extra_context)
 
             # Process template with Jinja2.
-            # SandboxedEnvironment blocks access to unsafe attributes/methods (e.g.
+            # HardenedSandboxedEnvironment blocks access to unsafe attributes/methods (e.g.
             # __class__.__subclasses__ chains) so an agent author cannot turn the
             # instruction template into a server-side template-injection RCE.
             # DebugUndefined leaves unresolved variables as {{variable}} rather than failing.
-            environment = SandboxedEnvironment(undefined=DebugUndefined)
+            environment = HardenedSandboxedEnvironment(undefined=DebugUndefined)
             template = environment.from_string(template_str)
             resolved = template.render(context)
 

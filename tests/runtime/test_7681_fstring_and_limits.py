@@ -1,5 +1,7 @@
 """Issue #7681 — AC-6 (fstring attribute/index traversal) and AC-7 (resource exhaustion)."""
 
+from unittest.mock import patch
+
 import pytest
 
 from elitea_sdk.runtime.langchain.utils import propagate_the_input_mapping
@@ -89,3 +91,45 @@ class TestResourceExhaustion:
 
     def test_normal_arithmetic_and_repetition_unchanged(self):
         assert EvaluateTemplate("{{ 2 ** 10 }}-{{ 'ab' * 3 }}-{{ 6 * 7 }}-{{ 7 % 3 }}-{{ '%05d|%%' % 42 }}", {}).extract() == "1024-ababab-42-1-00042|%"
+
+
+# --- call sites ------------------------------------------------------------------
+
+class TestCallSites:
+
+    def test_agent_node_task_rejects_unsafe_and_keeps_traversal(self):
+        from langchain_core.tools import BaseTool
+        from elitea_sdk.runtime.tools.agent import AgentNode
+
+        seen = []
+
+        class _Child(BaseTool):
+            name: str = "child"
+            description: str = "records input"
+
+            def _run(self, task: str) -> str:
+                seen.append(task)
+                return "done"
+
+        node = AgentNode(tool=_Child(), input_variables=["data", "template"], task="{data[0]}|{template}")
+        with patch("elitea_sdk.runtime.tools.agent.dispatch_custom_event"):
+            node.invoke({"data": ["a"], "template": "t"})
+        assert seen == ["a|t"]
+
+        node.task = "{data.__class__}"
+        with pytest.raises(UnsafePlaceholderError):
+            node.invoke({"data": ["a"], "template": "t"})
+
+    def test_hitl_fstring_unsafe_falls_back_to_raw(self):
+        from elitea_sdk.runtime.tools.hitl import HITLNode
+
+        node = HITLNode(name="review", input_variables=["x"],
+                        user_message={"type": "fstring", "value": "{x.__class__}"},
+                        routes={"approve": "end"})
+        assert node._build_user_message({"x": _Obj()}) == "{x.__class__}"
+
+    def test_assistant_instructions_use_hardened_sandbox(self):
+        from elitea_sdk.runtime.langchain import assistant
+        from elitea_sdk.runtime.utils.safe_templates import HardenedSandboxedEnvironment
+
+        assert assistant.HardenedSandboxedEnvironment is HardenedSandboxedEnvironment
