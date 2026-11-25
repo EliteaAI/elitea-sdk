@@ -58,6 +58,54 @@ def _url_has_image_extension(url: str) -> bool:
     path = url.split("?", 1)[0].split("#", 1)[0]
     return path.lower().endswith(_IMAGE_EXTENSIONS)
 
+
+# ADO Wiki writes resized images as `![name](/.attachments/x.png =250x)`; the
+# size (` =WxH`, ` =Wx`, ` =xH`) is part of the markdown target, not the URL.
+_IMAGE_SIZE_SUFFIX_RE = re.compile(r"\s+=\d*x\d*$")
+
+# Project wikis always live on this branch of their backing repo.
+_PROJECT_WIKI_BRANCH = "wikiMaster"
+
+
+def _strip_image_size_suffix(url: str) -> str:
+    """Drop a trailing ADO image size suffix (` =250x`, ` =x300`, ` =250x300`)."""
+    return _IMAGE_SIZE_SUFFIX_RE.sub("", url.strip()) if url else url
+
+
+_MAX_FAILURE_REASON_CHARS = 300
+
+
+def _image_failure_note(failed: int, total: int, reasons: List[str]) -> str:
+    """One line telling the caller how many images were not described, and why."""
+    distinct = list(dict.fromkeys(
+        r if len(r) <= _MAX_FAILURE_REASON_CHARS else r[:_MAX_FAILURE_REASON_CHARS] + "..." for r in reasons
+    ))
+    return f"[{failed} of {total} images not described: {'; '.join(distinct)}]"
+
+
+def _is_code_wiki(wiki) -> bool:
+    return "codewiki" in str(getattr(wiki, "type", "") or "").lower()
+
+
+def _wiki_branch(wiki) -> str:
+    """Branch the wiki is published from.
+
+    Code wikis publish a folder of an ordinary branch (`versions[0]`); project
+    wikis, and wikis without versions, use `wikiMaster`.
+    """
+    if not _is_code_wiki(wiki):
+        return _PROJECT_WIKI_BRANCH
+    versions = getattr(wiki, "versions", None) or []
+    version = getattr(versions[0], "version", None) if versions else None
+    return version or _PROJECT_WIKI_BRANCH
+
+
+def _wiki_mapped_prefix(wiki) -> str:
+    """Repo folder a code wiki is published from, without slashes ('' for the root)."""
+    if not _is_code_wiki(wiki):
+        return ""
+    return str(getattr(wiki, "mapped_path", None) or "").strip("/")
+
 GetWikiInput = create_model(
     "GetWikiInput",
     wiki_identified=(Optional[str], Field(default=None, description="Wiki ID or wiki name. If not provided, uses the default wiki identifier from toolkit configuration."))
@@ -522,35 +570,66 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
             raise ToolException(f"Unexpected error during wiki page retrieval: {str(e)}")
 
     def _get_repos_wrapper(self, wiki_identified: str) -> Optional["ReposApiWrapper"]:
-        """Return a ReposApiWrapper bound to the wikiMaster branch of the given wiki.
+        """Return a ReposApiWrapper bound to the branch the given wiki is published from.
 
         Cached per (project, wiki identifier) on the instance so index-time processing of many
-        pages doesn't rebuild the wrapper (and its azure-devops Connection) per page.
-        Returns None when the wiki cannot be resolved — callers must handle that.
+        pages doesn't rebuild the wrapper (and its azure-devops Connection) per page. A failed
+        lookup is cached too, with its reason (see `_repos_wrapper_error`), so pages after the
+        first don't repeat the setup calls. Returns None when the wiki cannot be resolved —
+        callers must handle that.
         """
         cache = self.__dict__.setdefault("_repos_wrapper_cache", {})
+        errors = self.__dict__.setdefault("_repos_wrapper_errors", {})
         cache_key = (self._project(), wiki_identified)
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
+        if cache_key in errors:
+            return None
         try:
             wiki = self._client.get_wiki(project=self._project(), wiki_identifier=wiki_identified)
+            branch = _wiki_branch(wiki)
             repos_wrapper = ReposApiWrapper(
                 organization_url=self.organization_url,
                 project=self._project(),
                 token=self.token.get_secret_value(),
                 repository_id=wiki.repository_id,
-                base_branch="wikiMaster",
-                active_branch="wikiMaster",
+                base_branch=branch,
+                active_branch=branch,
                 llm=self.llm,
             )
         except Exception as e:
             logger.error(f"Failed to initialize repos wrapper for wiki '{wiki_identified}': {str(e)}")
+            errors[cache_key] = str(e)
             return None
+        self.__dict__.setdefault("_wiki_mapped_prefixes", {})[cache_key] = _wiki_mapped_prefix(wiki)
         cache[cache_key] = repos_wrapper
         return repos_wrapper
 
-    def _process_images(self, page_content: str, wiki_identified: str, image_description_prompt=None):
+    def _repos_wrapper_error(self, wiki_identified: str) -> Optional[str]:
+        """Why `_get_repos_wrapper` returned None for this wiki, if it did."""
+        return self.__dict__.get("_repos_wrapper_errors", {}).get((self._project(), wiki_identified))
+
+    def _attachment_repo_path(self, attachment_url: str, wiki_identified: Optional[str] = None) -> str:
+        """Map a `/.attachments/...` URL to its path in the wiki's repo.
+
+        A code wiki published from a subfolder keeps attachments under that folder.
+        """
+        file_path = unquote(_strip_image_size_suffix(attachment_url).lstrip('/'))
+        prefixes = self.__dict__.get("_wiki_mapped_prefixes")
+        if wiki_identified is None or not prefixes:
+            return file_path
+        prefix = prefixes.get((self._project(), wiki_identified))
+        return f"{prefix}/{file_path}" if prefix else file_path
+
+    def _process_images(self, page_content: str, wiki_identified: str, image_description_prompt=None,
+                        report_failures: bool = True):
+        """Replace image markdown with LLM descriptions.
+
+        With report_failures, a page where some images could not be described gets
+        one trailing `[N of M images not described: <reason>]` line so the caller can
+        tell; otherwise failures are only logged.
+        """
         if image_description_prompt and self.llm is None:
             raise ToolException(
                 "Cannot generate image descriptions: image_description_prompt was provided but no LLM is configured. "
@@ -565,18 +644,21 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
 
         # Initialize repos_wrapper once for all attachments in this page
         repos_wrapper = None
+        repos_wrapper_error = None
         has_attachments = any(url.startswith("/.attachments/") for _, url in matches)
 
         if has_attachments:
             repos_wrapper = self._get_repos_wrapper(wiki_identified)
+            if repos_wrapper is None:
+                repos_wrapper_error = self._repos_wrapper_error(wiki_identified) or "Repos wrapper not initialized"
 
         def _describe_image(item):
             """Fetch + LLM-describe a single image. Runs on a worker thread.
 
-            Returns (image_name, image_url, description) on success or
-            (image_name, image_url, None) if the image was skipped for any reason —
-            the caller then leaves the original markdown untouched (matches the
-            prior serial behavior).
+            Returns (image_name, image_url, description, error): a description on
+            success; otherwise description is None and error is the failure reason,
+            or None when the reference is not an image at all. The caller leaves
+            the original markdown untouched for any None description.
             """
             img_idx, image_name, image_url = item
             logger.debug(
@@ -584,42 +666,47 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
             )
             if not image_url:
                 logger.warning(f"Skipping image '{image_name}': empty URL, leaving original markdown unchanged.")
-                return image_name, image_url, None
-            if image_url.startswith("/.attachments/"):
+                return image_name, image_url, None, None
+            source_url = _strip_image_size_suffix(image_url)
+            if source_url.startswith("/.attachments/"):
                 # ADO Wiki uses image-markdown syntax for every attachment type
                 # (PDF, DOCX, ...), not just real images. Only treat this as an
                 # image if the URL extension is a known image type; otherwise
                 # leave the markdown untouched and let the `include_attachments`
                 # dependent-doc path handle it with the real extension.
-                if not _url_has_image_extension(image_url):
+                if not _url_has_image_extension(source_url):
                     logger.debug(
                         f"Skipping non-image attachment '{image_name}' -> '{image_url}' in image processing; "
                         f"will be handled by include_attachments path."
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, None
+                if repos_wrapper is None:
+                    logger.warning(
+                        f"Skipping image '{image_name}': wiki repository is unavailable: {repos_wrapper_error}"
+                    )
+                    return image_name, image_url, None, f"wiki repository is unavailable: {repos_wrapper_error}"
                 try:
-                    if repos_wrapper is None:
-                        raise Exception("Repos wrapper not initialized")
                     description = self.process_attachment(
-                        attachment_url=image_url,
+                        attachment_url=source_url,
                         attachment_name=image_name,
                         image_description_prompt=image_description_prompt,
                         repos_wrapper=repos_wrapper,
+                        wiki_identified=wiki_identified,
                     )
                 except ToolException as e:
                     logger.warning(
                         f"Skipping image '{image_name}': attachment parser returned error for '{image_url}': "
                         f"{str(e)}"
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, str(e)
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error parsing attachment '{image_url}': {str(e)}"
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, str(e)
             else:
                 try:
-                    response = requests.get(image_url)
+                    response = requests.get(source_url)
                     response.raise_for_status()
                     file_content = response.content
                     description = parse_file_content(
@@ -634,13 +721,13 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
                         f"Skipping image '{image_name}': image parser returned error for '{image_url}': "
                         f"{str(e)}"
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, str(e)
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error fetching external image '{image_url}': {str(e)}"
                     )
-                    return image_name, image_url, None
-            return image_name, image_url, description
+                    return image_name, image_url, None, f"could not fetch '{source_url}': {str(e)}"
+            return image_name, image_url, description, None
 
         # If the outer _collect_dependencies runs pages in parallel (Phase 4),
         # this call already sits on a worker thread — nesting another pool
@@ -663,15 +750,24 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
             ) as executor:
                 results = list(executor.map(in_caller_context(_describe_image), items))
 
-        for image_name, image_url, description in results:
+        attempted = 0
+        reasons: List[str] = []
+        for image_name, image_url, description, error in results:
             if description is None:
+                if error is not None:
+                    attempted += 1
+                    reasons.append(error)
                 continue
+            attempted += 1
             new_image_markdown = f"![{image_name}]({description})"
             page_content = page_content.replace(f"![{image_name}]({image_url})", new_image_markdown)
+        if reasons and report_failures:
+            page_content += f"\n\n{_image_failure_note(len(reasons), attempted, reasons)}"
         return page_content
 
-    def process_attachment(self, attachment_url, attachment_name, repos_wrapper, image_description_prompt):
-        file_path = unquote(attachment_url.lstrip('/'))
+    def process_attachment(self, attachment_url, attachment_name, repos_wrapper, image_description_prompt,
+                           wiki_identified: Optional[str] = None):
+        file_path = self._attachment_repo_path(attachment_url, wiki_identified)
         attachment_content = repos_wrapper.download_file(path=file_path)
         return parse_file_content(
             file_content=attachment_content,
@@ -1097,6 +1193,8 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
                 raw_content,
                 wiki_identified=wiki_identifier,
                 image_description_prompt=image_description_prompt,
+                # The note is for tool callers; it must not be indexed as page text.
+                report_failures=False,
             )
         except Exception as e:
             logger.warning(
@@ -1197,7 +1295,9 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
                 f"[ADO wiki index] Downloading attachment {att_idx}/{total_attachments} for page '{parent_path}': '{file_path}'"
             )
             try:
-                data = self._download_attachment_with_retry(repos_wrapper, file_path)
+                # IDs keep the wiki-relative path; the download needs the repo path.
+                repo_path = self._attachment_repo_path(att_url, wiki_identifier)
+                data = self._download_attachment_with_retry(repos_wrapper, repo_path)
                 return item, data, None
             except Exception as e:
                 return item, None, e
@@ -1312,8 +1412,8 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
                 default=False,
                 description=(
                     "If True, also index each /.attachments/ file referenced by wiki pages as "
-                    "its own dependent document. Attachment bytes are pulled from the wikiMaster "
-                    "branch of the wiki's backing git repo and passed through the standard "
+                    "its own dependent document. Attachment bytes are pulled from the branch the "
+                    "wiki is published from (wikiMaster for project wikis) in its backing git repo and passed through the standard "
                     "content parser (LLM description for images/PDFs, text for supported files). "
                     "External image URLs (http/https) are not indexed — only files stored in the "
                     "wiki repo. Independent of process_images: enabling both means image content "
