@@ -773,9 +773,17 @@ class LLMNode(BaseTool):
         Returns:
             Formatted result dictionary with messages
         """
-        # Ensure messages are properly formatted
-        if result.get('messages') and isinstance(result['messages'], list):
-            result['messages'] = [{'role': 'assistant', 'content': '\n'.join(result['messages'])}]
+        # Ensure messages are properly formatted. The `messages` field is typed
+        # list[JsonValue], so models may fill it with strings or with
+        # {"role": ..., "content": ...} dicts.
+        messages_value = result.get('messages')
+        if isinstance(messages_value, str):
+            messages_value = [messages_value]
+        parts = []
+        if isinstance(messages_value, list):
+            parts = [text for text in (self._structured_message_text(item) for item in messages_value) if text]
+        if parts:
+            result['messages'] = [{'role': 'assistant', 'content': '\n'.join(parts)}]
         else:
             # Extract content from initial_completion, handling thinking blocks
             fallback_content = result.get(ELITEA_RS, '')
@@ -796,6 +804,17 @@ class LLMNode(BaseTool):
                 'elitea_routing': initial_completion.response_metadata['elitea_routing']} if isinstance(initial_completion, AIMessage) and initial_completion.response_metadata.get('elitea_routing') else {})])
 
         return result
+
+    @staticmethod
+    def _structured_message_text(item: Any) -> str:
+        """Convert one item of a structured `messages` list to text."""
+        if isinstance(item, dict) and 'content' in item:
+            item = item['content']
+        if item is None:
+            return ''
+        if isinstance(item, str):
+            return item
+        return json.dumps(item, ensure_ascii=False)
 
     def get_filtered_tools(self, config: Optional[Any] = None) -> List[BaseTool]:
         """
