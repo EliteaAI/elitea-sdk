@@ -3128,8 +3128,8 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
         index_meta = super().get_index_meta(index_name)
         if not index_meta:
             raise ToolException(f"Index '{index_name}' not found. {self._available_indexes_note()}")
-        configuration = (index_meta.get("metadata") or {}).get("index_configuration")
-        if not isinstance(configuration, dict) or not configuration:
+        configuration = self._stored_index_configuration(index_meta.get("metadata") or {})
+        if not configuration:
             raise ToolException(
                 f"Index '{index_name}' has no saved indexing configuration, so the source cannot be "
                 f"listed. Run index_data first. {self._available_indexes_note()}"
@@ -3472,6 +3472,21 @@ class BaseIndexerToolkit(VectorStoreWrapperBase):
             entry for entry in history
             if isinstance(entry, dict) and entry.get("state") in COMPLETED_INDEX_STATES
         ])
+
+    @staticmethod
+    def _stored_index_configuration(metadata: dict[str, Any]) -> dict[str, Any] | None:
+        """The saved index configuration as a dict, or None when it is missing or unreadable.
+
+        `add_documents` writes the meta row with its dict values as JSON strings, so the
+        vector store hands the configuration back as a string.
+        """
+        configuration = metadata.get("index_configuration")
+        if isinstance(configuration, str):
+            try:
+                configuration = json.loads(configuration)
+            except json.JSONDecodeError:
+                return None
+        return configuration if isinstance(configuration, dict) else None
 
     @staticmethod
     def _stored_last_run_scope(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:

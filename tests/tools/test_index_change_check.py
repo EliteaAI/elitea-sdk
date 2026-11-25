@@ -304,6 +304,14 @@ class TestCheckTool:
 
         assert indexed_toolkit.seen_configuration == {"path": "/lib"}
 
+    def test_a_configuration_stored_as_a_json_string_reaches_the_hook_as_a_dict(self, indexed_toolkit):
+        indexed_toolkit.stored_meta["metadata"]["index_configuration"] = json.dumps({"path": "/lib"})
+
+        report = indexed_toolkit.check_for_changes("idx")
+
+        assert indexed_toolkit.seen_configuration == {"path": "/lib"}
+        assert report["status"] == "up_to_date"
+
     @pytest.fixture
     def scoped_toolkit(self, indexed_toolkit, monkeypatch):
         monkeypatch.setattr(_Indexed, "_run_scope_keys", lambda self, cfg: {"path": cfg.get("path")})
@@ -392,6 +400,9 @@ class TestCheckTool:
         {"id": "meta-1", "metadata": {"index_configuration": None}},
         {"id": "meta-1", "metadata": {"index_configuration": "not a dict"}},
         {"id": "meta-1", "metadata": {"index_configuration": {}}},
+        {"id": "meta-1", "metadata": {"index_configuration": "{}"}},
+        {"id": "meta-1", "metadata": {"index_configuration": "[1, 2]"}},
+        {"id": "meta-1", "metadata": {"index_configuration": "null"}},
     ])
     def test_missing_index_or_configuration_raises_with_the_index_list(self, indexed_toolkit, meta):
         object.__setattr__(indexed_toolkit, "stored_meta", meta)
