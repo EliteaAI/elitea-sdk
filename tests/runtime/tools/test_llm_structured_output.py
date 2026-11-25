@@ -1961,3 +1961,43 @@ class TestUnparsedStructuredOutputKeepsState:
         ))
         assert result["custom_text"] is None
         assert result["custom_json"] == {"a": 1}
+
+
+class TestFormatStructuredOutputMessages:
+    """`messages` in a structured output is list[JsonValue]: models may return
+    strings or {"role", "content"} dicts. Both must become one assistant message."""
+
+    def _format(self, messages_value, rs="summary"):
+        node = _make_llm_node()
+        result = {'messages': messages_value, ELITEA_RS: rs}
+        completion = AIMessage(content="raw completion")
+        return node._format_structured_output_result(result, [HumanMessage(content="hi")], completion)
+
+    def test_string_items_are_joined(self):
+        out = self._format(["line one", "line two"])
+        assert out['messages'] == [{'role': 'assistant', 'content': 'line one\nline two'}]
+
+    def test_dict_items_use_content(self):
+        out = self._format([{"role": "assistant", "content": "custom=1 | str_var=hello"}])
+        assert out['messages'] == [{'role': 'assistant', 'content': 'custom=1 | str_var=hello'}]
+
+    def test_mixed_and_non_string_items(self):
+        out = self._format(["a", {"role": "assistant", "content": "b"}, {"k": 1}, 3, None])
+        assert out['messages'] == [{'role': 'assistant', 'content': 'a\nb\n{"k": 1}\n3'}]
+
+    def test_dict_with_non_string_content_is_dumped(self):
+        out = self._format([{"role": "assistant", "content": [{"type": "text", "text": "x"}]}])
+        assert out['messages'][0]['content'] == '[{"type": "text", "text": "x"}]'
+
+    def test_bare_string_value(self):
+        out = self._format("just text")
+        assert out['messages'] == [{'role': 'assistant', 'content': 'just text'}]
+
+    def test_empty_items_fall_back_to_elitea_response(self):
+        out = self._format([{"role": "assistant", "content": ""}], rs="summary")
+        assert [m.content for m in out['messages']] == ["hi", "summary"]
+
+    def test_missing_messages_falls_back_to_elitea_response(self):
+        out = self._format(None, rs="summary")
+        assert isinstance(out['messages'][-1], AIMessage)
+        assert out['messages'][-1].content == "summary"
