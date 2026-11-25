@@ -68,6 +68,14 @@ class TestGraphListing:
 
         assert sleeps == [7.0]
 
+    @pytest.mark.parametrize("header", ["Wed, 21 Oct 2026 07:28:00 GMT", "soon"])
+    def test_a_retry_after_that_is_not_a_number_falls_back_to_the_backoff(self, header, sleeps):
+        pages = [_response(429, headers={"Retry-After": header}), _response(200, {"value": []})]
+        with patch(f"{GRAPH_MODULE}.requests.get", side_effect=pages):
+            _graph().get_files_list()
+
+        assert sleeps == [library_metadata.BACKOFF_BASE_SECONDS]
+
     def test_a_listing_that_stays_throttled_raises_after_the_attempts(self, sleeps):
         with (
             patch(f"{GRAPH_MODULE}.requests.get", return_value=_response(429)) as get,
