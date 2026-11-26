@@ -6,8 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime
 from enum import Enum
+from fnmatch import fnmatch
 from json import dumps
 from os import environ
+from os.path import splitext
 from typing import ClassVar, List, Literal, Union, Optional, Any, Dict
 
 from azure.devops.v7_0.git.git_client import GitClient
@@ -197,6 +199,40 @@ class GitChange:
         return change_dict
 
 
+_PR_CHANGES_PAGE = 2000  # API maximum for get_pull_request_iteration_changes
+_BINARY_DIFF = "Binary file, diff not shown"
+_BINARY_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tif", ".tiff", ".psd",
+    ".zip", ".gz", ".tgz", ".7z", ".rar", ".tar", ".jar", ".war", ".nupkg", ".whl",
+    ".dll", ".exe", ".so", ".dylib", ".pdb", ".lib", ".a", ".o", ".obj", ".class", ".pyc",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".wav", ".avi", ".mov", ".bin",
+})
+
+
+def _is_binary_path(path: str) -> bool:
+    return splitext(path or "")[1].lower() in _BINARY_EXTENSIONS
+
+
+def _path_matches(path: str, patterns: List[str]) -> bool:
+    """Case-insensitive glob match; `*` also crosses `/`, so `*.cs` matches at any depth."""
+    path = (path or "").lstrip("/").lower()
+    return any(fnmatch(path, pattern.lstrip("/").lower()) for pattern in patterns)
+
+
+def _pr_file_matches(entry: dict, include_patterns, exclude_patterns, change_types) -> bool:
+    if include_patterns and not _path_matches(entry["path"], include_patterns):
+        return False
+    if exclude_patterns and _path_matches(entry["path"], exclude_patterns):
+        return False
+    if change_types:
+        # ADO joins combined changes, e.g. "edit, rename"
+        kinds = {kind.strip() for kind in (entry["change_type"] or "").split(",")}
+        if not kinds & {kind.lower() for kind in change_types}:
+            return False
+    return True
+
+
 class ArgsSchema(Enum):
     NoInput = create_model("NoInput")
     BranchName = create_model(
@@ -211,6 +247,63 @@ class ArgsSchema(Enum):
         pull_request_id=(
             str,
             Field(description="The PR number as a string, e.g. `12`"),
+        ),
+    )
+    ListPRFiles = create_model(
+        "ListPRFiles",
+        pull_request_id=(
+            str,
+            Field(description="The PR number as a string, e.g. `12`"),
+        ),
+        include_diff=(
+            bool,
+            Field(
+                default=True,
+                description=(
+                    "Set to false to get only the path and change type of each file, without downloading any content."
+                    " On a large PR, list the files first with false, then ask for the diffs of the files you need."
+                ),
+            ),
+        ),
+        include_patterns=(
+            Optional[List[str]],
+            Field(
+                default=None,
+                description=(
+                    "Keep only files whose path matches one of these glob patterns, e.g. `[\"*.cs\", \"src/api/**\"]`."
+                    " Case-insensitive; the leading `/` of the path is optional."
+                ),
+            ),
+        ),
+        exclude_patterns=(
+            Optional[List[str]],
+            Field(
+                default=None,
+                description=(
+                    "Drop files whose path matches one of these glob patterns, e.g. `[\"*.lock\", \"*.min.js\"]`."
+                    " An exclude wins over an include."
+                ),
+            ),
+        ),
+        change_types=(
+            Optional[List[Literal["add", "edit", "delete", "rename"]]],
+            Field(default=None, description="Keep only files with these change types. Empty means all."),
+        ),
+        max_files=(
+            int,
+            Field(default=50, ge=1, description="Return at most this many files, after filtering."),
+        ),
+        offset=(
+            int,
+            Field(
+                default=0,
+                ge=0,
+                description="Skip this many files, after filtering. When `has_more` is true, pass `offset + returned_files` to read the next page.",
+            ),
+        ),
+        max_diff_lines=(
+            int,
+            Field(default=500, ge=0, description="Cut each diff after this many lines. 0 means no limit."),
         ),
     )
     ListFilesModel = create_model(
@@ -1129,12 +1222,25 @@ class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
         return parsed
 
     @tool_group('read')
-    def list_pull_request_diffs(self, pull_request_id: str) -> str:
+    def list_pull_request_diffs(
+        self,
+        pull_request_id: str,
+        include_diff: bool = True,
+        include_patterns: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        change_types: Optional[List[str]] = None,
+        max_files: int = 50,
+        offset: int = 0,
+        max_diff_lines: int = 500,
+    ) -> str:
         """
-        Fetches the files and their diffs included in a pull request.
+        Lists the files changed in a pull request, optionally with their diffs.
 
-        Returns:
-            str: A list of files and diffs included in the pull request.
+        Returns a JSON object: `files` (path, change_type, original_path for renames, diff), the counts
+        `total_files` / `matched_files` / `returned_files`, `has_more`, and `errors` for files that could not be read.
+        Filters (include/exclude glob patterns, change types) and paging (`offset`, `max_files`, 50 by default)
+        are applied before any content is downloaded. Each diff is cut at `max_diff_lines` (500 by default).
+        On a large PR, call it first with `include_diff: false` to see the paths, then ask for the diffs you need.
         """
         try:
             pull_request_id = int(pull_request_id)
@@ -1150,50 +1256,97 @@ class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
                 pull_request_id=pull_request_id,
             )
             last_iteration_id = pr_iterations[-1].id
-
-            changes = self._client.get_pull_request_iteration_changes(
-                repository_id=self.repository_id,
-                project=self._project(),
-                pull_request_id=pull_request_id,
-                iteration_id=last_iteration_id,
-            )
+            change_entries = self._pull_request_change_entries(pull_request_id, last_iteration_id)
         except Exception as e:
             msg = f"Error during attempt to get Pull Request iterations and changes.\nError: {str(e)}"
             logger.error(msg)
             raise ToolException(msg)
 
-        data = []
         source_commit_id = pr_iterations[-1].source_ref_commit.commit_id
         target_commit_id = pr_iterations[-1].target_ref_commit.commit_id
 
-        for change in changes.change_entries:
-            path = change.additional_properties["item"]["path"]
-            change_type = change.additional_properties["changeType"]
+        all_files = []
+        for change in change_entries:
+            item = change.additional_properties.get("item") or {}
+            if item.get("isFolder"):
+                continue
+            entry = {"path": item.get("path"), "change_type": change.additional_properties.get("changeType")}
+            original_path = change.additional_properties.get("originalPath")
+            if original_path:
+                entry["original_path"] = original_path
+            all_files.append(entry)
 
-            # it should reflects VersionControlChangeType enum,
-            # but the model is not accessible in azure.devops.v7_0.git.models
-            if change_type == "edit":
+        matched = [
+            entry for entry in all_files
+            if _pr_file_matches(entry, include_patterns, exclude_patterns, change_types)
+        ]
+        page = matched[offset:offset + max_files]
+
+        files, errors = [], []
+        for entry in page:
+            if include_diff:
                 try:
-                    base_content = self.get_file_content(target_commit_id, path)
+                    entry.update(self._pull_request_file_diff(entry, target_commit_id, source_commit_id, max_diff_lines))
                 except ToolException as e:
-                    msg = f"Failed to process base file content for path: {path}: {str(e)}"
-                    logger.error(msg)
-                    return msg
+                    logger.error(f"Failed to get the diff of {entry['path']}: {e}")
+                    errors.append({"path": entry["path"], "error": str(e)})
+                    continue
+            files.append(entry)
 
-                try:
-                    target_content = self.get_file_content(source_commit_id, path)
-                except ToolException as e:
-                    msg = f"Failed to process target file content for path: {path}: {str(e)}"
-                    logger.error(msg)
-                    return msg
+        return dumps({
+            "pull_request_id": pull_request_id,
+            "total_files": len(all_files),
+            "matched_files": len(matched),
+            "returned_files": len(files),
+            "offset": offset,
+            "has_more": offset + len(page) < len(matched),
+            "files": files,
+            "errors": errors,
+        })
 
-                diff = generate_diff(base_content, target_content, path)
-            else:
-                diff = f"Change Type: {change_type}"
+    def _pull_request_change_entries(self, pull_request_id: int, iteration_id: int) -> list:
+        """All change entries of a PR iteration; the API returns at most 2000 per call."""
+        entries, skip = [], 0
+        while True:
+            changes = self._client.get_pull_request_iteration_changes(
+                repository_id=self.repository_id,
+                project=self._project(),
+                pull_request_id=pull_request_id,
+                iteration_id=iteration_id,
+                top=_PR_CHANGES_PAGE,
+                skip=skip,
+            )
+            entries.extend(changes.change_entries or [])
+            if not changes.next_skip or changes.next_skip <= skip:
+                return entries
+            skip = changes.next_skip
 
-            data.append({"path": path, "diff": diff})
+    def _pull_request_file_diff(self, entry: dict, target_commit_id: str, source_commit_id: str, max_diff_lines: int) -> dict:
+        path, change_type = entry["path"], entry["change_type"]
+        # it should reflects VersionControlChangeType enum,
+        # but the model is not accessible in azure.devops.v7_0.git.models
+        if change_type != "edit":
+            return {"diff": f"Change Type: {change_type}"}
+        if _is_binary_path(path):
+            return {"diff": _BINARY_DIFF}
 
-        return dumps(data)
+        try:
+            base_content = self.get_file_content(target_commit_id, path)
+        except ToolException as e:
+            raise ToolException(f"Failed to process base file content: {e}")
+        try:
+            target_content = self.get_file_content(source_commit_id, path)
+        except ToolException as e:
+            raise ToolException(f"Failed to process target file content: {e}")
+        if "\x00" in base_content[:8192] or "\x00" in target_content[:8192]:
+            return {"diff": _BINARY_DIFF}
+
+        diff_lines = generate_diff(base_content, target_content, path).splitlines(keepends=True)
+        if max_diff_lines and len(diff_lines) > max_diff_lines:
+            cut = len(diff_lines) - max_diff_lines
+            diff = "".join(diff_lines[:max_diff_lines]) + f"... diff truncated ({cut:,} more lines)"
+            return {"diff": diff, "diff_truncated": True}
+        return {"diff": "".join(diff_lines), "diff_truncated": False}
 
     def download_file(self, path: str, branch: str = None):
         branch = branch or self.active_branch or self.base_branch
@@ -2125,7 +2278,7 @@ class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
                 "ref": self.list_pull_request_diffs,
                 "name": "list_pull_request_files",
                 "description": self.list_pull_request_diffs.__doc__,
-                "args_schema": self._with_repo(ArgsSchema.GetPR.value),
+                "args_schema": self._with_repo(ArgsSchema.ListPRFiles.value),
             },
             {
                 "ref": self.create_branch,
