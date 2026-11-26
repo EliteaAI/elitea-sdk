@@ -162,6 +162,8 @@ DeletePageByPathInput = create_model(
     "DeletePageByPathInput",
     wiki_identified=(Optional[str], Field(default=None, description="Wiki ID or wiki name. If not provided, uses the default wiki identifier from toolkit configuration.")),
     page_name=(str, Field(description="Wiki page path")),
+    version_identifier=(Optional[str], Field(default=None, description="Branch, tag or commit the page is deleted on. Leave empty to use the branch the wiki is published from ('wikiMaster' for project wikis, the published branch for code wikis).")),
+    version_type=(Optional[Literal["branch", "tag", "commit"]], Field(description="Version type (branch, tag, or commit). Determines how version_identifier is interpreted", default="branch")),
 )
 
 DeletePageByIdInput = create_model(
@@ -778,15 +780,33 @@ class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
         )
 
     @tool_group('delete')
-    def delete_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None):
-        """Delete ADO wiki page by path."""
+    def delete_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None,
+                            version_identifier: Optional[str] = None, version_type: Optional[str] = "branch"):
+        """Delete ADO wiki page by path.
+
+        Code wikis are backed by an ordinary Git branch, and ADO only deletes their pages by path
+        when the branch is given. Without an explicit `version_identifier` the branch the wiki is
+        published from is used (`wikiMaster` for project wikis).
+        """
+        wiki_id = None
+        version = version_identifier
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            self._client.delete_page(project=self._project(), wiki_identifier=wiki_id, path=page_name)
+            if not version:
+                wiki = self._client.get_wiki(project=self._project(), wiki_identifier=wiki_id)
+                version = _wiki_branch(wiki)
+                version_type = "branch"
+            self._client.delete_page(
+                project=self._project(),
+                wiki_identifier=wiki_id,
+                path=page_name,
+                version_descriptor=GitVersionDescriptor(version=version, version_type=version_type or "branch"),
+            )
             return f"Page '{page_name}' in wiki '{wiki_id}' has been deleted"
         except Exception as e:
-            logger.error(f"Unable to delete wiki page: {str(e)}")
-            raise ToolException(f"Unable to delete wiki page: {str(e)}")
+            on_version = f" (on {version_type or 'branch'} '{version}')" if version else ""
+            logger.error(f"Unable to delete wiki page '{page_name}'{on_version}: {str(e)}")
+            raise ToolException(f"Unable to delete wiki page '{page_name}'{on_version}: {str(e)}")
 
     @tool_group('delete')
     def delete_page_by_id(self, wiki_identified: Optional[str] = None, page_id: int = None):
