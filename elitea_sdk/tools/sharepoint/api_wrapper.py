@@ -131,6 +131,15 @@ GetFiles = create_model(
                     "'png', '.jpg', '*.tmp', or 'testdata.csv'; matched case-insensitively. "
                     "Example: ['png', '*.jpg'] or ['testdata.csv'].",
         default=None)),
+    library_lists=(Optional[List[str]], Field(
+        description="Names of the library lists (usually the document libraries) whose list "
+                    "columns are added to each returned file, e.g. ['Shared Documents']. "
+                    "Use together with metadata_fields. Without it, files carry no list columns.",
+        default=None)),
+    metadata_fields=(Optional[List[str]], Field(
+        description="Optional field mapping, as for index_data, e.g. `[\"_Category=category\"]`. "
+                    "Only used when library_lists is set.",
+        default=[])),
 )
 
 ReadDocument = create_model(
@@ -667,7 +676,9 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
                        on_file_skipped: Callable[[str], None] | None = None,
-                       on_listing_gap: Callable[[str], None] | None = None):
+                       on_listing_gap: Callable[[str], None] | None = None,
+                       library_lists: Optional[List[str]] = None,
+                       metadata_fields: Optional[List[str]] = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder path; otherwise lists
@@ -680,14 +691,34 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         If skip_extensions is specified, matching files are excluded. Patterns
         accept forms like 'pdf', '.pdf', '*.pdf', or 'report.pdf' and are matched
         case-insensitively.
+
+        If library_lists is specified (names of library lists, usually the document
+        libraries), each file also gets the columns of its list item (for example
+        category, metadata_status, library_list), read once for the whole listing.
+        metadata_fields maps columns the same way as for index_data, e.g.
+        `["_Category=category"]` stores the _Category column as category. The
+        extension filters run first; files with no list item are still returned.
         Note:
             * URL anatomy: https://epam.sharepoint.com/sites/{some_site}/{form_name}/Forms/AllItems.aspx
             * Example of folders syntax: `{form_name} / Hello / inner-folder` - 1st folder is commonly form_name
         """
         self._sync_backend_context()
-        return self._backend.get_files_list(
+        # Validate and read the lists before the listing so a bad setting fails fast.
+        library = self._library_join_context(library_lists, metadata_fields)
+        files = self._backend.get_files_list(
             folder_name, limit_files, form_name, include_extensions, skip_extensions,
             on_file_skipped=on_file_skipped, on_listing_gap=on_listing_gap)
+        if library is None:
+            return files
+        settings, index, counts = library
+        # Copy each row: the backend's own dicts stay untouched.
+        joined = []
+        for file in files:
+            row = dict(file)
+            apply_library_metadata(row, index, settings, counts)
+            joined.append(row)
+        logging.info("[SP-library] join: %s", counts.as_dict())
+        return joined
 
     @tool_group('read')
     def read_file(self, path: str,
