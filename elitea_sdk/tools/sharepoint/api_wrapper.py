@@ -1222,7 +1222,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 on_listing_gap=gaps.append)
             self._log_tool_event(
                 message="List of the files has been extracted", tool_name="loader")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - the three backends raise different errors; the caller needs one ToolException
             raise ToolException(f"Unable to extract files: {e}")
         if list_limit > limit_files and len(all_files) >= list_limit:
             raise LibraryMetadataError(
