@@ -214,10 +214,18 @@ def _is_binary_path(path: str) -> bool:
     return splitext(path or "")[1].lower() in _BINARY_EXTENSIONS
 
 
+def _change_kinds(change_type: Optional[str]) -> set:
+    # ADO joins combined changes, e.g. "edit, rename"
+    return {kind.strip() for kind in (change_type or "").lower().split(",")}
+
+
 def _path_matches(path: str, patterns: List[str]) -> bool:
-    """Case-insensitive glob match; `*` also crosses `/`, so `*.cs` matches at any depth."""
+    """Case-insensitive glob match; `*` also crosses `/`, so `*.cs` matches at any depth.
+
+    `[` is literal, so route folders like `src/pages/[id]/*` match as written.
+    """
     path = (path or "").lstrip("/").lower()
-    return any(fnmatch(path, pattern.lstrip("/").lower()) for pattern in patterns)
+    return any(fnmatch(path, pattern.lstrip("/").lower().replace("[", "[[]")) for pattern in patterns)
 
 
 def _pr_file_matches(entry: dict, include_patterns, exclude_patterns, change_types) -> bool:
@@ -226,9 +234,7 @@ def _pr_file_matches(entry: dict, include_patterns, exclude_patterns, change_typ
     if exclude_patterns and _path_matches(entry["path"], exclude_patterns):
         return False
     if change_types:
-        # ADO joins combined changes, e.g. "edit, rename"
-        kinds = {kind.strip() for kind in (entry["change_type"] or "").split(",")}
-        if not kinds & {kind.lower() for kind in change_types}:
+        if not _change_kinds(entry["change_type"]) & {kind.lower() for kind in change_types}:
             return False
     return True
 
@@ -271,7 +277,7 @@ class ArgsSchema(Enum):
                 default=None,
                 description=(
                     "Keep only files whose path matches one of these glob patterns, e.g. `[\"*.cs\", \"src/api/**\"]`."
-                    " Case-insensitive; the leading `/` of the path is optional."
+                    " Case-insensitive; the leading `/` of the path is optional; `[` and `]` match literally."
                 ),
             ),
         ),
@@ -298,7 +304,7 @@ class ArgsSchema(Enum):
             Field(
                 default=0,
                 ge=0,
-                description="Skip this many files, after filtering. When `has_more` is true, pass `offset + returned_files` to read the next page.",
+                description="Skip this many files, after filtering. When `has_more` is true, pass the returned `next_offset` to read the next page.",
             ),
         ),
         max_diff_lines=(
@@ -1237,7 +1243,8 @@ class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
         Lists the files changed in a pull request, optionally with their diffs.
 
         Returns a JSON object: `files` (path, change_type, original_path for renames, diff), the counts
-        `total_files` / `matched_files` / `returned_files`, `has_more`, and `errors` for files that could not be read.
+        `total_files` / `matched_files` / `returned_files`, `has_more` with the `next_offset` of the next page,
+        and `errors` for files that could not be read (they still count towards the page).
         Filters (include/exclude glob patterns, change types) and paging (`offset`, `max_files`, 50 by default)
         are applied before any content is downloaded. Each diff is cut at `max_diff_lines` (500 by default).
         On a large PR, call it first with `include_diff: false` to see the paths, then ask for the diffs you need.
@@ -1300,6 +1307,7 @@ class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
             "returned_files": len(files),
             "offset": offset,
             "has_more": offset + len(page) < len(matched),
+            "next_offset": offset + len(page) if offset + len(page) < len(matched) else None,
             "files": files,
             "errors": errors,
         })
@@ -1325,13 +1333,14 @@ class ReposApiWrapper(AdoProjectScope, CodeIndexerToolkit):
         path, change_type = entry["path"], entry["change_type"]
         # it should reflects VersionControlChangeType enum,
         # but the model is not accessible in azure.devops.v7_0.git.models
-        if change_type != "edit":
+        if "edit" not in _change_kinds(change_type):
             return {"diff": f"Change Type: {change_type}"}
         if _is_binary_path(path):
             return {"diff": _BINARY_DIFF}
 
         try:
-            base_content = self.get_file_content(target_commit_id, path)
+            # an "edit, rename" keeps its old content under the original path
+            base_content = self.get_file_content(target_commit_id, entry.get("original_path") or path)
         except ToolException as e:
             raise ToolException(f"Failed to process base file content: {e}")
         try:

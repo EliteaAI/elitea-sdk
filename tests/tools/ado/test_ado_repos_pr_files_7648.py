@@ -103,6 +103,38 @@ def test_max_files_and_offset_page_through_matches():  # AC-5
     assert last["has_more"] is False
 
 
+def test_next_offset_counts_files_that_failed_to_read():  # review: paging must not repeat or stall
+    changes = [_change(f"/f{i}.cs") for i in range(6)]
+    broken = {(TARGET, f"/f{i}.cs"): Exception("item not found") for i in (0, 1, 2)}
+    wrapper, _ = _wrapper(changes, broken)
+
+    first = _run(wrapper, max_files=3)
+    second = _run(wrapper, max_files=3, offset=first["next_offset"])
+
+    assert (first["returned_files"], len(first["errors"]), first["has_more"], first["next_offset"]) == (0, 3, True, 3)
+    assert [f["path"] for f in second["files"]] == ["/f3.cs", "/f4.cs", "/f5.cs"]
+    assert (second["has_more"], second["next_offset"]) == (False, None)
+
+
+def test_brackets_in_patterns_match_literally():  # review: Next.js route folders
+    changes = [_change("/src/pages/[id]/index.tsx"), _change("/src/pages/i/index.tsx")]
+    wrapper, _ = _wrapper(changes)
+
+    files = _run(wrapper, include_diff=False, include_patterns=["src/pages/[id]/*"])["files"]
+
+    assert [f["path"] for f in files] == ["/src/pages/[id]/index.tsx"]
+
+
+def test_edit_rename_is_diffed_against_its_original_path():  # review: "edit, rename" got no diff
+    changes = [_change("/new.py", "edit, rename", original_path="/old.py")]
+    wrapper, _ = _wrapper(changes, {(TARGET, "/old.py"): "x = 1\n", (SOURCE, "/new.py"): "x = 2\n"})
+
+    file = _run(wrapper, change_types=["edit"])["files"][0]
+
+    assert "-x = 1\n+x = 2\n" in file["diff"]
+    assert file["original_path"] == "/old.py"
+
+
 def test_changes_past_the_first_page_are_read():  # AC-6
     wrapper, client = _wrapper([_change(f"/f{i}.cs") for i in range(250)], page_size=100)
 
