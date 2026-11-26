@@ -13,6 +13,7 @@ import logging
 from unittest.mock import MagicMock
 
 import pytest
+from langchain_core.tools import ToolException
 
 from elitea_sdk.runtime.credential_slots import GovernedCredentialError
 from elitea_sdk.runtime.toolkits import tools as tools_mod
@@ -24,6 +25,13 @@ from elitea_sdk.runtime.utils.mcp_oauth import McpAuthorizationRequired
 
 class _BuildStop(Exception):
     """Raised by the fake client.application so a test can inspect the build without running it."""
+
+
+def _stopped_at_build(tool):
+    # _run reports a failed build as a readable ToolException; the stop marker is its cause
+    with pytest.raises(ToolException) as raised:
+        tool._run(task='go')
+    assert isinstance(raised.value.__cause__, _BuildStop)
 
 
 def _app_tool_cfg(app_id, ver_id):
@@ -98,8 +106,7 @@ def test_each_call_builds_once_with_the_load_path_restored():
     tool.load_path = frozenset({(1, 10), (2, 20)})
 
     for _ in range(2):
-        with pytest.raises(_BuildStop):
-            tool._run(task='do it')
+        _stopped_at_build(tool)
 
     assert client.builds == [((2, 20), frozenset({(1, 10), (2, 20)}))] * 2
     assert tools_mod._APP_LOAD_STACK.get() == frozenset()
@@ -119,11 +126,9 @@ def test_cycle_across_lazy_builds_is_still_cut(caplog):
 
     with caplog.at_level(logging.WARNING):
         [tool_a] = get_tools([_app_tool_cfg(1, 10)], elitea_client=client, llm=MagicMock())
-        with pytest.raises(_BuildStop):
-            tool_a._run(task='go')
+        _stopped_at_build(tool_a)
         [tool_b] = loaded_tools_per_build[(1, 10)]
-        with pytest.raises(_BuildStop):
-            tool_b._run(task='go')
+        _stopped_at_build(tool_b)
 
     assert loaded_tools_per_build[(2, 20)] == []
     assert [r for r in caplog.records if 'Circular application reference' in r.message]

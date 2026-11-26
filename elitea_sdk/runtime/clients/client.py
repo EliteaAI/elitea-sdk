@@ -1,3 +1,4 @@
+import functools
 import logging
 import traceback
 from copy import deepcopy
@@ -144,6 +145,26 @@ SCHEDULE_SORT_BY = frozenset({'name', 'entity_name', 'entity_type', 'next_run', 
 SCHEDULE_SORT_ORDER = frozenset({'asc', 'desc'})
 SCHEDULE_ENTITY_TYPES = frozenset({'agent', 'pipeline', 'toolkit_index'})
 SCHEDULE_TRIGGERS = ('manual', 'test')
+
+
+def _on_app_load_path(build):
+    # The agent being built joins the load path, so a sub-agent cycle back to it (root included) is cut
+    @functools.wraps(build)
+    def wrapper(self, application_id, application_version_id, *args, **kwargs):
+        from ..toolkits.tools import _APP_LOAD_STACK
+        try:
+            key = (int(application_id), int(application_version_id))
+        except (TypeError, ValueError):
+            return build(self, application_id, application_version_id, *args, **kwargs)
+        stack = _APP_LOAD_STACK.get()
+        if key in stack:
+            return build(self, application_id, application_version_id, *args, **kwargs)
+        token = _APP_LOAD_STACK.set(stack | {key})
+        try:
+            return build(self, application_id, application_version_id, *args, **kwargs)
+        finally:
+            _APP_LOAD_STACK.reset(token)
+    return wrapper
 
 
 class EliteAClient:
@@ -1619,6 +1640,7 @@ class EliteAClient:
         except Exception as e:
             logger.warning(f"Failed to auto-inject ToolExceptionHandlerMiddleware: {e}")
 
+    @_on_app_load_path
     def application(self, application_id: int, application_version_id: int,
                     tools: Optional[list] = None, chat_history: Optional[List[Any]] = None,
                     app_type=None, memory=None, runtime='langchain',

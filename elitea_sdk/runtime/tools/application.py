@@ -377,6 +377,33 @@ class Application(BaseTool):
 
         return result
 
+    def _build_child(self, runnable_args: dict, application_variables: dict):
+        from langgraph.errors import GraphBubbleUp
+        from ..credential_slots import GovernedCredentialError
+        from ..exceptions import InputGuardrailBlocked, budget_exceeded_from
+        from ..toolkits.tools import _APP_LOAD_STACK
+        from ..utils.mcp_oauth import McpAuthorizationRequired
+        stack_token = _APP_LOAD_STACK.set(self.load_path)
+        try:
+            return self.client.application(**runnable_args, application_variables=application_variables)
+        except GovernedCredentialError as refused:
+            # Same contract as a load-time refusal (#7229): name the innermost sub-agent refused
+            if refused.subagent:
+                raise
+            raise GovernedCredentialError(refused.reason_code, self._display_name()) from refused
+        except (McpAuthorizationRequired, GraphBubbleUp, InputGuardrailBlocked):
+            raise
+        except Exception as exc:
+            if budget_exceeded_from(exc) is not None:
+                raise
+            logger.error("Sub-agent '%s' could not be loaded: %s", self._display_name(), exc)
+            raise ToolException(f"Sub-agent '{self._display_name()}' could not be loaded: {exc}") from exc
+        finally:
+            _APP_LOAD_STACK.reset(stack_token)
+
+    def _display_name(self) -> str:
+        return (self.metadata or {}).get('original_name') or self.name
+
     def _run(self, *args, config: RunnableConfig = None, **kwargs):
         # `config` is injected by BaseTool.run() because of the RunnableConfig type annotation
         # (via _get_runnable_config_param). It carries the parent's metadata (toolkit_name,
@@ -486,14 +513,7 @@ class Application(BaseTool):
                 # child rebuild; mutating self.args_runnable would leak one
                 # sibling's invocation state into concurrent calls.
                 runnable_args['mcp_tokens'] = _live_mcp_tokens
-            from ..toolkits.tools import _APP_LOAD_STACK
-            stack_token = _APP_LOAD_STACK.set(self.load_path)
-            try:
-                application_runnable = self.client.application(
-                    **runnable_args, application_variables=application_variables,
-                )
-            finally:
-                _APP_LOAD_STACK.reset(stack_token)
+            application_runnable = self._build_child(runnable_args, application_variables)
         if application_runnable is None:
             raise ToolException(f"Sub-agent '{self.name}' has no runnable configuration")
         # Capture parent's pending intermediate messages BEFORE invoking the
