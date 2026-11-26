@@ -131,12 +131,12 @@ GetFiles = create_model(
                     "'png', '.jpg', '*.tmp', or 'testdata.csv'; matched case-insensitively. "
                     "Example: ['png', '*.jpg'] or ['testdata.csv'].",
         default=None)),
-    library_lists=(Optional[List[str]], Field(
+    library_lists=(list[str] | None, Field(
         description="Names of the library lists (usually the document libraries) whose list "
                     "columns are added to each returned file, e.g. ['Shared Documents']. "
                     "Use together with metadata_fields. Without it, files carry no list columns.",
         default=None)),
-    metadata_fields=(Optional[List[str]], Field(
+    metadata_fields=(list[str] | None, Field(
         description="Optional field mapping, as for index_data, e.g. `[\"_Category=category\"]`. "
                     "Only used when library_lists is set.",
         default=[])),
@@ -677,8 +677,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                        skip_extensions: Optional[List[str]] = None,
                        on_file_skipped: Callable[[str], None] | None = None,
                        on_listing_gap: Callable[[str], None] | None = None,
-                       library_lists: Optional[List[str]] = None,
-                       metadata_fields: Optional[List[str]] = None):
+                       library_lists: list[str] | None = None,
+                       metadata_fields: list[str] | None = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder path; otherwise lists
@@ -717,7 +717,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
             row = dict(file)
             apply_library_metadata(row, index, settings, counts)
             joined.append(row)
-        logging.info("[SP-library] join: %s", counts.as_dict())
+        logging.getLogger(__name__).info("[SP-library] join: %s", counts.as_dict())
         return joined
 
     @tool_group('read')
