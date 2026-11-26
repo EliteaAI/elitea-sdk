@@ -66,6 +66,7 @@ class BaseSharepointWrapper(ABC):
         include_extensions: Optional[List[str]] = None,
         skip_extensions: Optional[List[str]] = None,
         on_file_skipped: Optional[Callable[[str], None]] = None,
+        on_listing_gap: Callable[[str], None] | None = None,
     ):
         """Return a list of file metadata dicts from document libraries,
         including files from subfolders.
@@ -83,6 +84,9 @@ class BaseSharepointWrapper(ABC):
                 format as *include_extensions*.
             on_file_skipped: Called with the name of every file excluded by the
                 filters, so indexing can report what it left out.
+            on_listing_gap: Called with a short reason each time part of the
+                source may be missing from the result (a limit, a page or a
+                library that could not be read, a switch to another listing path).
 
         Returns:
             list[dict] on success, :class:`ToolException` on failure.

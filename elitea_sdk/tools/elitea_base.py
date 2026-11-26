@@ -25,7 +25,7 @@ from ..runtime.utils.utils import IndexerKeywords
 logger = logging.getLogger(__name__)
 
 INDEX_TOOL_NAMES = ['index_data', 'remove_index', 'list_indexes', 'search_index', 'stepback_search_index',
-                            'stepback_summary_index']
+                            'stepback_summary_index', 'check_for_changes']
 
 LoaderSchema = create_model(
     "LoaderSchema",

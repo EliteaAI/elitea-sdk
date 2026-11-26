@@ -22,6 +22,7 @@ Safety properties, each covered by a test:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -33,6 +34,15 @@ from urllib.parse import quote, unquote, urlsplit
 import requests
 from langchain_core.tools import ToolException
 
+from .graph_retry import (  # re-exported: the tests and the library loader read the limits from here
+    BACKOFF_BASE_SECONDS,
+    MAX_RETRIES,
+    MAX_RETRY_AFTER_SECONDS,
+    send_with_retry,
+)
+from .graph_retry import (
+    TRANSIENT_ERRORS as _TRANSIENT_ERRORS,
+)
 from .graph_wrapper import _is_graph_url as is_graph_url
 
 logger = logging.getLogger(__name__)
@@ -60,11 +70,6 @@ MAX_VALUE_CHARS = 1_000
 MAX_LIST_VALUE_ENTRIES = 50
 MAX_CATALOGUE_LISTS = 2_000
 REQUEST_TIMEOUT = (10, 60)          # connect, read (seconds)
-MAX_RETRIES = 4
-BACKOFF_BASE_SECONDS = 1.0
-MAX_RETRY_AFTER_SECONDS = 60.0
-RETRYABLE_STATUS = frozenset({429, 503, 504})
-_TRANSIENT_ERRORS = (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError)
 
 # Status values written to every file's metadata in library mode.
 STATUS_OK = "ok"
@@ -74,7 +79,7 @@ STATUS_AMBIGUOUS = "ambiguous"
 # Keys the toolkit owns in document metadata; a list field never overwrites them.
 RESERVED_KEYS = frozenset({
     "id", "updated_on", "created_on", "name", "path", "created", "modified", "link", "source",
-    "metadata_status", "metadata_match", "library_list", "library_item_id", "web_url", "file_name",
+    "metadata_status", "metadata_match", "library_list", "library_item_id", "library_digest", "web_url", "file_name",
     "chunk_id", "chunk_type", "method_name", "collection", "type", "page", "page_number",
     # keys the indexer itself reads from document metadata (grouping, deletion, content routing)
     "parent_id", "dependent_docs", "loader_content", "loader_content_type", "filename", "file_path",
@@ -312,16 +317,6 @@ def _segment(value: str) -> str:
     return quote(str(value), safe="")
 
 
-def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
-    header = (resp.headers or {}).get("Retry-After")
-    if header:
-        try:
-            return min(max(float(header), 0.0), MAX_RETRY_AFTER_SECONDS)
-        except ValueError:
-            pass
-    return min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS)
-
-
 class GraphListClient:
     """Read-only Graph calls for library mode: site, list catalogue, list items.
 
@@ -363,40 +358,31 @@ class GraphListClient:
         if not is_graph_url(url):
             raise LibraryMetadataError("Library mode only calls Microsoft Graph.")
         refreshed = False
-        attempt = 0
+        body_attempt = 0
         while True:
             try:
-                resp = self._session.get(
-                    url, params=params, timeout=REQUEST_TIMEOUT, allow_redirects=False, stream=True,
-                    headers={"Authorization": f"Bearer {self._get_token()}", "Accept": "application/json"})
+                resp = send_with_retry(
+                    lambda: self._session.get(
+                        url, params=params, timeout=REQUEST_TIMEOUT, allow_redirects=False, stream=True,
+                        headers={"Authorization": f"Bearer {self._get_token()}", "Accept": "application/json"}),
+                    self._sleep)
             except _TRANSIENT_ERRORS as exc:
-                if attempt >= MAX_RETRIES:
-                    raise LibraryMetadataError(
-                        f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
-                self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
-                attempt += 1
-                continue
+                raise LibraryMetadataError(
+                    f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
             try:
                 status = resp.status_code
                 if status == 401 and not refreshed and self._refresh and self._refresh():
                     refreshed = True
                     continue
-                if status in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                    delay = _retry_after_seconds(resp, attempt)
-                    logger.info("[SP-library] Graph answered %s; retrying in %.1fs (attempt %d)",
-                                status, delay, attempt + 1)
-                    self._sleep(delay)
-                    attempt += 1
-                    continue
                 self._raise_for_status(resp)
                 try:
                     body = self._read_body(resp)
                 except _TRANSIENT_ERRORS as exc:
-                    if attempt >= MAX_RETRIES:
+                    if body_attempt >= MAX_RETRIES:
                         raise LibraryMetadataError(
                             f"SharePoint did not answer after {MAX_RETRIES + 1} attempts ({type(exc).__name__}).")
-                    self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** attempt), MAX_RETRY_AFTER_SECONDS))
-                    attempt += 1
+                    self._sleep(min(BACKOFF_BASE_SECONDS * (2 ** body_attempt), MAX_RETRY_AFTER_SECONDS))
+                    body_attempt += 1
                     continue
                 try:
                     return json.loads(body or b"{}")
@@ -626,7 +612,22 @@ def _categories_of(metadata: Dict[str, Any]) -> List[str]:
 
 def apply_library_metadata(file_meta: Dict[str, Any], index: LibraryIndex, settings: LibrarySettings,
                            counts: JoinCounts) -> bool:
-    """Merge list fields into ``file_meta`` in place; False when the categories filter drops the file."""
+    """Merge list fields into ``file_meta`` in place; False when the categories filter drops the file.
+
+    A kept file also gets ``library_digest``, a hash of everything the join added. A change check
+    compares it, because an edit of a list field leaves the file's own modified time alone.
+    """
+    before = set(file_meta)
+    kept = _join_library_metadata(file_meta, index, settings, counts)
+    if kept:
+        added = {key: file_meta[key] for key in sorted(set(file_meta) - before)}
+        file_meta["library_digest"] = hashlib.sha256(
+            json.dumps(added, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+    return kept
+
+
+def _join_library_metadata(file_meta: dict[str, Any], index: LibraryIndex, settings: LibrarySettings,
+                           counts: JoinCounts) -> bool:
     entry, how = index.match(file_meta)
     file_meta["web_url"] = file_meta.get("Link") or file_meta.get("web_url") or ""
     file_meta["file_name"] = file_meta.get("Name") or file_meta.get("file_name") or ""
