@@ -6,6 +6,7 @@ Before the fix the loader was built with file_path=None and every read failed wi
 
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -66,3 +67,54 @@ def test_metadata_line_count_matches_read_content(file_name, content):
     meta = get_file_metadata(file_name, file_content=content, file_size=len(content))
 
     assert meta["total_lines"] == len(text.splitlines())
+
+
+def test_str_content_is_read_as_utf8():
+    assert parse_file_content(file_name="page.html", file_content=HTML.decode()) == "Title\n\nHello & bye"
+    assert parse_file_content(file_name="blank.html", file_content="  ") == ""
+
+
+def test_failed_temp_write_leaves_no_file(monkeypatch, tmp_path):
+    class FullDisk:
+        def __init__(self, fd, mode):
+            os.close(fd)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, data):
+            raise OSError("No space left on device")
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(os, "fdopen", FullDisk)
+
+    with pytest.raises(OSError, match="No space left"):
+        EliteAHTMLLoader(file_content=HTML, file_name="page.html").load()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_overlapping_loads_on_one_instance_use_their_own_temp_file(monkeypatch):
+    import threading
+    import unstructured.partition.html as html_partition
+
+    real_partition, both_inside, seen = html_partition.partition_html, threading.Barrier(2, timeout=5), []
+
+    def partition_html(filename=None, **kwargs):
+        seen.append((filename, loader.file_path))
+        both_inside.wait()  # both loads are inside partition at the same time
+        return real_partition(filename=filename, **kwargs)
+
+    monkeypatch.setattr(html_partition, "partition_html", partition_html)
+    loader = EliteAHTMLLoader(file_content=HTML, file_name="page.html")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        texts = list(pool.map(lambda _: loader.load()[0].page_content, range(2)))
+
+    assert texts == ["Title\n\nHello & bye"] * 2
+    paths = [path for path, _ in seen]
+    assert len(set(paths)) == 2 and None not in paths
+    assert [shared for _, shared in seen] == [None, None]  # no load writes its temp path to the shared instance
+    assert not any(os.path.exists(path) for path in paths)

@@ -16,6 +16,8 @@ class _BytesInputMixin:
     _default_suffix = ""
 
     def __init__(self, file_path=None, file_content=None, file_name=None, mode: str = "single", **unstructured_kwargs):
+        if isinstance(file_content, str):
+            file_content = file_content.encode("utf-8")
         self._file_content = file_content
         self._file_name = file_name
         self._from_path = bool(file_path)
@@ -25,24 +27,27 @@ class _BytesInputMixin:
 
     @contextmanager
     def _materialized(self):
-        if self.file_path or self._file_content is None:
-            yield
+        """Yields the path to partition: the given file, or a temp copy of the bytes owned by this load only."""
+        if self._from_path or self._file_content is None:
+            yield self.file_path
             return
         suffix = os.path.splitext(self._file_name or "")[1] or self._default_suffix
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(self._file_content)
-        self.file_path = tmp.name
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
         try:
-            yield
+            with os.fdopen(fd, "wb") as tmp:
+                tmp.write(self._file_content)
+            yield tmp_path
         finally:
-            self.file_path = None
-            os.unlink(tmp.name)
+            os.unlink(tmp_path)
+
+    def _get_elements(self):
+        with self._materialized() as path:
+            return self._partition(path)
 
     def lazy_load(self):
         if not self._from_path and self._file_content is not None and not bytes(self._file_content).strip():
             return  # Unstructured raises on an empty document; an empty file has no text
-        with self._materialized():
-            yield from super().lazy_load()
+        yield from super().lazy_load()
 
     def _get_metadata(self) -> dict:
         if not self._from_path and self._file_content is not None:
@@ -60,6 +65,11 @@ class EliteAHTMLLoader(_BytesInputMixin, UnstructuredHTMLLoader):
 
     _default_suffix = ".html"
 
+    def _partition(self, path: str):
+        from unstructured.partition.html import partition_html
+
+        return partition_html(filename=path, **self.unstructured_kwargs)
+
     def get_content(self) -> str:
         return "\n".join(doc.page_content for doc in self.load())
 
@@ -74,6 +84,11 @@ class EliteAXMLLoader(_BytesInputMixin, UnstructuredXMLLoader):
     """Thin wrapper for XML files — same pattern as EliteAHTMLLoader (PRE-9 #5440)."""
 
     _default_suffix = ".xml"
+
+    def _partition(self, path: str):
+        from unstructured.partition.xml import partition_xml
+
+        return partition_xml(filename=path, **self.unstructured_kwargs)
 
     def get_content(self) -> str:
         return "\n".join(doc.page_content for doc in self.load())
