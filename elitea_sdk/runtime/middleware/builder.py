@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 BUILDER_CHANGESET_GUARDRAIL = "builder_changeset"
 APPLY_ACTION = "apply"
 CANCEL_ACTION = "cancel"
+# builder_ref returns pipeline reference pages as {page_key: text} under this key (elitea_core, #6388)
+REFERENCE_PAGES_KEY = "reference_pages"
 _ACTION_RE = re.compile(r"(?:^|_)builder_(find|read|propose|apply|ref|reference)(?:_|$)")
 _NON_INTERACTIVE = ("The user is not available to confirm in this non-interactive run, so nothing was changed. "
                     "Tell the user the change needs their confirmation in an interactive chat.")
@@ -118,24 +120,38 @@ class BuilderMiddleware(Middleware):
         return self.core_prompt
 
     def transform_messages_for_model(self, messages: list, config: dict) -> Optional[list]:
-        """The platform attaches the entity playbook to every find / read. Keep it only in its first result in the
-        conversation, so the model reads each playbook once however often the middleware is rebuilt."""
+        """The platform attaches the entity playbook to every find / read, and builder_ref returns pipeline
+        reference pages one entry per page (#6388). Keep each playbook and each page only in its first result in the
+        conversation, so the model reads it once however often the middleware is rebuilt or the page is asked for."""
         seen = set()
+        seen_pages = set()
         transformed = []
         changed = False
         for message in messages or []:
             parsed = None
             if isinstance(message, ToolMessage) and builder_action(getattr(message, "name", "")):
                 parsed = _parse(message.content)
-            playbook = parsed.get("playbook") if parsed else None
-            if playbook and playbook in seen:
-                stripped = {k: v for k, v in parsed.items() if k != "playbook"}
-                transformed.append(message.model_copy(update={"content": json.dumps(stripped)}))
-                changed = True
+            if not parsed:
+                transformed.append(message)
                 continue
-            if playbook:
+            update = dict(parsed)
+            playbook = parsed.get("playbook")
+            if playbook and playbook in seen:
+                update.pop("playbook")
+            elif playbook:
                 seen.add(playbook)
-            transformed.append(message)
+            pages = parsed.get(REFERENCE_PAGES_KEY)
+            if isinstance(pages, dict):
+                repeated = [key for key in pages if key in seen_pages]
+                seen_pages.update(pages)
+                if repeated:
+                    update[REFERENCE_PAGES_KEY] = {k: v for k, v in pages.items() if k not in repeated}
+                    update["already_loaded"] = repeated
+            if update != parsed:
+                transformed.append(message.model_copy(update={"content": json.dumps(update)}))
+                changed = True
+            else:
+                transformed.append(message)
         return transformed if changed else None
 
     def bind_tools(self, tools: List[BaseTool]) -> None:
