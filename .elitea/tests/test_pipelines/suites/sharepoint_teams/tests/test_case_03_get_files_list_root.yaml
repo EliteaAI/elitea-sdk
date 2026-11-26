@@ -78,12 +78,15 @@ nodes:
           Folder: root (empty string)
           Limit: {limit_files}
           Results: {files_result}
+          The pipeline passes a native list of objects. Its interpolation above uses
+          Python's representation (single quotes), not JSON serialization. Judge
+          the list structure and content, not the quotation marks in this display.
           Expected fields: {expected_fields}
           Error indicators: {error_indicators}
 
           STRICT VALIDATION RULES (all must pass):
           1. Tool executed successfully without errors
-          2. Result is a valid JSON array (not null, not empty string)
+          2. Result is a list/array of objects (not null, not empty string, not an error message)
           3. No error indicators present in the result
           4. Array is NOT EMPTY - must contain at least 1 file or folder
              (test data: DO_NOT_DELETE_TeamsTestFiles folder should be visible)
