@@ -65,17 +65,17 @@ def test_prefetched_hit_skips_both_round_trips():
 
     assert client.http_calls == []
     assert tool.name == 'PrefetchedChild'  # sanitized from the prefetched name, not 'fetched-name'
-    assert client.application_calls[0]['instructions'] == 'prefetched instructions'
+    assert tool.args_runnable['version_details']['instructions'] == 'prefetched instructions'
 
 
 def test_miss_falls_back_to_get_and_patch():
     # Prefetched data exists, but for a different version — must not be used.
     client = _RecordingClient({'11:99': {'name': 'x', 'description': '', 'version_details': _version_details()}})
 
-    _build(client)
+    tool = _build(client)
 
     assert client.http_calls == [('GET application', 11), ('PATCH version', 11, 22)]
-    assert client.application_calls[0]['instructions'] == 'fetched instructions'
+    assert tool.args_runnable['version_details']['instructions'] == 'fetched instructions'
 
 
 def test_client_without_prefetch_support_uses_http():
@@ -93,11 +93,11 @@ def test_prefetched_entry_is_not_mutated_across_builds():
     entry_details['tools'] = [{'type': 'mcp', 'name': 'm', 'settings': {'url': 'u'}}]
     client = _RecordingClient({'11:22': {'name': 'n', 'description': '', 'version_details': entry_details}})
 
-    _build(client)
-    client.application_calls[0]['instructions'] = 'mutated by first build'
-    _build(client)
+    first = _build(client)
+    first.args_runnable['version_details']['instructions'] = 'mutated by first build'
+    second = _build(client)
 
-    assert client.application_calls[1]['instructions'] == 'prefetched instructions'
+    assert second.args_runnable['version_details']['instructions'] == 'prefetched instructions'
     assert client.prefetched_version_details['11:22']['version_details']['instructions'] == 'prefetched instructions'
 
 

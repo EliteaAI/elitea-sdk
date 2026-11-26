@@ -47,6 +47,7 @@ from ..context_floor import (
     shrink_after_overflow,
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
+from ..credential_slots import GovernedCredentialError
 from ..utils.internal_run_auth import run_token_refusal
 from ..tool_outcome import (
     RUN_FAILURE_NOTICE_KEY,
@@ -3582,6 +3583,15 @@ class LLMNode(BaseTool):
         route = f"{container_call_id}\x1f{leaf_call_id}"
         return f"hitl_{uuid5(NAMESPACE_URL, route).hex}"
 
+    def _parallel_mcp_auth_pause(self, exc, spec, config) -> 'ToolMessage':
+        tool_name, tool_args, tool_call_id, tool = spec
+        auth_interrupt = self._build_mcp_auth_interrupt(exc, tool, tool_name, tool_args, tool_call_id, config)
+        resume_value = _langgraph_interrupt(auth_interrupt)
+        action = str((resume_value or {}).get('action') or 'skip').strip().lower() if isinstance(resume_value, dict) else 'skip'
+        if action not in {'authorize', 'skip'}:
+            action = 'skip'
+        return ToolMessage(content=self._mcp_auth_decision_message(auth_interrupt, action), tool_call_id=tool_call_id)
+
     def _build_mcp_auth_interrupt(
         self,
         exc: McpAuthorizationRequired,
@@ -4320,6 +4330,12 @@ class LLMNode(BaseTool):
                 # the parent model would reason about it as data and may retry it
                 if isinstance(result, InputGuardrailBlocked):
                     raise result
+                if isinstance(result, GovernedCredentialError):
+                    raise result
+                if isinstance(result, McpAuthorizationRequired):
+                    # Same durable pause as the sequential loop; a lazily built sub-agent raises it on call
+                    new_messages.append(self._parallel_mcp_auth_pause(result, spec, config))
+                    continue
                 budget_error = budget_exceeded_from(result)
                 if budget_error is not None:
                     raise budget_error from result
@@ -4729,7 +4745,8 @@ class LLMNode(BaseTool):
                         ))
                         continue
                     except Exception as e:
-                        if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked)):
+                        # A governed refusal (#7229) ends the run readably, never as tool output
+                        if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked, GovernedCredentialError)):
                             _PENDING_TOOL_MESSAGES.set([])
                             raise
                         # Same reasoning as the MCP clause above: swallowing a budget

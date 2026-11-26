@@ -15,6 +15,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from ..exceptions import InputGuardrailBlocked, budget_exceeded_from
+from ..credential_slots import GovernedCredentialError
 from ..tool_outcome import (
     ToolOutcome,
     ToolResultStatus,
@@ -687,7 +688,7 @@ alita_state = elitea_state.copy()
                     return messages_dict
                 else:
                     return { self.output_variables[0]: object_to_dict(tool_result) }
-        except (GraphBubbleUp, InputGuardrailBlocked):
+        except (GraphBubbleUp, InputGuardrailBlocked, GovernedCredentialError):
             raise
         except McpAuthorizationRequired as auth_error:
             # Direct Toolkit/MCP pipeline nodes bypass the LLM tool loop, so
