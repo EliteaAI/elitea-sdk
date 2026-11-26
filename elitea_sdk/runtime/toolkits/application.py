@@ -219,16 +219,9 @@ class ApplicationToolkit(BaseToolkit):
             model_settings = {}
             resolved_llm = fallback_llm
 
-        app = client.application(application_id, application_version_id, store=store,
-                                 llm=resolved_llm,
-                                 memory=memory,
-                                 ignored_mcp_servers=ignored_mcp_servers,
-                                 is_subgraph=is_subgraph,
-                                 mcp_tokens=mcp_tokens,
-                                 conversation_id=conversation_id,
-                                 version_details=version_details,
-                                 user_declined_mcp_servers=user_declined_mcp_servers,
-                                 auto_approve_sensitive_actions=auto_approve_sensitive_actions)  # Pass version_details to avoid re-fetching
+        # #7759: no build here; Application._run builds the child on each call from args_runnable
+        from .tools import _APP_LOAD_STACK
+        load_path = _APP_LOAD_STACK.get()
 
         # Extract icon_meta from version_details meta field
         icon_meta = version_details.get('meta', {}).get('icon_meta', {})
@@ -268,8 +261,8 @@ class ApplicationToolkit(BaseToolkit):
         )
         return cls(tools=[Application(name=app_name,
                                       description=description,
-                                      application=app,
                                       args_schema=dynamic_schema,
+                                      load_path=load_path,
                                       return_type='str',
                                       client=client,
                                       metadata=metadata,

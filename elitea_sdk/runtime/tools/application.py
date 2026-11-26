@@ -224,7 +224,9 @@ def _child_failed(response: Any) -> bool:
 class Application(BaseTool):
     name: str
     description: str
-    application: Any
+    application: Any = None
+    # Ancestors on the load path; restored while building the child so the cycle guard still applies
+    load_path: frozenset = frozenset()
     args_schema: Type[BaseModel] = applicationToolSchema
     return_type: str = "str"
     client: Any
@@ -484,9 +486,16 @@ class Application(BaseTool):
                 # child rebuild; mutating self.args_runnable would leak one
                 # sibling's invocation state into concurrent calls.
                 runnable_args['mcp_tokens'] = _live_mcp_tokens
-            application_runnable = self.client.application(
-                **runnable_args, application_variables=application_variables,
-            )
+            from ..toolkits.tools import _APP_LOAD_STACK
+            stack_token = _APP_LOAD_STACK.set(self.load_path)
+            try:
+                application_runnable = self.client.application(
+                    **runnable_args, application_variables=application_variables,
+                )
+            finally:
+                _APP_LOAD_STACK.reset(stack_token)
+        if application_runnable is None:
+            raise ToolException(f"Sub-agent '{self.name}' has no runnable configuration")
         # Capture parent's pending intermediate messages BEFORE invoking the
         # child application. The child runs in the same thread/asyncio context
         # and its own __perform_tool_calling overwrites the shared
