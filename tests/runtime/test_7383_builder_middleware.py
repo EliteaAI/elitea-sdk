@@ -230,6 +230,45 @@ def test_playbook_dedupe_leaves_other_messages_alone():
     assert middleware.transform_messages_for_model([_read_result('c1'), other], {}) is None
 
 
+def _ref_result(call_id, pages):
+    from langchain_core.messages import ToolMessage
+    body = {'status': 'ok', 'topic': 'pipeline:' + ','.join(pages), 'reference_pages': pages}
+    return ToolMessage(content=json.dumps(body), tool_call_id=call_id, name='post_elitea_core_builder_ref')
+
+
+def test_a_reference_page_reaches_the_model_once_per_conversation():
+    """#6388: a page already loaded earlier in the conversation is dropped from later results and named instead."""
+    history = [
+        _ref_result('r1', {'overview': 'OVERVIEW', 'node:llm': 'LLM'}),
+        _ref_result('r2', {'node:llm': 'LLM', 'node:router': 'ROUTER'}),
+        _ref_result('r3', {'overview': 'OVERVIEW'}),
+    ]
+    for _ in range(2):  # a middleware rebuilt each turn gives the same answer
+        out = builder_mw.BuilderMiddleware(core_prompt='x').transform_messages_for_model(history, {})
+        bodies = [json.loads(m.content) for m in out]
+        assert bodies[0]['reference_pages'] == {'overview': 'OVERVIEW', 'node:llm': 'LLM'}
+        assert 'already_loaded' not in bodies[0]
+        assert bodies[1]['reference_pages'] == {'node:router': 'ROUTER'}
+        assert bodies[1]['already_loaded'] == ['node:llm']
+        assert bodies[2]['reference_pages'] == {} and bodies[2]['already_loaded'] == ['overview']
+    assert json.loads(history[1].content)['reference_pages'] == {'node:llm': 'LLM', 'node:router': 'ROUTER'}
+
+
+def test_pages_and_playbooks_are_deduplicated_independently():
+    history = [_read_result('c1'), _ref_result('r1', {'overview': 'O'}), _read_result('c2'),
+               _ref_result('r2', {'node:llm': 'L'})]
+    out = builder_mw.BuilderMiddleware(core_prompt='x').transform_messages_for_model(history, {})
+    bodies = [json.loads(m.content) for m in out]
+    assert 'playbook' in bodies[0] and 'playbook' not in bodies[2]
+    assert bodies[1]['reference_pages'] == {'overview': 'O'} and bodies[3]['reference_pages'] == {'node:llm': 'L'}
+    assert 'already_loaded' not in bodies[3]
+
+
+def test_new_pages_only_leave_the_history_untouched():
+    history = [_ref_result('r1', {'overview': 'O'}), _ref_result('r2', {'node:llm': 'L'})]
+    assert builder_mw.BuilderMiddleware(core_prompt='x').transform_messages_for_model(history, {}) is None
+
+
 def test_a_wrapped_builder_tool_keeps_a_content_and_artifact_result(middleware):
     """A (content, artifact) tool result passes through unchanged when it needs no card (review fix)."""
     result = (json.dumps({'status': 'ok', 'playbook': 'p'}), {'a': 1})
