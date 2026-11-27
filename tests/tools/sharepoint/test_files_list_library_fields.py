@@ -8,15 +8,17 @@ import logging
 import pytest
 from langchain_core.tools import ToolException
 
+from elitea_sdk.tools.sharepoint import api_wrapper
 from elitea_sdk.tools.sharepoint import library_metadata as lm
-from elitea_sdk.tools.sharepoint.api_wrapper import GetFiles
+from elitea_sdk.tools.sharepoint.api_wrapper import GetFiles, SharepointApiWrapper
 from tests.tools.sharepoint.test_library_mode import (
     LIB,
     LIB_ID,
     P1,
     P2,
+    SITE,
     FakeGraph,
-    _wrapper,
+    FakeResponse,
     graph_file,
     item,
     rest_file,
@@ -25,6 +27,14 @@ from tests.tools.sharepoint.test_library_mode import (
 MAPPING = ["_Category=category"]
 JOIN_KEYS = {"web_url", "file_name", "metadata_status", "metadata_match", "library_list",
              "library_item_id", "library_digest"}
+
+
+def _wrapper(monkeypatch, files, graph):
+    """A Graph-backed wrapper: the backend listing returns ``files``, Graph list reads go to ``graph``."""
+    w = SharepointApiWrapper(site_url=SITE, llm=None, token="tok", scopes=["Sites.Read.All"])
+    monkeypatch.setattr(lm.requests, "get", graph.get)
+    monkeypatch.setattr(w._backend, "get_files_list", lambda *a, **k: files)
+    return w
 
 
 def _lists(*rows):
@@ -69,16 +79,56 @@ def test_files_list_does_not_change_the_rows_of_the_backend(monkeypatch):
     assert backend_rows == [graph_file(P1)]
 
 
-@pytest.mark.parametrize("library_lists", [None, [], ""])
-def test_files_list_without_library_lists_returns_rows_unchanged(monkeypatch, library_lists):
+@pytest.mark.parametrize("params", [{}, {"library_lists": None}, {"library_lists": []},
+                                    {"library_lists": None, "metadata_fields": []}])
+def test_files_list_without_library_settings_returns_rows_unchanged(monkeypatch, params):
     graph = FakeGraph(_lists(item(1, P1, _Category="Embedded")))
     files = [graph_file(P1), rest_file(P2)]
     w = _wrapper(monkeypatch, files, graph)
 
-    rows = _files_list(w, library_lists=library_lists, metadata_fields=MAPPING)
+    rows = _files_list(w, **params)
 
     assert rows == [graph_file(P1), rest_file(P2)]
     assert graph.calls == []
+
+
+@pytest.mark.parametrize("params", [
+    {"library_lists": [""]},
+    {"library_lists": ["   ", ""]},
+    {"library_lists": ""},
+    {"metadata_fields": MAPPING},
+    {"library_lists": [], "metadata_fields": MAPPING},
+    {"library_lists": None, "metadata_fields": MAPPING},
+    {"library_lists": [" "], "metadata_fields": MAPPING},
+])
+def test_files_list_blank_or_missing_library_lists_raises_instead_of_skipping_the_join(monkeypatch, params):
+    graph = FakeGraph(_lists(item(1, P1, _Category="Embedded")))
+    w = _wrapper(monkeypatch, [graph_file(P1)], graph)
+    listed = []
+    monkeypatch.setattr(w._backend, "get_files_list", lambda *a, **k: listed.append(a) or [graph_file(P1)])
+
+    with pytest.raises(ToolException, match="library_lists"):
+        _files_list(w, **params)
+
+    assert graph.calls == [] and listed == []
+
+
+def test_files_list_join_matches_the_join_of_index_data(monkeypatch):
+    graph = FakeGraph(_lists(item(1, P1, _Category="Embedded", Owner0="x")))
+    files = [graph_file(P1), graph_file("/sites/handbook/Handbook Library/Unlisted.pdf")]
+    w = _wrapper(monkeypatch, files, graph)
+    w._init_indexing_stats()
+
+    rows = _files_list(w, library_lists=[LIB], metadata_fields=["*", "_Category=category"])
+    docs = list(w._base_loader(library_lists=[LIB], metadata_fields=["*", "_Category=category"],
+                               limit_files=10))
+
+    compared = JOIN_KEYS | {"category"}
+    assert len(rows) == len(docs) == 2
+    for row, doc in zip(rows, docs, strict=True):
+        assert {k: row[k] for k in compared if k in row} == {k: doc.metadata[k] for k in compared if k in doc.metadata}
+    assert rows[0]["metadata_status"] == lm.STATUS_OK
+    assert rows[1]["metadata_status"] == lm.STATUS_NO_METADATA
 
 
 def test_files_list_default_call_keeps_the_old_signature(monkeypatch):
@@ -173,6 +223,64 @@ def test_files_list_keeps_the_type_of_the_column_value(monkeypatch, value, expec
     assert rows[0]["category"] == expected
 
 
+def test_files_list_passes_a_large_limit_to_the_backend_and_joins_every_row(monkeypatch):
+    names = [f"File {n}.pdf" for n in range(250)]
+    paths = [f"/sites/handbook/Handbook Library/{name}" for name in names]
+    graph = FakeGraph(_lists(*(item(n, p, _Category="Embedded") for n, p in enumerate(paths))), page_size=100)
+    w = _wrapper(monkeypatch, [], graph)
+    seen = []
+
+    def backend_listing(*args, **kwargs):
+        seen.append(args)
+        return [graph_file(p) for p in paths]
+
+    monkeypatch.setattr(w._backend, "get_files_list", backend_listing)
+
+    rows = _files_list(w, limit_files=10_000_000, library_lists=[LIB], metadata_fields=MAPPING)
+
+    assert seen[0][1] == 10_000_000
+    assert len(rows) == 250
+    assert {r["category"] for r in rows} == {"Embedded"}
+
+
+def test_files_list_failing_backend_listing_raises_and_returns_no_partial_rows(monkeypatch):
+    graph = FakeGraph(_lists(item(1, P1, _Category="Embedded")))
+    w = _wrapper(monkeypatch, [], graph)
+
+    def failing_listing(*args, **kwargs):
+        raise RuntimeError("listing failed")
+
+    monkeypatch.setattr(w._backend, "get_files_list", failing_listing)
+
+    with pytest.raises(RuntimeError, match="listing failed"):
+        _files_list(w, library_lists=[LIB], metadata_fields=MAPPING)
+
+
+def test_files_list_failing_list_read_stops_before_the_listing(monkeypatch):
+    graph = FakeGraph(_lists(item(1, P1, _Category="Embedded")))
+    graph.scripted = [FakeResponse(403)]
+    w = _wrapper(monkeypatch, [], graph)
+    listed = []
+    monkeypatch.setattr(w._backend, "get_files_list", lambda *a, **k: listed.append(a) or [graph_file(P1)])
+
+    with pytest.raises(ToolException, match="HTTP 403"):
+        _files_list(w, library_lists=[LIB], metadata_fields=MAPPING)
+
+    assert listed == []
+
+
+def test_files_list_logs_the_join_with_the_module_logger(monkeypatch, caplog):
+    graph = FakeGraph(_lists(item(1, P1, _Category="Embedded")))
+    w = _wrapper(monkeypatch, [graph_file(P1)], graph)
+
+    with caplog.at_level(logging.INFO, logger=api_wrapper.__name__):
+        _files_list(w, library_lists=[LIB], metadata_fields=MAPPING)
+
+    records = [r for r in caplog.records if "[SP-library] join" in r.getMessage()]
+    assert [r.name for r in records] == [api_wrapper.__name__]
+    assert "Embedded" not in caplog.text
+
+
 def test_files_list_with_no_files_still_reads_nothing_into_rows(monkeypatch):
     graph = FakeGraph(_lists(item(1, P1, _Category="Embedded")))
     w = _wrapper(monkeypatch, [], graph)
@@ -188,6 +296,13 @@ def test_get_files_schema_offers_library_fields():
     parsed = GetFiles(library_lists=[LIB], metadata_fields=MAPPING)
     assert parsed.library_lists == [LIB] and parsed.metadata_fields == MAPPING
     assert GetFiles().library_lists is None
+
+
+def test_get_files_schema_says_what_empty_metadata_fields_returns():
+    description = GetFiles.model_fields["metadata_fields"].description
+
+    assert "Empty" in description and "snake_case" in description
+    assert "Needs library_lists" in description
 
 
 def test_get_files_tool_is_listed_with_the_new_fields(monkeypatch):

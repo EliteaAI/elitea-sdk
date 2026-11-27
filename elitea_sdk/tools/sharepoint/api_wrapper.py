@@ -36,6 +36,8 @@ from .. import index_change_check
 from ..utils.tool_groups import tool_group, with_tool_groups
 from ..utils.source_info import join_location, reuse_url, web_base
 
+logger = logging.getLogger(__name__)
+
 # Settings that decide which files an index run covers. A run that covers other files than the
 # run before it must not remove rows, because the rows of the earlier scope look absent.
 INDEX_SCOPE_KEYS = ('path', 'form_name', 'include_extensions', 'skip_extensions',
@@ -134,11 +136,12 @@ GetFiles = create_model(
     library_lists=(list[str] | None, Field(
         description="Names of the library lists (usually the document libraries) whose list "
                     "columns are added to each returned file, e.g. ['Shared Documents']. "
-                    "Use together with metadata_fields. Without it, files carry no list columns.",
+                    "Without it, files carry no list columns. Blank names are an error.",
         default=None)),
     metadata_fields=(list[str] | None, Field(
         description="Optional field mapping, as for index_data, e.g. `[\"_Category=category\"]`. "
-                    "Only used when library_lists is set.",
+                    "Empty: every simple list column is added under its readable snake_case name. "
+                    "Needs library_lists: setting it alone is an error.",
         default=[])),
 )
 
@@ -696,8 +699,11 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         libraries), each file also gets the columns of its list item (for example
         category, metadata_status, library_list), read once for the whole listing.
         metadata_fields maps columns the same way as for index_data, e.g.
-        `["_Category=category"]` stores the _Category column as category. The
-        extension filters run first; files with no list item are still returned.
+        `["_Category=category"]` stores the _Category column as category. Empty
+        metadata_fields adds every simple list column under its snake_case name.
+        Blank library_lists names, or metadata_fields without library_lists, raise
+        an error. The extension filters run first; files with no list item are
+        still returned.
         Note:
             * URL anatomy: https://epam.sharepoint.com/sites/{some_site}/{form_name}/Forms/AllItems.aspx
             * Example of folders syntax: `{form_name} / Hello / inner-folder` - 1st folder is commonly form_name
@@ -705,19 +711,24 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         # Validate and read the lists before the listing so a bad setting fails fast.
         library = self._library_join_context(library_lists, metadata_fields)
+        # index_data lets blank settings switch the join off; a listing call that asked for
+        # columns must not silently return rows without them.
+        if library is None and (metadata_fields or library_lists not in (None, [])):
+            raise LibraryMetadataError(
+                "Pass the names of the library lists to read (library_lists); "
+                "metadata_fields and blank list names need at least one.")
         files = self._backend.get_files_list(
             folder_name, limit_files, form_name, include_extensions, skip_extensions,
             on_file_skipped=on_file_skipped, on_listing_gap=on_listing_gap)
         if library is None:
             return files
-        settings, index, counts = library
         # Copy each row: the backend's own dicts stay untouched.
         joined = []
         for file in files:
             row = dict(file)
-            apply_library_metadata(row, index, settings, counts)
+            self._apply_library_metadata(row, *library)
             joined.append(row)
-        logging.getLogger(__name__).info("[SP-library] join: %s", counts.as_dict())
+        logger.info("[SP-library] join: %s", library[2].as_dict())
         return joined
 
     @tool_group('read')
