@@ -2118,9 +2118,13 @@ class EliteAClient:
                       parallel_hitl_max_concurrency: int = 8,
                       user_declined_mcp_servers: Optional[list] = None,
                       project_context: Optional[dict] = None,
-                      builder: Optional[dict] = None):
+                      builder: Optional[dict] = None,
+                      output_schema: Optional[dict] = None):
         """
         Create a predict-type agent with minimal configuration.
+
+        With ``output_schema`` (EL-7679) the run is one structured answer instead of an agent: see
+        :class:`~elitea_sdk.runtime.langchain.structured.StructuredAnswerRunnable`.
 
         Args:
             llm: The LLM to use
@@ -2147,6 +2151,9 @@ class EliteAClient:
         Returns:
             Runnable agent ready for execution
         """
+        if output_schema:
+            from ..langchain.structured import StructuredAnswerRunnable  # pylint: disable=C0415
+            return StructuredAnswerRunnable(llm=llm, instructions=instructions, schema=output_schema)
         auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
             tools = []
