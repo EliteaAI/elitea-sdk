@@ -30,6 +30,14 @@ from ..langchain.constants import (
     SKILLS_SECTION_ENTRY,
     SKILLS_SECTION_HEADER,
 )
+from ..langchain.structured import (
+    candidates as structured_candidates,
+    is_anthropic_client,
+    is_anthropic_thinking_client,
+    is_openai_compatible_client,
+    is_structured_transform_rejection,
+    structured_text,
+)
 from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
@@ -578,20 +586,7 @@ class LLMNode(BaseTool):
         the ``tool_choice`` / ``response_format`` / ``json_schema`` shape litellm
         derives (e.g. Bedrock ``tool_choice.type``, Azure ``tool_choice.function``).
         """
-        msg = str(getattr(exc, 'message', '') or exc).lower()
-        is_bad_request = (
-            'badrequest' in type(exc).__name__.lower()
-            or 'badrequesterror' in msg
-            or '400' in msg
-            or 'invalid_request_error' in msg
-        )
-        if not is_bad_request:
-            return False
-        return any(
-            marker in msg for marker in (
-                'tool_choice', 'response_format', 'json_schema', 'output_format',
-            )
-        )
+        return is_structured_transform_rejection(exc)
 
     def _structured_via_json_prompt(self, llm_client: Any, synth_messages: List, struct_model: Any, config: RunnableConfig) -> Any:
         """Prompt for a JSON object and parse it from the text response.
@@ -625,13 +620,7 @@ class LLMNode(BaseTool):
         the thinking block (``['', {'type': 'thinking', ...}, '{...}']``) instead
         of a ``{'type': 'text'}`` block (#7623).
         """
-        if not isinstance(content, list):
-            return str(content)
-        return ''.join(
-            block if isinstance(block, str) else block.get('text', '')
-            for block in content
-            if isinstance(block, str) or (isinstance(block, dict) and block.get('type') == 'text')
-        )
+        return structured_text(content)
 
     def _build_json_instruction(self, struct_model: Any) -> str:
         """
@@ -5174,11 +5163,7 @@ class LLMNode(BaseTool):
         base ChatAnthropic directly. Both detection helpers below need to
         check both layers — this returns the list to walk.
         """
-        try:
-            bound = getattr(client, 'bound', None)
-            return [client, bound] if bound is not None else [client]
-        except Exception:  # pragma: no cover — defensive
-            return [client]
+        return structured_candidates(client)
 
     @staticmethod
     def _is_anthropic_client(client: Any) -> bool:
@@ -5189,11 +5174,7 @@ class LLMNode(BaseTool):
         ``$defs.JsonValue`` patch applied (Anthropic's ``transform_schema``
         rejects the empty def Pydantic emits for ``JsonValue``).
         """
-        for candidate in LLMNode._anthropic_candidates(client):
-            module = getattr(type(candidate), '__module__', '') or ''
-            if 'langchain_anthropic' in module:
-                return True
-        return False
+        return is_anthropic_client(client)
 
     @staticmethod
     def _client_is_openai_compatible(client: Any) -> bool:
@@ -5207,24 +5188,14 @@ class LLMNode(BaseTool):
         litellm derives for Bedrock, so block-continuation and structured-output
         routing avoid those transforms for these clients.
         """
-        for candidate in LLMNode._anthropic_candidates(client):
-            if getattr(candidate, '_elitea_openai_compatible', False):
-                return True
-        return False
+        return is_openai_compatible_client(client)
 
     @staticmethod
     def _is_anthropic_thinking_client(client: Any) -> bool:
         """Return True when *client* is (or wraps) a langchain-anthropic
         ChatAnthropic with thinking enabled (type "enabled" or "adaptive").
         """
-        for candidate in LLMNode._anthropic_candidates(client):
-            module = getattr(type(candidate), '__module__', '') or ''
-            if 'langchain_anthropic' not in module:
-                continue
-            thinking = getattr(candidate, 'thinking', None)
-            if isinstance(thinking, dict) and thinking.get('type') in ('enabled', 'adaptive'):
-                return True
-        return False
+        return is_anthropic_thinking_client(client)
 
     @staticmethod
     def _anthropic_system_content(text: str, client: Any, dynamic_suffix: str = "") -> Any:

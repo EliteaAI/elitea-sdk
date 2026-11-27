@@ -721,7 +721,12 @@ def make_anthropic_compatible_schema(pydantic_model: Any) -> dict:
     which all three accept. No-op for schemas without ``$defs.JsonValue``,
     so the boundary call site stays unconditional.
     """
-    schema = copy.deepcopy(pydantic_model.model_json_schema())
+    return make_anthropic_compatible_schema_dict(pydantic_model.model_json_schema())
+
+
+def make_anthropic_compatible_schema_dict(schema: dict) -> dict:
+    """:func:`make_anthropic_compatible_schema` for a JSON schema that is already a dict."""
+    schema = copy.deepcopy(schema)
     defs = schema.get("$defs")
     if not (isinstance(defs, dict) and "JsonValue" in defs):
         return schema
