@@ -23,8 +23,10 @@ from pydantic.fields import Field
 
 import elitea_sdk.tools.ado.work_item
 from ..repos import ReposApiWrapper
+from ..utils import AdoProjectScope, in_caller_context, with_project_argument
 from ...non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ...utils import normalize_base_url
+from ...utils.source_info import join_location, web_host
 from ...utils.available_tools_decorator import extend_with_parent_available_tools
 from ...utils.content_parser import parse_file_content
 from ....runtime.langchain.document_loaders.image_cache import ImageDescriptionCache
@@ -55,6 +57,54 @@ def _url_has_image_extension(url: str) -> bool:
         return False
     path = url.split("?", 1)[0].split("#", 1)[0]
     return path.lower().endswith(_IMAGE_EXTENSIONS)
+
+
+# ADO Wiki writes resized images as `![name](/.attachments/x.png =250x)`; the
+# size (` =WxH`, ` =Wx`, ` =xH`) is part of the markdown target, not the URL.
+_IMAGE_SIZE_SUFFIX_RE = re.compile(r"\s+=\d*x\d*$")
+
+# Project wikis always live on this branch of their backing repo.
+_PROJECT_WIKI_BRANCH = "wikiMaster"
+
+
+def _strip_image_size_suffix(url: str) -> str:
+    """Drop a trailing ADO image size suffix (` =250x`, ` =x300`, ` =250x300`)."""
+    return _IMAGE_SIZE_SUFFIX_RE.sub("", url.strip()) if url else url
+
+
+_MAX_FAILURE_REASON_CHARS = 300
+
+
+def _image_failure_note(failed: int, total: int, reasons: List[str]) -> str:
+    """One line telling the caller how many images were not described, and why."""
+    distinct = list(dict.fromkeys(
+        r if len(r) <= _MAX_FAILURE_REASON_CHARS else r[:_MAX_FAILURE_REASON_CHARS] + "..." for r in reasons
+    ))
+    return f"[{failed} of {total} images not described: {'; '.join(distinct)}]"
+
+
+def _is_code_wiki(wiki) -> bool:
+    return "codewiki" in str(getattr(wiki, "type", "") or "").lower()
+
+
+def _wiki_branch(wiki) -> str:
+    """Branch the wiki is published from.
+
+    Code wikis publish a folder of an ordinary branch (`versions[0]`); project
+    wikis, and wikis without versions, use `wikiMaster`.
+    """
+    if not _is_code_wiki(wiki):
+        return _PROJECT_WIKI_BRANCH
+    versions = getattr(wiki, "versions", None) or []
+    version = getattr(versions[0], "version", None) if versions else None
+    return version or _PROJECT_WIKI_BRANCH
+
+
+def _wiki_mapped_prefix(wiki) -> str:
+    """Repo folder a code wiki is published from, without slashes ('' for the root)."""
+    if not _is_code_wiki(wiki):
+        return ""
+    return str(getattr(wiki, "mapped_path", None) or "").strip("/")
 
 GetWikiInput = create_model(
     "GetWikiInput",
@@ -112,6 +162,8 @@ DeletePageByPathInput = create_model(
     "DeletePageByPathInput",
     wiki_identified=(Optional[str], Field(default=None, description="Wiki ID or wiki name. If not provided, uses the default wiki identifier from toolkit configuration.")),
     page_name=(str, Field(description="Wiki page path")),
+    version_identifier=(Optional[str], Field(default=None, description="Branch, tag or commit the page is deleted on. Leave empty to use the branch the wiki is published from ('wikiMaster' for project wikis, the published branch for code wikis).")),
+    version_type=(Optional[Literal["branch", "tag", "commit"]], Field(description="Version type (branch, tag, or commit). Determines how version_identifier is interpreted", default="branch")),
 )
 
 DeletePageByIdInput = create_model(
@@ -126,7 +178,7 @@ ModifyPageInput = create_model(
     page_name=(str, Field(description="Wiki page name")),
     page_content=(str, Field(description="Wiki page content")),
     version_identifier=(str, Field(description="Version string identifier (name of tag/branch, SHA1 of commit). Usually for wiki the branch is 'wikiMaster'")),
-    version_type=(Optional[str], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch")),
+    version_type=(Optional[Literal["branch", "tag", "commit"]], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch")),
     expanded=(Optional[bool], Field(description="Whether to return the full page object or just its simplified version.", default=False))
 )
 
@@ -136,7 +188,7 @@ RenamePageInput = create_model(
     old_page_name=(str, Field(description="Old Wiki page name to be renamed", examples= ["/TestPageName"])),
     new_page_name=(str, Field(description="New Wiki page name", examples= ["/RenamedName"])),
     version_identifier=(str, Field(description="Version string identifier (name of tag/branch, SHA1 of commit)")),
-    version_type=(Optional[str], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch"))
+    version_type=(Optional[Literal["branch", "tag", "commit"]], Field(description="Version type (branch, tag, or commit). Determines how Id is interpreted", default="branch"))
 )
 
 
@@ -257,11 +309,13 @@ def _format_wiki_response(wiki_response):
         return {"error": f"Unable to format wiki response: {str(e)}"}
 
 
-class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
+class AzureDevOpsApiWrapper(AdoProjectScope, NonCodeIndexerToolkit):
+    index_source_type = "azure_devops_wiki"
     index_item_labels = ('page', 'pages')
     # TODO use ado_configuration instead of organization_url, project and token
     organization_url: str
-    project: str
+    # Default project; each tool call may target another one
+    project: Optional[str] = None
     token: SecretStr
     default_wiki_identifier: Optional[str] = None
     _client: Optional[WikiClient] = PrivateAttr()  # Private attribute for the wiki client
@@ -340,7 +394,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Extract ADO wiki information."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            wiki_response = self._client.get_wiki(project=self.project, wiki_identifier=wiki_id)
+            wiki_response = self._client.get_wiki(project=self._project(), wiki_identifier=wiki_id)
             return _format_wiki_response(wiki_response)
         except Exception as e:
             logger.error(f"Error during the attempt to extract wiki: {str(e)}")
@@ -351,7 +405,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Extract ADO wiki page content."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            content = self._client.get_page(project=self.project, wiki_identifier=wiki_id, path=page_name,
+            content = self._client.get_page(project=self._project(), wiki_identifier=wiki_id, path=page_name,
                                             include_content=True).page.content
             if process_images:
                 return self._process_images(content, image_description_prompt=image_description_prompt, wiki_identified=wiki_id)
@@ -365,7 +419,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Extract ADO wiki page content."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            content = self._client.get_page_by_id(project=self.project, wiki_identifier=wiki_id, id=page_id,
+            content = self._client.get_page_by_id(project=self._project(), wiki_identifier=wiki_id, id=page_id,
                                                    include_content=True).page.content
             if process_images:
                 return self._process_images(content, image_description_prompt=image_description_prompt, wiki_identified=wiki_id)
@@ -416,7 +470,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             if page_id:
                 logger.info(f"Fetching wiki page by ID: {page_id} from wiki: {wiki_id}")
                 wiki_page_response = self._client.get_page_by_id(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     id=page_id,
                     include_content=include_content,
@@ -425,7 +479,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             else:
                 logger.info(f"Fetching wiki page by path: {page_path} from wiki: {wiki_id}")
                 wiki_page_response = self._client.get_page(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     path=page_path,
                     include_content=include_content,
@@ -518,34 +572,66 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             raise ToolException(f"Unexpected error during wiki page retrieval: {str(e)}")
 
     def _get_repos_wrapper(self, wiki_identified: str) -> Optional["ReposApiWrapper"]:
-        """Return a ReposApiWrapper bound to the wikiMaster branch of the given wiki.
+        """Return a ReposApiWrapper bound to the branch the given wiki is published from.
 
-        Cached per wiki identifier on the instance so index-time processing of many
-        pages doesn't rebuild the wrapper (and its azure-devops Connection) per page.
-        Returns None when the wiki cannot be resolved — callers must handle that.
+        Cached per (project, wiki identifier) on the instance so index-time processing of many
+        pages doesn't rebuild the wrapper (and its azure-devops Connection) per page. A failed
+        lookup is cached too, with its reason (see `_repos_wrapper_error`), so pages after the
+        first don't repeat the setup calls. Returns None when the wiki cannot be resolved —
+        callers must handle that.
         """
         cache = self.__dict__.setdefault("_repos_wrapper_cache", {})
-        cached = cache.get(wiki_identified)
+        errors = self.__dict__.setdefault("_repos_wrapper_errors", {})
+        cache_key = (self._project(), wiki_identified)
+        cached = cache.get(cache_key)
         if cached is not None:
             return cached
+        if cache_key in errors:
+            return None
         try:
-            wiki = self._client.get_wiki(project=self.project, wiki_identifier=wiki_identified)
+            wiki = self._client.get_wiki(project=self._project(), wiki_identifier=wiki_identified)
+            branch = _wiki_branch(wiki)
             repos_wrapper = ReposApiWrapper(
                 organization_url=self.organization_url,
-                project=self.project,
+                project=self._project(),
                 token=self.token.get_secret_value(),
                 repository_id=wiki.repository_id,
-                base_branch="wikiMaster",
-                active_branch="wikiMaster",
+                base_branch=branch,
+                active_branch=branch,
                 llm=self.llm,
             )
         except Exception as e:
             logger.error(f"Failed to initialize repos wrapper for wiki '{wiki_identified}': {str(e)}")
+            errors[cache_key] = str(e)
             return None
-        cache[wiki_identified] = repos_wrapper
+        self.__dict__.setdefault("_wiki_mapped_prefixes", {})[cache_key] = _wiki_mapped_prefix(wiki)
+        cache[cache_key] = repos_wrapper
         return repos_wrapper
 
-    def _process_images(self, page_content: str, wiki_identified: str, image_description_prompt=None):
+    def _repos_wrapper_error(self, wiki_identified: str) -> Optional[str]:
+        """Why `_get_repos_wrapper` returned None for this wiki, if it did."""
+        return self.__dict__.get("_repos_wrapper_errors", {}).get((self._project(), wiki_identified))
+
+    def _attachment_repo_path(self, attachment_url: str, wiki_identified: Optional[str] = None) -> str:
+        """Map a `/.attachments/...` URL to its path in the wiki's repo.
+
+        A code wiki published from a subfolder keeps attachments under that folder.
+        """
+        file_path = unquote(_strip_image_size_suffix(attachment_url).lstrip('/'))
+        prefixes = self.__dict__.get("_wiki_mapped_prefixes")
+        if wiki_identified is None or not prefixes:
+            return file_path
+        prefix = prefixes.get((self._project(), wiki_identified))
+        return f"{prefix}/{file_path}" if prefix else file_path
+
+    def _process_images(self, page_content: str, wiki_identified: str, image_description_prompt=None,
+                        report_failures: bool = True):
+        """Replace image markdown with LLM descriptions.
+
+        With report_failures, a page where some images could not be described gets
+        one trailing `[N of M images not described: <reason>]` line so the caller can
+        tell; otherwise failures are only logged.
+        """
         if image_description_prompt and self.llm is None:
             raise ToolException(
                 "Cannot generate image descriptions: image_description_prompt was provided but no LLM is configured. "
@@ -560,18 +646,21 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
         # Initialize repos_wrapper once for all attachments in this page
         repos_wrapper = None
+        repos_wrapper_error = None
         has_attachments = any(url.startswith("/.attachments/") for _, url in matches)
 
         if has_attachments:
             repos_wrapper = self._get_repos_wrapper(wiki_identified)
+            if repos_wrapper is None:
+                repos_wrapper_error = self._repos_wrapper_error(wiki_identified) or "Repos wrapper not initialized"
 
         def _describe_image(item):
             """Fetch + LLM-describe a single image. Runs on a worker thread.
 
-            Returns (image_name, image_url, description) on success or
-            (image_name, image_url, None) if the image was skipped for any reason —
-            the caller then leaves the original markdown untouched (matches the
-            prior serial behavior).
+            Returns (image_name, image_url, description, error): a description on
+            success; otherwise description is None and error is the failure reason,
+            or None when the reference is not an image at all. The caller leaves
+            the original markdown untouched for any None description.
             """
             img_idx, image_name, image_url = item
             logger.debug(
@@ -579,42 +668,47 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             )
             if not image_url:
                 logger.warning(f"Skipping image '{image_name}': empty URL, leaving original markdown unchanged.")
-                return image_name, image_url, None
-            if image_url.startswith("/.attachments/"):
+                return image_name, image_url, None, None
+            source_url = _strip_image_size_suffix(image_url)
+            if source_url.startswith("/.attachments/"):
                 # ADO Wiki uses image-markdown syntax for every attachment type
                 # (PDF, DOCX, ...), not just real images. Only treat this as an
                 # image if the URL extension is a known image type; otherwise
                 # leave the markdown untouched and let the `include_attachments`
                 # dependent-doc path handle it with the real extension.
-                if not _url_has_image_extension(image_url):
+                if not _url_has_image_extension(source_url):
                     logger.debug(
                         f"Skipping non-image attachment '{image_name}' -> '{image_url}' in image processing; "
                         f"will be handled by include_attachments path."
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, None
+                if repos_wrapper is None:
+                    logger.warning(
+                        f"Skipping image '{image_name}': wiki repository is unavailable: {repos_wrapper_error}"
+                    )
+                    return image_name, image_url, None, f"wiki repository is unavailable: {repos_wrapper_error}"
                 try:
-                    if repos_wrapper is None:
-                        raise Exception("Repos wrapper not initialized")
                     description = self.process_attachment(
-                        attachment_url=image_url,
+                        attachment_url=source_url,
                         attachment_name=image_name,
                         image_description_prompt=image_description_prompt,
                         repos_wrapper=repos_wrapper,
+                        wiki_identified=wiki_identified,
                     )
                 except ToolException as e:
                     logger.warning(
                         f"Skipping image '{image_name}': attachment parser returned error for '{image_url}': "
                         f"{str(e)}"
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, str(e)
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error parsing attachment '{image_url}': {str(e)}"
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, str(e)
             else:
                 try:
-                    response = requests.get(image_url)
+                    response = requests.get(source_url)
                     response.raise_for_status()
                     file_content = response.content
                     description = parse_file_content(
@@ -629,13 +723,13 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                         f"Skipping image '{image_name}': image parser returned error for '{image_url}': "
                         f"{str(e)}"
                     )
-                    return image_name, image_url, None
+                    return image_name, image_url, None, str(e)
                 except Exception as e:
                     logger.warning(
                         f"Skipping image '{image_name}': error fetching external image '{image_url}': {str(e)}"
                     )
-                    return image_name, image_url, None
-            return image_name, image_url, description
+                    return image_name, image_url, None, f"could not fetch '{source_url}': {str(e)}"
+            return image_name, image_url, description, None
 
         # If the outer _collect_dependencies runs pages in parallel (Phase 4),
         # this call already sits on a worker thread — nesting another pool
@@ -656,17 +750,26 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 max_workers=max_workers,
                 thread_name_prefix="ado-wiki-img",
             ) as executor:
-                results = list(executor.map(_describe_image, items))
+                results = list(executor.map(in_caller_context(_describe_image), items))
 
-        for image_name, image_url, description in results:
+        attempted = 0
+        reasons: List[str] = []
+        for image_name, image_url, description, error in results:
             if description is None:
+                if error is not None:
+                    attempted += 1
+                    reasons.append(error)
                 continue
+            attempted += 1
             new_image_markdown = f"![{image_name}]({description})"
             page_content = page_content.replace(f"![{image_name}]({image_url})", new_image_markdown)
+        if reasons and report_failures:
+            page_content += f"\n\n{_image_failure_note(len(reasons), attempted, reasons)}"
         return page_content
 
-    def process_attachment(self, attachment_url, attachment_name, repos_wrapper, image_description_prompt):
-        file_path = unquote(attachment_url.lstrip('/'))
+    def process_attachment(self, attachment_url, attachment_name, repos_wrapper, image_description_prompt,
+                           wiki_identified: Optional[str] = None):
+        file_path = self._attachment_repo_path(attachment_url, wiki_identified)
         attachment_content = repos_wrapper.download_file(path=file_path)
         return parse_file_content(
             file_content=attachment_content,
@@ -677,22 +780,40 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         )
 
     @tool_group('delete')
-    def delete_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None):
-        """Delete ADO wiki page by path."""
+    def delete_page_by_path(self, wiki_identified: Optional[str] = None, page_name: str = None,
+                            version_identifier: Optional[str] = None, version_type: Optional[str] = "branch"):
+        """Delete ADO wiki page by path.
+
+        Code wikis are backed by an ordinary Git branch, and ADO only deletes their pages by path
+        when the branch is given. Without an explicit `version_identifier` the branch the wiki is
+        published from is used (`wikiMaster` for project wikis).
+        """
+        wiki_id = None
+        version = version_identifier
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            self._client.delete_page(project=self.project, wiki_identifier=wiki_id, path=page_name)
+            if not version:
+                wiki = self._client.get_wiki(project=self._project(), wiki_identifier=wiki_id)
+                version = _wiki_branch(wiki)
+                version_type = "branch"
+            self._client.delete_page(
+                project=self._project(),
+                wiki_identifier=wiki_id,
+                path=page_name,
+                version_descriptor=GitVersionDescriptor(version=version, version_type=version_type or "branch"),
+            )
             return f"Page '{page_name}' in wiki '{wiki_id}' has been deleted"
         except Exception as e:
-            logger.error(f"Unable to delete wiki page: {str(e)}")
-            raise ToolException(f"Unable to delete wiki page: {str(e)}")
+            on_version = f" (on {version_type or 'branch'} '{version}')" if version else ""
+            logger.error(f"Unable to delete wiki page '{page_name}'{on_version}: {str(e)}")
+            raise ToolException(f"Unable to delete wiki page '{page_name}'{on_version}: {str(e)}")
 
     @tool_group('delete')
     def delete_page_by_id(self, wiki_identified: Optional[str] = None, page_id: int = None):
         """Delete ADO wiki page by ID."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            self._client.delete_page_by_id(project=self.project, wiki_identifier=wiki_id, id=page_id)
+            self._client.delete_page_by_id(project=self._project(), wiki_identifier=wiki_id, id=page_id)
             return f"Page with id '{page_id}' in wiki '{wiki_id}' has been deleted"
         except Exception as e:
             logger.error(f"Unable to delete wiki page: {str(e)}")
@@ -715,7 +836,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
             try:
                 return self._client.create_page_move(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     comment=f"Page rename from '{old_page_name}' to '{new_page_name}'",
                     page_move_parameters=WikiPageMoveParameters(new_path=new_page_name, path=old_page_name),
@@ -725,7 +846,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 if "The version '{0}' either is invalid or does not exist." in str(e):
                     # Retry the request without version_descriptor
                     return self._client.create_page_move(
-                        project=self.project,
+                        project=self._project(),
                         wiki_identifier=wiki_id,
                         comment=f"Page rename from '{old_page_name}' to '{new_page_name}'",
                         page_move_parameters=WikiPageMoveParameters(new_path=new_page_name, path=old_page_name),
@@ -741,7 +862,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         """Create or Update ADO wiki page content."""
         try:
             wiki_id = self._resolve_wiki_identifier(wiki_identified)
-            all_wikis = [wiki.name for wiki in self._client.get_all_wikis(project=self.project)]
+            all_wikis = [wiki.name for wiki in self._client.get_all_wikis(project=self._project())]
             if wiki_id not in all_wikis:
                 logger.info(f"wiki name '{wiki_id}' doesn't exist. New wiki will be created.")
                 try:
@@ -749,17 +870,17 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     projects = self._core_client.get_projects()
 
                     for project in projects:
-                        if project.name == self.project:
+                        if project.name == self._project():
                             project_id = project.id
                             break
                     if project_id:
-                        self._client.create_wiki(project=self.project, wiki_create_params=WikiCreateParametersV2(name=wiki_id, project_id=project_id))
+                        self._client.create_wiki(project=self._project(), wiki_create_params=WikiCreateParametersV2(name=wiki_id, project_id=project_id))
                     else:
                         return "Project ID has not been found."
                 except Exception as create_wiki_e:
                     raise ToolException(f"Unable to create new wiki due to error: {create_wiki_e}")
             try:
-                page = self._client.get_page(project=self.project, wiki_identifier=wiki_id, path=page_name)
+                page = self._client.get_page(project=self._project(), wiki_identifier=wiki_id, path=page_name)
                 version = page.eTag
             except Exception as get_page_e:
                 if "Ensure that the path of the page is correct and the page exists" in str(get_page_e):
@@ -770,7 +891,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
             try:
                 return _format_wiki_page_response(self._client.create_or_update_page(
-                    project=self.project,
+                    project=self._project(),
                     wiki_identifier=wiki_id,
                     path=page_name,
                     parameters=WikiPageCreateOrUpdateParameters(content=page_content),
@@ -781,7 +902,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 if "The version '{0}' either is invalid or does not exist." in str(e):
                     # Retry the request without version_descriptor
                     return _format_wiki_page_response(wiki_page_response=self._client.create_or_update_page(
-                        project=self.project,
+                        project=self._project(),
                         wiki_identifier=wiki_id,
                         path=page_name,
                         parameters=WikiPageCreateOrUpdateParameters(content=page_content),
@@ -802,7 +923,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         the same call via the underlying Client._send so we can read the header.
         """
         route_values = {
-            'project': self._client._serialize.url('project', self.project, 'str'),
+            'project': self._client._serialize.url('project', self._project(), 'str'),
             'wikiIdentifier': self._client._serialize.url('wiki_identifier', wiki_identifier, 'str'),
         }
         continuation_token: Optional[str] = None
@@ -849,7 +970,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
     # LLM rate limits, and pgvector pool exhaustion.
     _MAX_WORKERS = 10
 
-    def _base_loader(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None,
+    def _chunk_source_location(self, metadata: dict) -> Optional[str]:
+        return join_location(metadata.get('project'), metadata.get('wiki'), metadata.get('path'))
+
+    def _base_loader(self, *args, project=None, **kwargs) -> Generator[Document, None, None]:
+        # run() already put the call's project in scope; it only rides along to be recorded
+        return self._load_in_project(lambda: self._load_pages(*args, **kwargs))
+
+    def _load_pages(self, wiki_identifier: Optional[str] = None, chunking_tool: str = None,
                      path_contains: Optional[str] = None,
                      process_images: bool = False,
                      image_description_prompt: Optional[str] = None,
@@ -859,6 +987,8 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                      workers: Optional[int] = None,
                      **kwargs) -> Generator[Document, None, None]:
         wiki_identifier = self._resolve_wiki_identifier(wiki_identifier)
+        self._record_index_source(
+            location=join_location(web_host(self.organization_url), self._project(), wiki_identifier))
 
         # Stash indexing-time flags on the instance so _process_document (called
         # later by the base indexer, without kwargs) can read them.
@@ -889,13 +1019,14 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
             Returns (page, raw_content). Any exception propagates via Future.result().
             """
             resp = self._client.get_page_by_id(
-                project=self.project,
+                project=self._project(),
                 wiki_identifier=wiki_identifier,
                 id=page.id,
                 include_content=True,
             )
             return page, resp.page.content
 
+        fetch_page_content = in_caller_context(_fetch_page_content)
         executor = ThreadPoolExecutor(
             max_workers=self._index_workers,
             thread_name_prefix="ado-wiki-fetch",
@@ -919,7 +1050,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     self._track_skipped_document(page.path, reason="filtered")
                     # Re-submit so we still fill the pool with a real fetch.
                     return _submit_next()
-                fut = executor.submit(_fetch_page_content, page)
+                fut = executor.submit(fetch_page_content, page)
                 futures_queue.append((page_idx, page.path, page.id, fut))
                 return True
 
@@ -962,6 +1093,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
 
                 metadata = {
                     'id': str(page.id),
+                    'wiki': wiki_identifier,
                     'path': page.path,
                     'title': title,
                     'updated_on': content_hash,
@@ -1081,6 +1213,8 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 raw_content,
                 wiki_identified=wiki_identifier,
                 image_description_prompt=image_description_prompt,
+                # The note is for tool callers; it must not be indexed as page text.
+                report_failures=False,
             )
         except Exception as e:
             logger.warning(
@@ -1119,6 +1253,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
         return current != stored
 
     def _process_document(self, document: Document) -> Generator[Document, None, None]:
+        return self._in_document_project(document, lambda: self._process_page(document))
+
+    def _process_page(self, document: Document) -> Generator[Document, None, None]:
         """Emit each referenced /.attachments/ file as a dependent Document, and
         optionally rewrite the parent page's inline images with LLM descriptions.
 
@@ -1178,7 +1315,9 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 f"[ADO wiki index] Downloading attachment {att_idx}/{total_attachments} for page '{parent_path}': '{file_path}'"
             )
             try:
-                data = self._download_attachment_with_retry(repos_wrapper, file_path)
+                # IDs keep the wiki-relative path; the download needs the repo path.
+                repo_path = self._attachment_repo_path(att_url, wiki_identifier)
+                data = self._download_attachment_with_retry(repos_wrapper, repo_path)
                 return item, data, None
             except Exception as e:
                 return item, None, e
@@ -1202,7 +1341,7 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 max_workers=max_workers,
                 thread_name_prefix="ado-wiki-att",
             )
-            results_iter = executor.map(_fetch, eligible)
+            results_iter = executor.map(in_caller_context(_fetch), eligible)
 
         try:
             for item, attachment_bytes, err in results_iter:
@@ -1293,8 +1432,8 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                 default=False,
                 description=(
                     "If True, also index each /.attachments/ file referenced by wiki pages as "
-                    "its own dependent document. Attachment bytes are pulled from the wikiMaster "
-                    "branch of the wiki's backing git repo and passed through the standard "
+                    "its own dependent document. Attachment bytes are pulled from the branch the "
+                    "wiki is published from (wikiMaster for project wikis) in its backing git repo and passed through the standard "
                     "content parser (LLM description for images/PDFs, text for supported files). "
                     "External image URLs (http/https) are not indexed — only files stored in the "
                     "wiki repo. Independent of process_images: enabling both means image content "
@@ -1327,8 +1466,10 @@ class AzureDevOpsApiWrapper(NonCodeIndexerToolkit):
                     "and the pgvector connection pool. Values above 10 are clamped."
                 ),
             )),
+            **self._project_field(),
         }
 
+    @with_project_argument
     @with_tool_groups
     @extend_with_parent_available_tools
     def get_available_tools(self):

@@ -461,3 +461,26 @@ def test_constructor_projection_preserves_substantive_system_and_authored_lookal
               HumanMessage(content=raw),SystemMessage(content='Authored independent system')]
     assert m.projection(messages)==[{'role':'system','content':'Authored constraint'},
         {'role':'user','content':raw},{'role':'system','content':'Authored independent system'}]
+
+
+def test_bound_tool_schema_with_a_field_named_type_is_not_mistaken_for_a_content_block():
+    # #7307: a tool parameter literally named ``type`` puts a dict under the
+    # ``type`` key of the schema's ``properties``; it is not an image block.
+    schema = {'type': 'object', 'properties': {'type': {'type': 'string', 'description': 'issue type'},
+                                                'image_url': {'type': 'string'}}}
+    payload = {'tools': [{'type': 'function', 'function': {'name': 'create_issue', 'parameters': schema}}]}
+    assert m.sized_images(payload) == payload
+    assert m.block_type({'type': {'type': 'string'}}) is None
+    assert m.block_type({'type': 'image_url', 'image_url': {'url': 'data:x'}}) == 'image_url'
+    assert not m._is_image({'type': {'type': 'string'}})
+
+
+def test_native_admission_screens_a_tool_whose_parameters_include_a_type_field():
+    auto, native, calls = model()
+    native._get_request_payload = lambda messages, **k: {
+        'messages': [x.model_dump(mode='json') for x in messages],
+        'tools': [{'type': 'function', 'function': {'name': 'create_issue', 'parameters': {
+            'type': 'object', 'properties': {'type': {'type': 'string'}}}}}]}
+    result = auto.invoke([HumanMessage(content='create a bug')], cfg())
+    assert result.content[-1]['text'] == 'result'
+    assert native.inputs  # The generation reached the native client.

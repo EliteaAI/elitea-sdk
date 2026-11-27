@@ -34,6 +34,7 @@ from ..langchain.utils import (
     args_match_normalized,
     create_pydantic_model,
     extract_json_content,
+    has_open_object,
     make_anthropic_compatible_schema,
     normalize_null_tool_call_ids,
     prepare_messages_for_model,
@@ -46,8 +47,17 @@ from ..context_floor import (
     shrink_after_overflow,
 )
 from ..exceptions import InputGuardrailBlocked, OutputContinuationExhausted, budget_exceeded_from
+from ..credential_slots import GovernedCredentialError
 from ..utils.internal_run_auth import run_token_refusal
-from ..tool_outcome import ToolOutcome, ToolResultStatus, outcome_sink, record_outcome, resolve_run_error
+from ..tool_outcome import (
+    RUN_FAILURE_NOTICE_KEY,
+    ToolOutcome,
+    ToolResultStatus,
+    note_run_error,
+    outcome_sink,
+    record_outcome,
+    resolve_run_error,
+)
 from ..toolkits.security import normalize_tool_name, qualified_tool_identity
 from ...tools.utils.serialization import serialize_tool_result
 from ..utils.failure_signals import describe_llm_error
@@ -139,6 +149,7 @@ from .hitl import (
     HITL_VIA_CALL_ID_KEY,
     PendingHITLEntry,
 )
+from .skill_script_runner import ScriptRunContext, SkillScriptRunner, is_canonical_uuid
 from .skill_tools import (
     LoadSkillTool,
     ReadSkillFileTool,
@@ -242,6 +253,27 @@ def _llm_idle_timeout(client):
             return value
     return None
 
+def _llm_error_message(content, exc, client):
+    """The AIMessage for a failed model call, tagged for nested agents and for the run status.
+
+    The graph carries on with this message as an answer, so the run would look successful.
+    The run-level error holder is what a non-interactive run reads to end as failed. Only the
+    holder is written: the outcome sink belongs to tool calls and would mislabel one.
+    """
+    message = AIMessage(content=content)
+    message.response_metadata[RUN_FAILURE_NOTICE_KEY] = True
+    message.response_metadata['llm_node_exception_type'] = type(exc).__name__
+    # The holder is never cleared by a later good call: a model error is final for its node,
+    # and a recovered nested agent must not hide a node that failed.
+    note_run_error(ToolOutcome(
+        status=ToolResultStatus.ERROR,
+        message=describe_llm_error(exc, _llm_idle_timeout(client)),
+        tool_name='model call',
+        toolkit_type='LLM',
+        exception_type=type(exc).__name__,
+    ))
+    return message
+
 class LLMNode(BaseTool):
     """Enhanced LLM node with chat history and tool binding support"""
     
@@ -281,6 +313,14 @@ class LLMNode(BaseTool):
         description='Enable lazy tools mode. When True, only meta-tools (list_toolkits, get_toolkit_tools, invoke_tool) '
                     'are bound to the LLM. The model uses these to discover and invoke any tool from the registry. '
                     'This dramatically reduces token usage for agents with many toolkits (30-100+).'
+    )
+    code_mode: Optional[bool] = Field(
+        default=False,
+        description='Code Mode (#7579): bind execute_code/get_tool_api; registry tools are called from the program.'
+    )
+    code_mode_direct_tools: List[str] = Field(
+        default_factory=list,
+        description='Code Mode: tools that need approval, bound directly instead of being called from programs.'
     )
     tool_registry: Optional[Any] = Field(
         default=None,
@@ -329,6 +369,7 @@ class LLMNode(BaseTool):
                     'when the independent parallel HITL supervisor is enabled.'
     )
     _meta_tools: Optional[List[BaseTool]] = None  # Cached meta-tools
+    _code_mode_tools: Optional[List[BaseTool]] = None
 
     def _prepare_structured_output_params(self) -> dict:
         """
@@ -501,6 +542,12 @@ class LLMNode(BaseTool):
         if self._client_is_openai_compatible(self.client):
             return self._structured_via_json_prompt(llm_client, synth_messages, struct_model, config)
 
+        # Thinking Anthropic goes through json_schema (see __get_struct_output_model),
+        # which can only return {} for an open object (#7623); parse via Pydantic instead.
+        if (self._is_anthropic_thinking_client(self.client)
+                and has_open_object(make_anthropic_compatible_schema(struct_model))):
+            return self._structured_via_json_prompt(llm_client, synth_messages, struct_model, config)
+
         try:
             llm = self.__get_struct_output_model(llm_client, struct_model)
             return llm.invoke(
@@ -568,12 +615,23 @@ class LLMNode(BaseTool):
             return extracted
 
         content = completion.content if hasattr(completion, 'content') else str(completion)
-        if isinstance(content, list):
-            content = ''.join(
-                b.get('text', '') for b in content
-                if isinstance(b, dict) and b.get('type') == 'text'
-            )
-        return self._create_fallback_completion(str(content).strip(), struct_model)
+        return self._create_fallback_completion(self._structured_text(content).strip(), struct_model)
+
+    @staticmethod
+    def _structured_text(content: Any) -> str:
+        """Text of a reply to parse as JSON: text blocks and bare strings, joined.
+
+        With thinking on, Claude 5.5 can return the answer as a bare string beside
+        the thinking block (``['', {'type': 'thinking', ...}, '{...}']``) instead
+        of a ``{'type': 'text'}`` block (#7623).
+        """
+        if not isinstance(content, list):
+            return str(content)
+        return ''.join(
+            block if isinstance(block, str) else block.get('text', '')
+            for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get('type') == 'text')
+        )
 
     def _build_json_instruction(self, struct_model: Any) -> str:
         """
@@ -612,12 +670,7 @@ class LLMNode(BaseTool):
         """
         try:
             content = completion.content if hasattr(completion, 'content') else str(completion)
-            if isinstance(content, list):
-                content = ''.join(
-                    block.get('text', '') for block in content
-                    if isinstance(block, dict) and block.get('type') == 'text'
-                )
-            content = content.strip()
+            content = self._structured_text(content).strip()
             if not content:
                 return None
             parsed = extract_json_content(content)
@@ -682,7 +735,9 @@ class LLMNode(BaseTool):
                 # Optional fields: use actual default, but guard against PydanticUndefined
                 field_default = field.default
                 result_dict[k] = None if field_default is PydanticUndefined else field_default
-        return struct_model.model_construct(**result_dict)
+        # Only the raw text counts as set, so the caller can tell these
+        # placeholder values from ones the model returned (#7623).
+        return struct_model.model_construct(_fields_set={ELITEA_RS}, **result_dict)
 
     def _handle_structured_output_fallback(self, llm_client: Any, messages: List, struct_model: Any,
                                           config: RunnableConfig, original_error: Exception) -> Any:
@@ -719,9 +774,17 @@ class LLMNode(BaseTool):
         Returns:
             Formatted result dictionary with messages
         """
-        # Ensure messages are properly formatted
-        if result.get('messages') and isinstance(result['messages'], list):
-            result['messages'] = [{'role': 'assistant', 'content': '\n'.join(result['messages'])}]
+        # Ensure messages are properly formatted. The `messages` field is typed
+        # list[JsonValue], so models may fill it with strings or with
+        # {"role": ..., "content": ...} dicts.
+        messages_value = result.get('messages')
+        if isinstance(messages_value, str):
+            messages_value = [messages_value]
+        parts = []
+        if isinstance(messages_value, list):
+            parts = [text for text in (self._structured_message_text(item) for item in messages_value) if text]
+        if parts:
+            result['messages'] = [{'role': 'assistant', 'content': '\n'.join(parts)}]
         else:
             # Extract content from initial_completion, handling thinking blocks
             fallback_content = result.get(ELITEA_RS, '')
@@ -742,6 +805,17 @@ class LLMNode(BaseTool):
                 'elitea_routing': initial_completion.response_metadata['elitea_routing']} if isinstance(initial_completion, AIMessage) and initial_completion.response_metadata.get('elitea_routing') else {})])
 
         return result
+
+    @staticmethod
+    def _structured_message_text(item: Any) -> str:
+        """Convert one item of a structured `messages` list to text."""
+        if isinstance(item, dict) and 'content' in item:
+            item = item['content']
+        if item is None:
+            return ''
+        if isinstance(item, str):
+            return item
+        return json.dumps(item, ensure_ascii=False)
 
     def get_filtered_tools(self, config: Optional[Any] = None) -> List[BaseTool]:
         """
@@ -773,6 +847,7 @@ class LLMNode(BaseTool):
             skill_search=configurable.get('skill_search'),
             skill_body_fetcher=self._resolve_skill_body_fetcher(configurable),
             skill_file_fetcher=getattr(self.elitea_client, 'get_skill_file', None),
+            skill_script_runner=self._build_skill_script_runner(configurable),
         )
 
         def merge_skill_tools(tools):
@@ -793,6 +868,9 @@ class LLMNode(BaseTool):
             # This ensures Planner tools are available even on first message when
             # Smart Tools Selection finds matching toolkits.
             return merge_skill_tools(list(selected_tools) + list(self.always_bind_tools or []))
+
+        if self.code_mode and self.tool_registry is not None:
+            return merge_skill_tools(self._get_code_mode_tools() + list(self.always_bind_tools or []))
 
         # Check if lazy tools mode is enabled and we have a registry
         if self.lazy_tools_mode and self.tool_registry is not None:
@@ -876,6 +954,26 @@ class LLMNode(BaseTool):
             )
         return self._meta_tools
 
+    def _get_code_mode_tools(self) -> List[BaseTool]:
+        if self._code_mode_tools is None:
+            from .code_mode import create_code_mode_tools, find_sensitive_guard
+            tools = create_code_mode_tools(self.tool_registry, sensitive_guard=find_sensitive_guard(self.middleware_manager),
+                                           direct_tool_names=self.code_mode_direct_tools)
+            # The dispatcher refuses sensitive calls itself, so the HITL guard is skipped like for meta-tools.
+            if self.middleware_manager is not None:
+                tools = [self.middleware_manager.wrap_tool(t, skip_sensitive_guard=True) for t in tools]
+            self._code_mode_tools = tools
+        return list(self._code_mode_tools)
+
+    def _uses_tool_index(self) -> bool:
+        return bool((self.lazy_tools_mode or self.code_mode) and self.tool_registry is not None)
+
+    def _registry_index(self) -> str:
+        if self.code_mode:
+            from .code_mode import generate_code_mode_index
+            return generate_code_mode_index(self.tool_registry, self.code_mode_direct_tools)
+        return self.tool_registry.generate_index()
+
     def get_tool_index(self) -> str:
         """
         Generate a compressed tool index for inclusion in system prompt.
@@ -886,7 +984,7 @@ class LLMNode(BaseTool):
             Formatted string with toolkit/tool index, or empty string if not applicable
         """
         if self.tool_registry is not None:
-            return self.tool_registry.generate_index()
+            return self._registry_index()
         return ""
 
     def _inject_tool_index_into_messages(self, messages: List) -> List:
@@ -905,7 +1003,7 @@ class LLMNode(BaseTool):
         if not self.tool_registry:
             return messages
 
-        tool_index = self.tool_registry.generate_index()
+        tool_index = self._registry_index()
 
         # Find and modify the system message
         modified_messages = []
@@ -1054,6 +1152,25 @@ class LLMNode(BaseTool):
         }
         return invoked | loaded_skill_names_from_messages(list(chat_history or []))
 
+    def _build_skill_script_runner(self, configurable: dict):
+        """A runner for this turn's scripts, keyed by the conversation the platform verified for the run, or None when
+        the run has no client or the platform sent no such conversation."""
+        scratch = configurable.get('skill_scratch') or {}
+        conversation_uuid = scratch.get('conversation_uuid')
+        if not is_canonical_uuid(conversation_uuid) or not scratch.get('bucket'):
+            return None
+        if not callable(getattr(self.elitea_client, 'get_skill_file', None)):
+            return None
+        return SkillScriptRunner(
+            ScriptRunContext(
+                client=self.elitea_client,
+                scratch_bucket=scratch['bucket'],
+                attachment_bucket=configurable.get('attachment_bucket') or scratch['bucket'],
+                conversation_uuid=conversation_uuid,
+            ),
+            file_fetcher=self.elitea_client.get_skill_file,
+        )
+
     def _resolve_skill_body_fetcher(self, configurable: dict):
         fetcher = configurable.get('skill_body_fetcher')
         if callable(fetcher):
@@ -1063,7 +1180,7 @@ class LLMNode(BaseTool):
     def _should_bind_tools(self, configurable: dict) -> bool:
         return (
             len(self.tool_names or []) > 0 or
-            (self.lazy_tools_mode and self.tool_registry is not None) or
+            self._uses_tool_index() or
             bool(self.available_tools) or  # Bind available tools even when lazy mode auto-disabled
             bool(configurable.get('attached_skills')) or  # Bind search_skills + load_skill for on-demand disclosure
             bool(configurable.get('project_skills'))
@@ -1087,8 +1204,8 @@ class LLMNode(BaseTool):
             )
             if 'system' in func_args:
                 system_content = str(func_args.get('system') or '')
-                if self.lazy_tools_mode and self.tool_registry is not None and not configurable.get('selected_tools'):
-                    system_content = f"{system_content}\n\n{self.tool_registry.generate_index()}"
+                if self._uses_tool_index() and not configurable.get('selected_tools'):
+                    system_content = f"{system_content}\n\n{self._registry_index()}"
             else:
                 system_content = next(
                     (m.content for m in state.get('messages', []) if isinstance(m, SystemMessage)), None
@@ -1351,9 +1468,7 @@ class LLMNode(BaseTool):
             logger.error(f"Error in LLM Node: {format_exc()}")
             logger.error(f"Model being used: {model_info}")
             logger.error(f"Error type: {type(e).__name__}")
-            _error_msg = AIMessage(content=f"Error: {describe_llm_error(e, _llm_idle_timeout(self.client))}")
-            _error_msg.response_metadata['llm_node_error'] = True
-            _error_msg.response_metadata['llm_node_exception_type'] = type(e).__name__
+            _error_msg = _llm_error_message(f"Error: {describe_llm_error(e, _llm_idle_timeout(self.client))}", e, self.client)
             result = {"messages": [_error_msg]}
 
         # A before_model hook may have swapped stored messages for model-only copies (input
@@ -1479,8 +1594,8 @@ class LLMNode(BaseTool):
 
             # Inject tool index into system prompt if lazy tools mode is enabled
             # Skip injection if dynamic tool selection provided actual tools
-            if self.lazy_tools_mode and self.tool_registry is not None and not has_selected_tools:
-                tool_index = self.tool_registry.generate_index()
+            if self._uses_tool_index() and not has_selected_tools:
+                tool_index = self._registry_index()
                 system_content = f"{system_content}\n\n{tool_index}"
                 logger.debug("[LazyTools] Injected tool index into system prompt")
 
@@ -1618,7 +1733,7 @@ class LLMNode(BaseTool):
 
                 # Inject tool index into system message if lazy tools mode is enabled
                 # Skip injection if dynamic tool selection provided actual tools
-                if self.lazy_tools_mode and self.tool_registry is not None and not has_selected_tools:
+                if self._uses_tool_index() and not has_selected_tools:
                     messages = self._inject_tool_index_into_messages(messages)
             else:
                 raise ToolException("LLMNode requires 'messages' in state for chat-based interaction")
@@ -1712,6 +1827,19 @@ class LLMNode(BaseTool):
             # Google / extraction-fallback all yield Pydantic instances.
             # Either way, the consumer wants a dict.
             result = completion if isinstance(completion, dict) else completion.model_dump()
+
+            # A reply that could not be parsed comes back from
+            # ``_create_fallback_completion`` with only ELITEA_RS set. Its other
+            # fields are placeholders, so drop them rather than overwrite state
+            # values set by earlier nodes with None (#7623).
+            if not isinstance(completion, dict) and completion.model_fields_set <= {ELITEA_RS}:
+                unparsed = [k for k, v in result.items() if k != ELITEA_RS and v is None]
+                if unparsed:
+                    logger.warning(
+                        "Structured output could not be parsed; keeping existing state for %s",
+                        unparsed,
+                    )
+                    result = {k: v for k, v in result.items() if k not in unparsed}
 
             # Anthropic's dict-schema path (see __get_struct_output_model) hands
             # back the raw tool-call arguments with no Pydantic model to filter
@@ -2260,6 +2388,10 @@ class LLMNode(BaseTool):
         filtered_tool = filtered_plan.resolve(tool_name)
         if filtered_tool is not None:
             return filtered_tool
+        # In code mode toolkit tools run only through execute_code; a guessed name must not bypass the dispatcher.
+        if self.code_mode and self.tool_registry is not None:
+            logger.warning("[CodeMode] Refused direct call to unbound tool '%s'", tool_name)
+            return None
 
         available_plan = build_tool_binding_plan(self.available_tools or [])
         available_tool = available_plan.resolve(tool_name)
@@ -3451,6 +3583,15 @@ class LLMNode(BaseTool):
         route = f"{container_call_id}\x1f{leaf_call_id}"
         return f"hitl_{uuid5(NAMESPACE_URL, route).hex}"
 
+    def _parallel_mcp_auth_pause(self, exc, spec, config) -> 'ToolMessage':
+        tool_name, tool_args, tool_call_id, tool = spec
+        auth_interrupt = self._build_mcp_auth_interrupt(exc, tool, tool_name, tool_args, tool_call_id, config)
+        resume_value = _langgraph_interrupt(auth_interrupt)
+        action = str((resume_value or {}).get('action') or 'skip').strip().lower() if isinstance(resume_value, dict) else 'skip'
+        if action not in {'authorize', 'skip'}:
+            action = 'skip'
+        return ToolMessage(content=self._mcp_auth_decision_message(auth_interrupt, action), tool_call_id=tool_call_id)
+
     def _build_mcp_auth_interrupt(
         self,
         exc: McpAuthorizationRequired,
@@ -4189,6 +4330,12 @@ class LLMNode(BaseTool):
                 # the parent model would reason about it as data and may retry it
                 if isinstance(result, InputGuardrailBlocked):
                     raise result
+                if isinstance(result, GovernedCredentialError):
+                    raise result
+                if isinstance(result, McpAuthorizationRequired):
+                    # Same durable pause as the sequential loop; a lazily built sub-agent raises it on call
+                    new_messages.append(self._parallel_mcp_auth_pause(result, spec, config))
+                    continue
                 budget_error = budget_exceeded_from(result)
                 if budget_error is not None:
                     raise budget_error from result
@@ -4598,7 +4745,8 @@ class LLMNode(BaseTool):
                         ))
                         continue
                     except Exception as e:
-                        if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked)):
+                        # A governed refusal (#7229) ends the run readably, never as tool output
+                        if isinstance(e, (OutputContinuationExhausted, InputGuardrailBlocked, GovernedCredentialError)):
                             _PENDING_TOOL_MESSAGES.set([])
                             raise
                         # Same reasoning as the MCP clause above: swallowing a budget
@@ -4832,10 +4980,7 @@ class LLMNode(BaseTool):
                         error_details.append("- Model ID doesn't contain unexpected prefixes")
                     
                     error_msg = "\n".join(error_details)
-                    _tagged = AIMessage(content=error_msg)
-                    _tagged.response_metadata['llm_node_error'] = True
-                    _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
-                    new_messages.append(_tagged)
+                    new_messages.append(_llm_error_message(error_msg, e, self.client))
                     break
 
                 if is_context_error or is_output_limit_error:
@@ -4949,7 +5094,7 @@ class LLMNode(BaseTool):
                             break
                         logger.error(f"Error retrying LLM after truncation: {retry_error}")
                         error_msg = f"Failed to retry after truncation: {str(retry_error)}"
-                        new_messages.append(AIMessage(content=error_msg))
+                        new_messages.append(_llm_error_message(error_msg, retry_error, self.client))
                         break
                     else:
                         # Couldn't find tool message, add error and break
@@ -4963,16 +5108,13 @@ class LLMNode(BaseTool):
                                 "Context window exceeded. The conversation or tool results are too large. "
                                 "Try using tools with smaller output limits (e.g., max_items, max_depth parameters)."
                             )
-                        new_messages.append(AIMessage(content=error_msg))
+                        new_messages.append(_llm_error_message(error_msg, e, self.client))
                         break
                 else:
                     logger.error(f"Error in LLM call during iteration {iteration}: {e}")
                     # Add error message and break the loop
                     error_msg = f"Error processing tool results in iteration {iteration}: {describe_llm_error(e, _llm_idle_timeout(self.client))}"
-                    _tagged = AIMessage(content=error_msg)
-                    _tagged.response_metadata['llm_node_error'] = True
-                    _tagged.response_metadata['llm_node_exception_type'] = type(e).__name__
-                    new_messages.append(_tagged)
+                    new_messages.append(_llm_error_message(error_msg, e, self.client))
                     break
 
         # Handle max iterations (against the local budget, which injections may have bumped)
@@ -5011,7 +5153,7 @@ class LLMNode(BaseTool):
             
             # Add warning message - CLI or calling code can detect this and prompt user
             warning_msg = f"Maximum tool execution iterations ({effective_limit}) reached. Stopping tool execution."
-            new_messages.append(AIMessage(content=warning_msg))
+            new_messages.append(AIMessage(content=warning_msg, response_metadata={RUN_FAILURE_NOTICE_KEY: True}))
         else:
             logger.info(f"Tool execution completed after {iteration} iterations")
 

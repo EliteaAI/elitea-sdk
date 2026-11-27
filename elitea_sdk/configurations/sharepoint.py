@@ -5,9 +5,42 @@ from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from .microsoft_graph_scopes import SCOPES_NOTE, normalize_scopes, scopes_field_extra
 from .oauth_app_mode import OAUTH_APP_ID_FIELD, require_app_client
 
 log = logging.getLogger(__name__)
+
+# Permissions offered as checkboxes, in display order (Microsoft Graph delegated permissions). The delegated
+# (Default app / Custom app) toolkit works through Microsoft Graph only; App-only does not use them.
+SHAREPOINT_SCOPE_DESCRIPTIONS: Dict[str, str] = {
+    "Sites.Read.All": (
+        "Read sites, lists and files in site libraries: get_lists, read_list, get_list_columns, "
+        "get_files_list, read_document, connection test."
+    ),
+    "Sites.ReadWrite.All": "Add list items and upload files to sites: create_list_item, upload_file.",
+    "Files.Read.All": "Read files you can open, including OneDrive: get_files_list, read_document.",
+    "Files.ReadWrite.All": (
+        "Open sharing links and file URLs, upload files: read_file_from_sharing_link, read_file_from_url, "
+        "upload_file. Microsoft offers no read-only permission for sharing links."
+    ),
+    "Notes.Read.All": (
+        "Read site OneNote notebooks, sections, pages and attachments: onenote_get_*, onenote_read_*, "
+        "onenote_list_attachments."
+    ),
+    "Notes.ReadWrite.All": (
+        "Create, change and delete OneNote notebooks, sections and pages: onenote_create_*, "
+        "onenote_update_page, onenote_replace_page_content, onenote_delete_page."
+    ),
+}
+SHAREPOINT_SCOPES = list(SHAREPOINT_SCOPE_DESCRIPTIONS)
+# Read-only, like Teams and Outlook: the reading, OneNote and indexing tools work; writes and sharing links need
+# the ReadWrite permissions ticked
+SHAREPOINT_DEFAULT_SCOPES = ["Sites.Read.All", "Files.Read.All", "Notes.Read.All"]
+
+
+def normalize_sharepoint_scopes(value) -> List[str]:
+    """Allowed SharePoint permissions from a stored value (list or string); default when empty."""
+    return normalize_scopes(value, SHAREPOINT_SCOPES, SHAREPOINT_DEFAULT_SCOPES, source="SharePoint")
 
 # A credential that acts with the signed-in person's Microsoft sign-in (C-1009 #6756): it holds no secret; the platform
 # mints a Graph token on the person's behalf when a governed run starts and puts it in ``access_token``
@@ -17,6 +50,10 @@ DELEGATION_UNSUPPORTED = (
     "DENIED_DELEGATION_UNSUPPORTED_CALLER: this SharePoint credential acts with your Microsoft sign-in, which only "
     "works in runs you start yourself from Elitea."
 )
+
+# Stands in for the site while a credential is signed in without one (#7197)
+GRAPH_RESOURCE = "https://graph.microsoft.com"
+
 
 class SharepointConfiguration(BaseModel):
     model_config = ConfigDict(
@@ -59,11 +96,21 @@ class SharepointConfiguration(BaseModel):
     oauth_app_id: Optional[str] = OAUTH_APP_ID_FIELD
     client_id: Optional[str] = Field(default=None, description="SharePoint Client ID")
     client_secret: Optional[SecretStr] = Field(default=None, description="SharePoint Client Secret")
-    site_url: str = Field(description="SharePoint Site URL")
+    # Deprecated (#7197): the site belongs to the toolkit, so one credential can serve many sites. Kept optional and
+    # hidden so credentials (and toolkits) saved before keep working: the toolkit falls back to it.
+    site_url: Optional[str] = Field(
+        default=None,
+        description="Deprecated: set the Site URL on the toolkit instead",
+        json_schema_extra={"hidden": True},
+    )
 
     # Additional fields for delegated/OAuth flows
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth Discovery Endpoint. Usually in format: https://login.microsoftonline.com/{tenant_id}")
-    scopes: Optional[List[str]] = Field(default=None, description="OAuth Scopes")
+    scopes: Optional[List[str]] = Field(
+        default=list(SHAREPOINT_DEFAULT_SCOPES),
+        description=SCOPES_NOTE,
+        json_schema_extra=scopes_field_extra(SHAREPOINT_SCOPE_DESCRIPTIONS),
+    )
     auto_refresh_token: Optional[bool] = Field(
         default=False,
         description="Automatically refresh the access token using the offline_access scope. "
@@ -102,6 +149,11 @@ class SharepointConfiguration(BaseModel):
             raise ValueError("Must be https://login.microsoftonline.com/<tenant_id>")
         return value
 
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def _normalize_scopes(cls, value):
+        return normalize_sharepoint_scopes(value)
+
     @staticmethod
     def check_connection(settings: dict) -> str | None:
         """
@@ -122,7 +174,8 @@ class SharepointConfiguration(BaseModel):
 
         Args:
             settings: Dictionary that may contain:
-                - site_url (required for both flows)
+                - site_url (optional, deprecated: since #7197 the site is set on the toolkit; without it
+                  only the credentials themselves are checked)
                 - oauth_discovery_endpoint: activates the delegated flow
                 - access_token: pre-obtained OAuth bearer token (delegated flow)
                 - client_id / client_secret: app credentials
@@ -149,6 +202,12 @@ class SharepointConfiguration(BaseModel):
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _site_absent(settings: dict) -> bool:
+        """True when the credential carries no site (the normal case since #7197)."""
+        site_url = settings.get("site_url")
+        return site_url is None or (isinstance(site_url, str) and not site_url.strip())
 
     @staticmethod
     def _validate_site_url(settings: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -198,7 +257,7 @@ class SharepointConfiguration(BaseModel):
         scopes: Optional[List[str]],
         status: Optional[int] = None,
         configuration_uuid: Optional[str] = None,
-        auto_refresh_token: bool = False,
+        auto_refresh_token: Optional[bool] = None,
         toolkit_id: Optional[int] = None,
         toolkit_name: Optional[str] = None,
         client_id: Optional[str] = None,
@@ -220,12 +279,10 @@ class SharepointConfiguration(BaseModel):
             fetch_oauth_authorization_server_metadata,
         )
 
-        # Always inject offline_access in delegated OAuth mode so Azure AD returns
-        # a refresh_token in the token exchange response. The auto_refresh_token
-        # flag previously gated this, but the feature spec requires it by default.
-        effective_scopes = list(scopes or [])
-        if "offline_access" not in effective_scopes:
-            effective_scopes.insert(0, "offline_access")
+        # offline_access makes Azure AD return a refresh_token; it's left out only when token refresh
+        # is switched off explicitly (#7415). A missing setting keeps it, as since #170.
+        from .oauth_app_mode import sign_in_scopes
+        effective_scopes = sign_in_scopes(scopes, auto_refresh_token)
 
         base_discovery = oauth_discovery_endpoint.rstrip("/")
         # Azure AD v2.0 well-known URL — injected as an extra candidate so the
@@ -473,7 +530,10 @@ class SharepointConfiguration(BaseModel):
         ``www_authenticate``, and ``resource_metadata_url``, so upstream
         handlers need no special-casing for SharePoint.
         """
-        site_url, err = SharepointConfiguration._validate_site_url(settings)
+        if SharepointConfiguration._site_absent(settings):
+            site_url, err = GRAPH_RESOURCE, None   # no site to probe: only the sign-in itself can be checked
+        else:
+            site_url, err = SharepointConfiguration._validate_site_url(settings)
         if err:
             return err
 
@@ -482,7 +542,7 @@ class SharepointConfiguration(BaseModel):
         oauth_app_id = settings.get("oauth_app_id")
         # Default app mode: the client ID is public and needed for the sign-in URL
         app_client_id = settings.get("client_id") if oauth_app_id else None
-        auto_refresh_token = settings.get("auto_refresh_token", False)
+        auto_refresh_token = settings.get("auto_refresh_token")
         from ..runtime.utils.mcp_oauth import access_token_from_stored_login
         access_token = access_token_from_stored_login(settings)
         if not access_token:
@@ -500,6 +560,8 @@ class SharepointConfiguration(BaseModel):
                 client_id=app_client_id,
             )
 
+        if site_url == GRAPH_RESOURCE:
+            return None   # signed in; which site is probed is decided by each toolkit
         # Use Graph API for health-check — delegated tokens are Graph tokens
         return SharepointConfiguration._call_graph_api(
             site_url, access_token, oauth_discovery_endpoint, scopes, configuration_uuid,
@@ -535,6 +597,8 @@ class SharepointConfiguration(BaseModel):
         if not client_secret or not client_secret.strip():
             return "Client secret cannot be empty"
 
+        if SharepointConfiguration._site_absent(settings):
+            return None   # client id and secret are present; there is no site to try them on (#7197)
         site_url, err = SharepointConfiguration._validate_site_url(settings)
         if err:
             return err

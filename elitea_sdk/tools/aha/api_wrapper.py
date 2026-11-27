@@ -239,7 +239,7 @@ query SearchDocuments($query: String!, $searchableType: [String!]) {
 # ---------------------------------------------------------------------------
 
 OUTPUT_FORMAT_FIELD = (
-    Optional[str],
+    Optional[Literal[_OUTPUT_FORMATS]],
     Field(
         default="json",
         description=f"Response format: {_OUTPUT_FORMAT_VALUES}. Defaults to `json`.",
@@ -275,7 +275,7 @@ MAX_RECORDS_FIELD = (
     ),
 )
 RESOURCE_TYPE_FIELD = (
-    str,
+    _CommentResourceType,
     Field(description=f"Aha resource type: {_COMMENTABLE_RESOURCE_VALUES}."),
 )
 COMMENT_RESOURCE_TYPE_FIELD = (
@@ -488,7 +488,7 @@ AhaListCommentsInput = create_model(
 AhaManageRecordInput = create_model(
     "AhaManageRecordInput",
     action=(
-        str,
+        Literal[_MANAGE_ACTIONS],
         Field(
             description=(
                 "`create` to insert a new record, `update` to modify an existing "
@@ -497,7 +497,7 @@ AhaManageRecordInput = create_model(
         ),
     ),
     record_type=(
-        str,
+        Literal[_MANAGEABLE_RECORD_TYPES],
         Field(
             description=f"Record type. Accepted: {_MANAGEABLE_RECORD_VALUES}."
         ),
@@ -539,7 +539,7 @@ AhaManageRecordInput = create_model(
 AhaCreateRecordInput = create_model(
     "AhaCreateRecordInput",
     record_type=(
-        str,
+        Literal[_MANAGEABLE_RECORD_TYPES],
         Field(description=f"Record type to create. Accepted: {_MANAGEABLE_RECORD_VALUES}."),
     ),
     parent_id=(
@@ -565,7 +565,7 @@ AhaCreateRecordInput = create_model(
 AhaUpdateRecordInput = create_model(
     "AhaUpdateRecordInput",
     record_type=(
-        str,
+        Literal[_MANAGEABLE_RECORD_TYPES],
         Field(description=f"Record type to update. Accepted: {_MANAGEABLE_RECORD_VALUES}."),
     ),
     record_id=(
@@ -591,7 +591,7 @@ AhaUpdateRecordInput = create_model(
 AhaDeleteRecordInput = create_model(
     "AhaDeleteRecordInput",
     record_type=(
-        str,
+        Literal[_MANAGEABLE_RECORD_TYPES],
         Field(description=f"Record type to delete. Accepted: {_MANAGEABLE_RECORD_VALUES}."),
     ),
     record_id=(
@@ -660,7 +660,15 @@ AhaCreateRecordLinkInput = create_model(
 
 AhaCopyRecordInput = create_model(
     "AhaCopyRecordInput",
-    record_type=(str, Field(description="Record type. Only `release` is currently supported by Aha.")),
+    record_type=(
+        Literal["release"],
+        Field(
+            description=(
+                "Record type. Only `release` is currently supported by Aha. For other record types use "
+                "`manage_record(action='create', ...)` with the fields you want to copy."
+            )
+        ),
+    ),
     record_id=(str, Field(description="Record reference or numeric ID to duplicate.")),
 )
 
@@ -720,7 +728,7 @@ AhaFindProjectInput = create_model(
 AhaSearchRecordsInput = create_model(
     "AhaSearchRecordsInput",
     record_type=(
-        str,
+        Literal[_SEARCHABLE_RECORD_TYPES],
         Field(
             description=f"Record type to search: {_SEARCHABLE_RECORD_VALUES}.",
         ),
@@ -745,7 +753,7 @@ AhaSearchRecordsInput = create_model(
 AhaReadRecordsInput = create_model(
     "AhaReadRecordsInput",
     record_type=(
-        str,
+        Literal[_SEARCHABLE_RECORD_TYPES + ("page",)],
         Field(
             description=f"Record type: {_READABLE_RECORD_VALUES}.",
         ),

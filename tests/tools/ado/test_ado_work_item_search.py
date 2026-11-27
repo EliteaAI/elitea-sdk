@@ -727,8 +727,8 @@ def test_search_work_items_by_text_is_registered_as_a_tool():
     tools = build_wrapper(None).get_available_tools()
     by_name = {tool["name"]: tool for tool in tools}
 
-    assert by_name["search_work_items_by_text"]["args_schema"] is ADOWorkItemsTextSearch
-    assert by_name["search_work_items"]["args_schema"] is wrapper_module.ADOWorkItemsSearch
+    assert issubclass(by_name["search_work_items_by_text"]["args_schema"], ADOWorkItemsTextSearch)
+    assert issubclass(by_name["search_work_items"]["args_schema"], wrapper_module.ADOWorkItemsSearch)
 
 
 def test_tool_descriptions_keep_their_toolkit_suffix_under_the_longest_possible_suffixes():

@@ -30,8 +30,18 @@ def estimated_input_tokens(size):
     return -(-size // BYTES_PER_TOKEN)
 
 
+def block_type(value):
+    """The content-block type of ``value``, or ``None`` when it is not a typed block.
+
+    Only a string counts: a JSON schema has a ``type`` property too, and a tool whose
+    parameters include a field literally named ``type`` carries a dict under that key.
+    """
+    kind = value.get('type') if isinstance(value, dict) else None
+    return kind if isinstance(kind, str) else None
+
+
 def _is_image(block):
-    return isinstance(block, dict) and block.get('type') in IMAGE_BLOCKS
+    return block_type(block) in IMAGE_BLOCKS
 
 
 def required_modalities(messages):
@@ -58,8 +68,8 @@ def sized_images(value):
     """
     if isinstance(value, dict):
         image = value.get('image')
-        if value.get('type') in IMAGE_BLOCKS or (isinstance(image, dict) and 'source' in image):
-            return {'type': value.get('type', 'image'), 'estimate': 'x' * IMAGE_INPUT_BYTES}
+        if _is_image(value) or (isinstance(image, dict) and 'source' in image):
+            return {'type': block_type(value) or 'image', 'estimate': 'x' * IMAGE_INPUT_BYTES}
         return {k: sized_images(v) for k, v in value.items()}
     if isinstance(value, list):
         return [sized_images(v) for v in value]
@@ -113,9 +123,9 @@ def projection(messages):
             for block in content:
                 if isinstance(block, str):
                     text.append(block)
-                elif isinstance(block, dict) and block.get('type') in {'text', 'output_text'}:
+                elif block_type(block) in {'text', 'output_text'}:
                     text.append(block.get('text', ''))
-                elif isinstance(block, dict) and block.get('type') in {'thinking', 'redacted_thinking', 'tool_use', 'reasoning', 'reasoning_content'}:
+                elif block_type(block) in {'thinking', 'redacted_thinking', 'tool_use', 'reasoning', 'reasoning_content'}:
                     continue  # Opaque provider content remains on the generation path.
                 elif _is_image(block):
                     text.append(CLASSIFIER_IMAGE_TEXT)  # Pixels stay on the generation path.
@@ -332,7 +342,7 @@ class AutoChatModel(BaseChatModel):
         for message in messages:
             if isinstance(message, HumanMessage) and isinstance(message.content, list):
                 for block in message.content:
-                    if not isinstance(block, str) and not (isinstance(block, dict) and block.get('type') in {'text', 'output_text'}) \
+                    if not isinstance(block, str) and block_type(block) not in {'text', 'output_text'} \
                             and not (vision and _is_image(block)):
                         raise ValueError('Auto does not yet qualify this input modality')
         # A conservative screening bound over the actual LangChain provider

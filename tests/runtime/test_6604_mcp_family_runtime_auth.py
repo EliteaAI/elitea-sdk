@@ -140,7 +140,6 @@ def test_missing_token_keeps_the_first_login_guard(monkeypatch):
     )
 
     assert any(tool.name.startswith("mcp_authorize_") for tool in loaded)
-    assert any(tool.name == "mcp_auth_control" for tool in loaded)
 
 
 def test_direct_target_token_remains_available_across_consecutive_turns(monkeypatch):
@@ -243,7 +242,6 @@ def test_family_reuse_rejects_different_resource_origin(monkeypatch):
 
     assert len(calls) == 1
     assert any(tool.name.startswith("mcp_authorize_") for tool in loaded)
-    assert any(tool.name == "mcp_auth_control" for tool in loaded)
 
 
 def test_family_reuse_rejects_different_authorization_server(monkeypatch):
@@ -303,4 +301,3 @@ def test_rejected_family_token_falls_back_to_normal_auth_guard(monkeypatch):
 
     assert len(calls) == 2
     assert any(tool.name.startswith("mcp_authorize_") for tool in loaded)
-    assert any(tool.name == "mcp_auth_control" for tool in loaded)

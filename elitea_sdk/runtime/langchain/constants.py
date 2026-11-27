@@ -763,8 +763,10 @@ LOAD_SKILL_LISTED_TOOL_DESCRIPTION = (
     "matches the user's request — if you are unsure whether a skill matches, load "
     "it — but only once per skill. After the instructions are returned you MUST "
     "follow them exactly for the applicable part of your response. Never apply a "
-    "skill you have not loaded. Only skills listed in <available_skills> can be "
-    "loaded."
+    "skill you have not loaded. Skills outside <available_skills> cannot be loaded "
+    "on your own; if the user asks for a skill by a name that is not listed, call "
+    "load_skill with that name once: the answer tells you whether the skill exists "
+    "and whether only the user can start it."
 )
 
 LOAD_SKILL_UNKNOWN_LISTED = (
@@ -772,7 +774,7 @@ LOAD_SKILL_UNKNOWN_LISTED = (
     "Call load_skill with one of these exact names, or proceed without a skill if none apply."
 )
 
-SKILL_SEARCH_PROMPT = """Skills with specialised instructions are available on demand. They are not listed here. Skills whose description matches the current request are suggested in a <suggested_skills> block at the end of your instructions for that request; call `load_skill` with the exact name of each suggested skill that applies BEFORE writing your answer. When nothing is suggested but the request might still benefit from a skill, call `search_skills` with a short description of what the user needs, then `load_skill` for each result that applies. Never imitate a skill you have not loaded. Follow each loaded skill's instructions exactly, within its own scope. If no skill applies, answer normally. Do not mention skills, `search_skills` or `load_skill` in your reply."""
+SKILL_SEARCH_PROMPT = """Skills with specialised instructions are available on demand. They are not listed here. Skills whose description matches the current request are suggested in a <suggested_skills> block at the end of your instructions for that request; call `load_skill` with the exact name of each suggested skill that applies BEFORE writing your answer. When nothing is suggested but the request might still benefit from a skill, call `search_skills` with a short description of what the user needs, then `load_skill` for each result that applies. If the user asks for a skill by name and `search_skills` does not return it, call `load_skill` with that exact name once: the answer tells you whether the skill exists and whether only the user can start it. Never imitate a skill you have not loaded. Follow each loaded skill's instructions exactly, within its own scope. If no skill applies, answer normally. Do not mention skills, `search_skills` or `load_skill` in your reply."""
 
 SKILL_SUGGESTIONS_HEADER = (
     "<suggested_skills>\nThese skills match the current request by description. Call load_skill "
@@ -865,6 +867,13 @@ LOAD_SKILL_UNAVAILABLE = (
 LOAD_SKILL_UNAVAILABLE_DENIED = "it is no longer accessible"
 LOAD_SKILL_UNAVAILABLE_TRANSIENT = "its instructions could not be fetched right now"
 
+LOAD_SKILL_USER_ONLY = (
+    "Skill \"{name}\" can only be started by the user, by typing ~{name} in their message. "
+    "Do not load it, and do not reproduce its steps another way. If the user wants it, "
+    "including to continue it, ask them to send ~{name}. You may name this skill to the "
+    "user for this purpose only."
+)
+
 SKILL_ROOT_URI = "skill://{name}"
 
 SKILL_FILES_BLOCK = """Skill root: skill://{name}/
@@ -874,6 +883,13 @@ Read this skill's files only with read_skill_file(skill="{name}", path="{example
 </skill_files>"""
 SKILL_FILES_BLOCK_END = "</skill_files>"
 SKILL_FILES_SCRIPTS_NOTE = "\nYou cannot run scripts here; read one and follow it yourself."
+SKILL_FILES_RUN_SCRIPTS_NOTE = (
+    "\nRun one of this skill's Python scripts with run_skill_script(skill=\"{name}\", path=\"{example}\", args=[...], "
+    "files=[...]): it runs offline in a sandbox with the skill's files at /skills/{name}/, in a working directory "
+    "that persists between script calls of this conversation (it may expire between sessions); attachments named in "
+    "files appear under inputs/, and anything the script writes directly under output/ is shared with the user. Only "
+    ".py files run; other scripts cannot run on this platform."
+)
 SKILL_FILES_LISTING_LIMIT = 30
 SKILL_FILES_LISTING_FILE = "{path} ({size})"
 SKILL_FILES_LISTING_DIRECTORY = "{path}/ ({count} {unit})"
@@ -934,6 +950,24 @@ SKILL_FILE_UNAVAILABLE = "Skill \"{name}\" file \"{path}\" could not be read: {r
 SKILL_FILE_UNAVAILABLE_DENIED = "it is no longer accessible"
 SKILL_FILE_UNAVAILABLE_TRANSIENT = "it could not be fetched right now"
 SKILL_FILE_SUGGESTION_LIMIT = 3
+
+RUN_SKILL_SCRIPT_TOOL_DESCRIPTION = (
+    "Run a Python script bundled with a loaded skill, when the skill's instructions say to. Pass the skill's exact "
+    "name, the script's path relative to the skill root (such as path=\"scripts/check.py\"), its command-line "
+    "arguments as a list of strings, and in files the names of conversation attachments the script must read. The "
+    "script runs offline in a Python sandbox with no network and no platform access, for at most "
+    "{timeout} seconds: the skill's files are at /skills/<name>/, the working directory persists between script "
+    "calls of this conversation (it may expire between sessions), attachments named in files appear under inputs/, "
+    "and files the script writes directly under output/ are shared with the user as attachments. Files a script "
+    "writes are kept even when it fails, so a later call sees what a failed one left behind. The result is "
+    "\"Exit code N\" followed by what the script printed; output over {inline_chars} characters is saved and "
+    "returned as a preview with a skill-output:// reference for read_skill_output. Only .py files run."
+)
+READ_SKILL_OUTPUT_TOOL_DESCRIPTION = (
+    "Read the saved output of an earlier run_skill_script call whose result named a skill-output:// reference, by "
+    "line range (1-based, inclusive). Omit start_line and end_line to read it from the beginning."
+)
+
 
 
 SEARCH_INDEX_ADDON = """

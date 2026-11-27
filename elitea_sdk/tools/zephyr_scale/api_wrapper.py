@@ -13,6 +13,7 @@ from langchain_core.documents import Document
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.available_tools_decorator import extend_with_parent_available_tools
 from ..utils.content_parser import file_extension_by_chunker
+from ..utils.source_info import join_location, web_host
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
 
@@ -92,7 +93,7 @@ ZephyrTestStepsInputModel = create_model(
     "ZephyrTestStepsInputModel",
     test_case_key=(str, Field(
         description="The key of the test case. Test case keys are of the format [A-Z]+-T[0-9]+")),
-    tc_mode=(str, Field(
+    tc_mode=(Literal["APPEND", "OVERWRITE"], Field(
         description=("Valid values: 'APPEND', 'OVERWRITE'. "
                      "'OVERWRITE' deletes and recreates the test steps and associated custom field values using the provided input. "
                      "Attachments for existing steps are kept, but those for missing steps are deleted permanently. "
@@ -113,7 +114,7 @@ ZephyrGetFolders = create_model(
     projectKey=(Optional[str], Field(
         description="Jira project key filter. Must match the pattern [A-Z][A-Z_0-9]+.",
         default=None)),
-    folderType=(Optional[str], Field(
+    folderType=(Optional[Literal["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]], Field(
         description=("Folder type filter. Valid values are 'TEST_CASE', 'TEST_PLAN', or 'TEST_CYCLE'."),
         default=None))
 )
@@ -190,7 +191,7 @@ ZephyrSearchTestCases = create_model(
     max_results=(Optional[int], Field(description="Maximum number of results to query from the API", default=1000, gt=0)),
     start_at=(Optional[int], Field(description="Zero-indexed starting position", default=0)),
     order_by=(Optional[str], Field(description="Field to order results by", default="name")),
-    order_direction=(Optional[str], Field(description="Order direction", default="ASC")),
+    order_direction=(Optional[Literal["ASC", "DESC"]], Field(description="Order direction", default="ASC")),
     archived=(Optional[bool], Field(description="Include archived test cases", default=False)),
     fields=(Optional[List[str]], Field(description="Fields to include in the response (default: key, name). Regular fields include key, name, id, labels, folder, etc. Custom fields can be included in the following ways:Individual custom fields via customFields.field_name format, All custom fields via customFields in the fields list", default=["key", "name"])),
     limit_results=(Optional[int], Field(description="Maximum number of filtered results to return", default=10, gt=0)),
@@ -265,6 +266,7 @@ ZephyrUpdateTestSteps = create_model(
 
 
 class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "zephyr_scale"
     index_item_labels = ('test case', 'test cases')
     # url for a Zephyr server
     base_url: Optional[str] = ""
@@ -1242,8 +1244,15 @@ class ZephyrScaleApiWrapper(NonCodeIndexerToolkit):
             """)),
         }
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        if metadata.get('type') == "FOLDER":
+            return f"folder {metadata['name']}" if metadata.get('name') else None
+        return metadata.get('key')
+
     def _base_loader(self, project_key: str, jql: str, **kwargs) -> Generator[Document, None, None]:
         self._chunking_tool = kwargs.get('chunking_tool', None)
+        self._record_index_source(location=join_location(
+            web_host(self.base_url), project_key, f"JQL: {jql}" if jql else None))
         for test_case_doc in self._get_test_cases_docs(project_key, jql):
             yield test_case_doc
         for folder_doc in self._get_folders_docs(project_key):

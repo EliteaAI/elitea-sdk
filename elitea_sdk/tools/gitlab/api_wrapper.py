@@ -1,6 +1,6 @@
 # api_wrapper.py
 import fnmatch
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from gitlab import GitlabGetError
 from langchain_core.tools import ToolException
@@ -16,6 +16,7 @@ from ..utils.file_metadata import guard_text_read, guard_nontext_read, capped_re
 from .utils import expand_inclusive_upper_bound, get_position
 from ..utils.tool_prompts import EDIT_FILE_DESCRIPTION, UPDATE_FILE_PROMPT_WITH_PATH
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import encode_path, encode_ref, web_base, web_url
 
 AppendFileModel = create_model(
     "AppendFileModel",
@@ -97,7 +98,10 @@ ListFoldersModel = create_model(
 )
 GetIssuesModel = create_model(
     "GetIssuesModel",
-    state=(Optional[str], Field(default="opened", description="Issue state filter: opened | closed | all")),
+    state=(
+        Optional[Literal["opened", "closed", "all"]],
+        Field(default="opened", description="Issue state filter: opened | closed | all"),
+    ),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when fetch_all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when fetch_all=True)")),
     created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
@@ -137,7 +141,10 @@ GetCommitsModel = create_model(
 # back to raw diff-only get_pr_changes.
 ListMergeRequestsModel = create_model(
     "ListMergeRequestsModel",
-    state=(Optional[str], Field(default="all", description="Merge request state filter: opened | merged | closed | all")),
+    state=(
+        Optional[Literal["opened", "closed", "locked", "merged", "all"]],
+        Field(default="all", description="Merge request state filter: opened | closed | locked | merged | all"),
+    ),
     page=(Optional[int], Field(default=None, description="Page number for pagination (ignored when all=True)")),
     per_page=(Optional[int], Field(default=20, description="Number of results per page (ignored when all=True)")),
     created_after=(Optional[str], Field(default=None, description="Inclusive lower bound on created_at. ISO 8601; a bare date (2026-09-03) starts at midnight")),
@@ -161,6 +168,7 @@ GetMergeRequestModel = create_model(
 )
 
 class GitLabAPIWrapper(CodeIndexerToolkit):
+    index_source_type = "gitlab"
     url: str
     repository: str
     private_token: SecretStr
@@ -207,6 +215,15 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
     def _sanitize_url(url: str) -> str:
         """Remove trailing slash from URL if present."""
         return url.rstrip('/') if url else url
+
+    def _index_target_metadata(self, target: Dict[str, str]) -> Dict[str, str]:
+        repository = getattr(self.repo_instance, "path_with_namespace", None) or self.repository
+        return {"repository": repository} if repository else {}
+
+    def _code_web_url(self, repository: str, branch: str, path: str = "") -> Optional[str]:
+        view = "blob" if path else "tree"
+        return web_url(web_base(self.url), encode_path(repository), "-", view,
+                       encode_ref(branch), encode_path(path) if path else "")
 
     @model_validator(mode='before')
     @classmethod
@@ -929,7 +946,7 @@ class GitLabAPIWrapper(CodeIndexerToolkit):
         aging, rejection rate and self-merge calculations.
 
         Parameters:
-            state: opened | merged | closed | all
+            state: opened | closed | locked | merged | all
             page: Page number (ignored when all=True)
             per_page: Results per page (ignored when all=True)
             created_after: Inclusive ISO 8601 lower bound on created_at

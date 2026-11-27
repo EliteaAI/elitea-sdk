@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Iterable, Optional, Tuple, Union
 
 from jinja2 import DebugUndefined
-from jinja2.sandbox import SandboxedEnvironment
+from ..utils.safe_templates import HardenedSandboxedEnvironment
 from langgraph.errors import GraphBubbleUp
 
 from ..exceptions import InputGuardrailBlocked, budget_exceeded_from
@@ -23,11 +23,14 @@ from .constants import (
 )
 from ..middleware.tool_exception_handler import (
     ToolExceptionHandlerMiddleware,
+    pending_authorization,
+    resolve_pending_authorizations,
     swarm_awrap_tool_call,
     swarm_handle_tool_errors,
     swarm_wrap_tool_call,
 )
 from ..middleware.base import Middleware, MiddlewareManager
+from ..middleware.builder import BuilderMiddleware, builder_action
 from ..models.agent_response import AgentResponse
 from ..tools.tool_binding import build_tool_binding_plan
 
@@ -37,6 +40,8 @@ logger = logging.getLogger(__name__)
 APP_TYPE_AGENT = "agent"      # Standard LangGraph react agent with tools
 APP_TYPE_PIPELINE = "pipeline"  # Graph-based workflow agent
 APP_TYPE_PREDICT = "predict"    # Special agent without memory store
+# Chat personas that bring an EliteA template; 'none' and 'bare' send instructions without one (#7467)
+TEMPLATE_PERSONAS = frozenset({"generic", "qa", "nerdy", "quirky", "cynical"})
 
 
 def _is_anthropic_model(model: Any) -> bool:
@@ -330,6 +335,7 @@ class Assistant:
                  persona: Optional[str] = "generic",
                  is_subgraph: bool = False,
                  lazy_tools_mode: Optional[bool] = None,
+                 code_mode: Optional[bool] = None,
                  middleware: Optional[list[Middleware]] = None,
                  child_dispatcher: Optional[Any] = None,
                  independent_parallel_hitl: bool = True,
@@ -369,6 +375,12 @@ class Assistant:
             self.lazy_tools_mode = lazy_tools_mode
         else:
             self.lazy_tools_mode = data.get('meta', {}).get('lazy_tools_mode', False)
+        if code_mode is None:
+            code_mode = 'code_mode' in conversation_internal_tools or 'code_mode' in version_internal_tools
+        self.code_mode = bool(code_mode) and app_type != 'pipeline'
+        if self.code_mode and self.lazy_tools_mode:
+            # create_graph turns lazy mode off only when code mode actually starts, so it stays the fallback.
+            logger.warning("[CodeMode] Both code_mode and lazy_tools_mode are set; code mode wins when available")
 
         # Log only the payload's top-level keys — the full dict carries
         # instructions and variable *values* that may include secrets.
@@ -426,7 +438,7 @@ class Assistant:
         internal_tools_list = data.get('internal_tools', []) or meta.get('internal_tools', [])
 
         # Filter out mode flags that aren't actual tools
-        mode_flags = {'lazy_tools_mode'}
+        mode_flags = {'lazy_tools_mode', 'code_mode'}
         actual_internal_tools = [t for t in internal_tools_list if t not in mode_flags]
 
         if actual_internal_tools:
@@ -458,7 +470,7 @@ class Assistant:
             logger.info(f"Added {len(actual_internal_tools)} internal tools as first-class: {actual_internal_tools}")
 
         # For pipeline agents, find the toolkit names of direct MCP/toolkit pipeline nodes
-        # so that mcp_auth_control is not injected for them (direct nodes bypass LLM decision-making).
+        # so that a skip on such a node stops the pipeline (direct nodes bypass LLM decision-making).
         pipeline_node_toolkit_names = None
         if self.app_type == APP_TYPE_PIPELINE:
             try:
@@ -500,8 +512,7 @@ class Assistant:
             # two toolkits with same-named tools (e.g. GitHub's create_issue and
             # Jira's create_issue) are both preserved.
             # Process injected tools first, then get_tools() results — get_tools() wins on
-            # conflict.  This ensures mcp_auth_control from get_tools() (which carries the
-            # ignored_mcp_servers guard) takes precedence over the injected version.
+            # conflict.
             _seen: dict = {}
             for _t in tools:
                 _toolkit = (getattr(_t, 'metadata', None) or {}).get('toolkit_name')
@@ -554,6 +565,14 @@ class Assistant:
             self._always_bind_tools = [
                 self.middleware_manager.wrap_tool(tool) for tool in self._always_bind_tools
             ]
+            # Elitea Builder (#7383): its five tools are always bound (never hidden by lazy mode), and the
+            # middleware applies an approved changeset through the fully wrapped builder_apply
+            builder_mw = next((mw for mw in middleware if isinstance(mw, BuilderMiddleware)), None)
+            if builder_mw is not None:
+                builder_tools = [tool for tool in self.tools if builder_action(tool.name)]
+                builder_mw.bind_tools(builder_tools)
+                bound = {id(tool) for tool in self._always_bind_tools}
+                self._always_bind_tools += [tool for tool in builder_tools if id(tool) not in bound]
 
         logger.debug(f"Tools initialized: {len(self.tools)} tools (lazy_mode={self.lazy_tools_mode})")
 
@@ -650,11 +669,11 @@ class Assistant:
                 context.update(extra_context)
 
             # Process template with Jinja2.
-            # SandboxedEnvironment blocks access to unsafe attributes/methods (e.g.
+            # HardenedSandboxedEnvironment blocks access to unsafe attributes/methods (e.g.
             # __class__.__subclasses__ chains) so an agent author cannot turn the
             # instruction template into a server-side template-injection RCE.
             # DebugUndefined leaves unresolved variables as {{variable}} rather than failing.
-            environment = SandboxedEnvironment(undefined=DebugUndefined)
+            environment = HardenedSandboxedEnvironment(undefined=DebugUndefined)
             template = environment.from_string(template_str)
             resolved = template.render(context)
 
@@ -736,9 +755,12 @@ class Assistant:
                 # (LLMNode) omits the SystemMessage entirely for empty content.
                 escaped_prompt = functional_addons
             logger.debug("bare persona: skipping EliteA persona template (instructions + tool addons only)")
-        # For agent/predict types, use instructions directly without wrapping.
-        # Persona templates (DEFAULT_ASSISTANT, etc.) are only used when persona is specified.
-        elif self.app_type in [APP_TYPE_AGENT, APP_TYPE_PREDICT] and prompt_instructions:
+        # Agents use their own instructions directly. Chat (predict) does too unless a persona
+        # template applies: its instructions then go in the template's Custom instructions (#7467).
+        elif prompt_instructions and (
+            self.app_type == APP_TYPE_AGENT
+            or (self.app_type == APP_TYPE_PREDICT and self.persona not in TEMPLATE_PERSONAS)
+        ):
             # Use agent's own instructions as the base system prompt; append addons
             # only when their corresponding tools are present.
             escaped_prompt = (
@@ -780,6 +802,8 @@ class Assistant:
             agent_tools = [t for t in simple_tools if self._is_agent_tool(t)]
             if agent_tools:
                 logger.info(f"Swarm mode enabled with {len(agent_tools)} child agents")
+                if self.code_mode:
+                    logger.warning("[CodeMode] Ignored: swarm mode builds its own agents and binds tools directly")
                 return self._create_swarm_agent(simple_tools, agent_tools)
             else:
                 logger.info("Swarm mode enabled but no agent tools found, using standard agent")
@@ -871,7 +895,7 @@ class Assistant:
         
         # Add tool-specific parameters only if tools exist and NOT in lazy mode
         # In lazy mode, we don't bind tool_names so the LLMNode uses meta-tools instead
-        if simple_tools and not self.lazy_tools_mode:
+        if simple_tools and not self.lazy_tools_mode and not self.code_mode:
             schema_dict['nodes'][0]['tool_names'] = tool_names
         
         # Convert to YAML string
@@ -889,6 +913,7 @@ class Assistant:
             debug=False,
             for_subgraph=self.is_subgraph,
             lazy_tools_mode=self.lazy_tools_mode,
+            code_mode=self.code_mode,
             elitea_client=self.elitea_client,
             steps_limit=self.max_iterations,
             always_bind_tools=self._always_bind_tools,  # Middleware tools always bound directly
@@ -996,6 +1021,13 @@ class Assistant:
         # Not "parent" or "coordinator" — just another peer in the swarm.
         main_agent_name = "main_agent"
 
+        def _repeats_paused_request(prior_msgs: list, new_human: HumanMessage) -> bool:
+            """Continuing a run paused for authorization re-sends its request; asking it again would redo finished steps."""
+            if not pending_authorization(prior_msgs):
+                return False
+            paused_request = next((m for m in reversed(prior_msgs) if isinstance(m, HumanMessage)), None)
+            return paused_request is not None and paused_request.text == new_human.text
+
         # --- Helper: filter orphaned tool_use blocks from message history ---
         def filter_orphaned_tool_calls(messages: list) -> list:
             """
@@ -1050,6 +1082,10 @@ class Assistant:
 
             def agent_node(state: MessagesState, config: RunnableConfig = None):
                 messages = state["messages"]
+                # Ending the subgraph here commits the batch to the swarm state; the
+                # wrapper raises once the graph returns (#7470).
+                if pending_authorization(messages):
+                    return {"messages": []}
                 # Filter out existing system messages to avoid "multiple non-consecutive system messages" error
                 filtered_messages = [m for m in messages if not isinstance(m, SystemMessage)]
                 # Filter orphaned tool_use blocks to avoid Anthropic API errors
@@ -1604,12 +1640,20 @@ class Assistant:
                                     break
                             if new_human is not None:
                                 input = dict(input)
-                                input["messages"] = [new_human]
+                                input["messages"] = resolve_pending_authorizations(prior_msgs, main_tools) + (
+                                    [] if _repeats_paused_request(prior_msgs, new_human) else [new_human]
+                                )
                                 logger.info(
                                     "[SWARM] Continuation: keeping checkpoint state, "
                                     "appending only the new HumanMessage"
                                 )
                     result = self._graph.invoke(input, config, **kwargs)
+
+                deferred_authorization = pending_authorization(
+                    result.get("messages", []) if isinstance(result, dict) else []
+                )
+                if deferred_authorization:
+                    raise deferred_authorization
 
                 # Check for HITL interrupt: when a peer's Application tool calls
                 # interrupt(), the swarm pregel suppresses GraphInterrupt and

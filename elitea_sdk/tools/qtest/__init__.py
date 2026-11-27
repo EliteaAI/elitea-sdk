@@ -47,7 +47,9 @@ class QtestToolkit(BaseToolkit):
             name,
             qtest_configuration=(QtestConfiguration, Field(description=get_credentials_tooltip("QTest"), json_schema_extra={
                 'configuration_types': ['qtest']})),
-            qtest_project_id=(int, Field(description="QTest project id")),
+            qtest_project_id=(Optional[int], Field(
+                default=None,
+                description="Default QTest project id. Optional: each tool call may name another project.")),
             no_of_tests_shown_in_dql_search=(Optional[int], Field(description="Max number of items returned by dql search",
                                                                   default=10)),
             # indexer configuration
@@ -101,7 +103,9 @@ class QtestToolkit(BaseToolkit):
             if selected_tools:
                 if tool["name"] not in selected_tools:
                     continue
-            description = f"{tool['description']}\nUrl: {qtest_api_wrapper.base_url}. Project id: {qtest_api_wrapper.qtest_project_id}"
+            description = f"{tool['description']}\nUrl: {qtest_api_wrapper.base_url}."
+            if qtest_api_wrapper.qtest_project_id is not None:
+                description = f"{description} Project id: {qtest_api_wrapper.qtest_project_id}"
             if toolkit_name:
                 description = f"{description}\nToolkit: {toolkit_name}"
             description = description[:1000]

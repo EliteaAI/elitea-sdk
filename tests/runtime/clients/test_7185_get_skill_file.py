@@ -50,8 +50,10 @@ def test_a_file_is_fetched_once_per_run_and_per_version():
     assert request.call_count == 2
 
 
-@pytest.mark.parametrize('status, denied', [(403, True), (404, True), (500, False), (502, False)])
-def test_get_skill_file_maps_http_failures_to_denied_or_transient(status, denied):
+@pytest.mark.parametrize('status, denied, missing', [
+    (403, True, False), (404, True, False), (410, False, True), (500, False, False), (502, False, False), (503, False, False),
+])
+def test_get_skill_file_maps_http_failures_to_denied_missing_or_transient(status, denied, missing):
     client = _client()
     with patch('requests.Session.request') as request:
         request.return_value = _response(status)
@@ -62,4 +64,5 @@ def test_get_skill_file_maps_http_failures_to_denied_or_transient(status, denied
         assert client.get_skill_file(1, 20, 120, 'forms.md') == b'later'
 
     assert error.value.denied is denied
+    assert error.value.missing is missing
     assert isinstance(error.value, SkillBodyUnavailable)

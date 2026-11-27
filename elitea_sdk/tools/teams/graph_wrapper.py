@@ -9,11 +9,13 @@ OAuth scopes (delegated), ticked in the Teams credential:
     ChatMessage.Send, Chat.Create             send to people / group chats
     Team.ReadBasic.All, Channel.ReadBasic.All list teams and channels
     ChannelMessage.Send                       post / reply in channels
+    ChannelMessage.Read.All (admin consent)   search_teams_messages (Search API)
     (offline_access is always added, for token refresh)
 
 Graph has no delegated "all my chats" message feed, so messages are read per
-chat, or found across Teams with the Search API. Reading channel messages
-needs ChannelMessage.Read.All (admin consent) and is intentionally not supported.
+chat, or found across Teams with the Search API. The Search API for Teams
+messages needs ChannelMessage.Read.All on top of Chat.Read; it needs Entra admin
+consent, so it is optional and never preselected.
 """
 from __future__ import annotations
 
@@ -76,7 +78,8 @@ def _needed_permission(method: Optional[str], url: str) -> Optional[str]:
             return "ChatMessage.Send" if "messages" in parts else "Chat.Create"
         return "Chat.Read"
     if parts[0] == "search":
-        return "Chat.Read"
+        # Chat.Read is a default scope; the Search API refuses Teams messages without this one
+        return "ChannelMessage.Read.All"
     if parts[0] in ("users", "me"):
         return "User.ReadBasic.All"
     return None
@@ -288,6 +291,7 @@ class TeamsGraphWrapper:
         configuration_uuid: Optional[str] = None,
         toolkit_id: Optional[int] = None,
         toolkit_name: Optional[str] = None,
+        auto_refresh_token: Optional[bool] = None,
     ):
         self._token = token
         self._scopes = scopes
@@ -298,6 +302,7 @@ class TeamsGraphWrapper:
         self._oauth_discovery_endpoint = oauth_discovery_endpoint
         self._configuration_uuid = configuration_uuid
         self._toolkit_id = toolkit_id
+        self._auto_refresh_token = auto_refresh_token
         self._toolkit_name = toolkit_name
         self._me: Optional[dict] = None
         self._users: Dict[str, dict] = {}         # lower(email / id) -> user
@@ -334,6 +339,7 @@ class TeamsGraphWrapper:
             toolkit_name=self._toolkit_name,
             client_id=self._client_id,
             client_secret=self._client_secret,
+            auto_refresh_token=self._auto_refresh_token,
         )
         auth_error.tool_name = None
         raise auth_error

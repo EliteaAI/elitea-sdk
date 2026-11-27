@@ -6,9 +6,10 @@ OAuth flow).  It communicates directly with
 ``https://graph.microsoft.com/v1.0`` using plain ``requests`` calls — the
 *office365-rest-python-client* library is **not** used here.
 
-Required OAuth scopes (delegated):
-    ``Sites.ReadWrite.All``, ``Files.ReadWrite.All``, ``Lists.ReadWrite.All``
-    (read-only variants also work for non-mutating operations)
+OAuth scopes (delegated): the SharePoint credential's list (``SHAREPOINT_SCOPE_DESCRIPTIONS`` in
+``elitea_sdk/configurations/sharepoint.py``); by default the read-only ``Sites.Read.All``,
+``Files.Read.All`` and ``Notes.Read.All``. Writes need the ReadWrite variants, and so do sharing
+links (``/shares`` has no read-only permission).
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from ...runtime.utils.mcp_oauth import McpAuthorizationRequired, is_entra_url
 
 from .base_wrapper import BaseSharepointWrapper
 from .browser_url import NOT_A_FILE_URL_MESSAGE, SharepointFileUrl, parse_sharepoint_file_url
+from .graph_retry import send_with_retry
 from .models import OnenotePageItems, OnenoteTextItem, OnenoteImageItem, OnenoteAttachmentItem
 from ..utils.content_parser import parse_file_content, parse_content_from_bytes
 from ..utils.file_metadata import bound_read_result, describe_requested_range
@@ -97,7 +99,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                  oauth_discovery_endpoint: Optional[str] = None,
                  configuration_uuid: Optional[str] = None,
                  toolkit_id: Optional[int] = None,
-                 toolkit_name: Optional[str] = None):
+                 toolkit_name: Optional[str] = None,
+                 auto_refresh_token: Optional[bool] = None):
         self.site_url = site_url.rstrip('/')
         self._token = token
         self._scopes = scopes
@@ -110,6 +113,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         self._oauth_discovery_endpoint = oauth_discovery_endpoint
         self._configuration_uuid = configuration_uuid
         self._toolkit_id = toolkit_id
+        self._auto_refresh_token = auto_refresh_token
         self._toolkit_name = toolkit_name
         # Lazily resolved and cached
         self.__site_id: Optional[str] = None
@@ -155,6 +159,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             toolkit_name=self._toolkit_name,
             client_id=self._client_id,
             client_secret=self._client_secret,
+            auto_refresh_token=self._auto_refresh_token,
         )
         # The LLM tool runner knows the exact leaf tool from BaseAction metadata.
         # Let it supply that name instead of presenting the SharePoint site URL.
@@ -220,10 +225,17 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
             logging.warning("SharePoint: token refresh error: %s", type(e).__name__)  # never the request (secret, token)
             return False
 
-    def _get(self, url: str, params: Optional[dict] = None) -> dict:
-        resp = requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
+    def _get(self, url: str, params: dict | None = None, retry_throttled: bool = False) -> dict:
+        # Only listings retry a throttled answer: a retry of other reads would slow a failing call for nothing.
+        def send() -> requests.Response:
+            return requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
+
+        if retry_throttled:
+            resp = send_with_retry(send)
+        else:
+            resp = send()
         if resp.status_code == 401 and self._try_refresh_token():
-            resp = requests.get(url, headers=self._auth_headers(), params=params, timeout=60)
+            resp = send_with_retry(send) if retry_throttled else send()
         self._raise_with_body(resp)
         return resp.json()
 
@@ -256,6 +268,16 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         if resp.status_code == 401 and self._try_refresh_token():
             resp = requests.delete(url, headers=self._auth_headers(), timeout=30)
         self._raise_with_body(resp)
+
+    def library_list_client(self):
+        """Graph list reads for library mode with this delegated token (refreshed on a 401)."""
+        from .library_metadata import GraphListClient
+        return GraphListClient(
+            self.site_url,
+            get_token=lambda: self._token,
+            refresh=self._try_refresh_token,
+            on_unauthorized=self._raise_authorization_required,
+        )
 
     # ------------------------------------------------------------------ #
     #  Site / Drive resolution (lazily cached)                            #
@@ -299,6 +321,7 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
         data = self._get(
             f"{_GRAPH_BASE}/sites/{self._resolve_site_id()}/drives",
             params={"$select": "id,name,webUrl"},
+            retry_throttled=True,
         )
         self.__drives_cache = data.get('value', [])
         logging.debug(
@@ -680,7 +703,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Callable[[str], None] | None = None,
+                       on_listing_gap: Callable[[str], None] | None = None):
         """
         Lists all files including files from subfolders across **all document
         libraries** on the site.
@@ -786,6 +810,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                             continue
                     typed_queue.append(
                         (did, f"{_GRAPH_BASE}/drives/{did}/root/children"))
+                if form_name and not typed_queue and on_listing_gap:
+                    # A renamed or removed library lists nothing; that is not proof that
+                    # the library holds no files.
+                    on_listing_gap("no document library matched the form name")
 
             while typed_queue and len(result) < limit_files:
                 drive_id, url = typed_queue.pop(0)
@@ -795,7 +823,8 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                     _t_req = time.perf_counter()
                     data = self._get(
                         next_link,
-                        params=params if next_link == url else None)
+                        params=params if next_link == url else None,
+                        retry_throttled=True)
                     _page_num += 1
                     logging.debug(
                         "[SP-Graph][get_files_list] page %d fetched in %.3fs — "
@@ -810,6 +839,9 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                                 typed_queue.append(
                                     (drive_id,
                                      f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/children"))
+                            elif on_listing_gap:
+                                # Without its id the folder cannot be walked, so its files are missing.
+                                on_listing_gap("a folder came back without an id")
                             continue
                         if 'file' not in item:
                             continue
@@ -832,6 +864,10 @@ class SharepointGraphWrapper(BaseSharepointWrapper):
                         if len(result) >= limit_files:
                             break
                     next_link = data.get('@odata.nextLink')
+
+            if on_listing_gap and len(result) >= limit_files:
+                # The listing stopped at the cap, so the files after it were never seen.
+                on_listing_gap("the file limit was reached before the listing ended")
 
             _t_total = time.perf_counter() - _t_start
             _result_size = len(str(result))

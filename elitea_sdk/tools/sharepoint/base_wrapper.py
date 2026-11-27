@@ -66,6 +66,7 @@ class BaseSharepointWrapper(ABC):
         include_extensions: Optional[List[str]] = None,
         skip_extensions: Optional[List[str]] = None,
         on_file_skipped: Optional[Callable[[str], None]] = None,
+        on_listing_gap: Callable[[str], None] | None = None,
     ):
         """Return a list of file metadata dicts from document libraries,
         including files from subfolders.
@@ -83,6 +84,9 @@ class BaseSharepointWrapper(ABC):
                 format as *include_extensions*.
             on_file_skipped: Called with the name of every file excluded by the
                 filters, so indexing can report what it left out.
+            on_listing_gap: Called with a short reason each time part of the
+                source may be missing from the result (a limit, a page or a
+                library that could not be read, a switch to another listing path).
 
         Returns:
             list[dict] on success, :class:`ToolException` on failure.
@@ -248,3 +252,16 @@ class BaseSharepointWrapper(ABC):
                            end_line: Optional[int] = None
                            ) -> Union[str, Dict[str, Any]]:
         raise ToolException(self._FILE_URL_NOT_SUPPORTED)
+
+    # ------------------------------------------------------------------ #
+    #  Document-library mode (#7352): Graph reads of library list items   #
+    # ------------------------------------------------------------------ #
+
+    _LIBRARY_MODE_NOT_SUPPORTED = (
+        "Library mode reads the library lists through Microsoft Graph. Use a credential with a "
+        "Microsoft sign-in (OAuth) or with app credentials (client id and secret)."
+    )
+
+    def library_list_client(self):
+        """A :class:`library_metadata.GraphListClient` bound to this backend's credential."""
+        raise ToolException(self._LIBRARY_MODE_NOT_SUPPORTED)

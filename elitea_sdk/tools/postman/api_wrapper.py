@@ -2,7 +2,7 @@ import copy
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from traceback import format_exc
 
 import requests
@@ -59,7 +59,7 @@ PostmanSearchRequests = create_model(
 
 PostmanAnalyze = create_model(
     "PostmanAnalyze",
-    scope=(str, Field(
+    scope=(Literal["collection", "folder", "request"], Field(
         description="The scope of analysis: 'collection', 'folder', or 'request'", 
         default="collection")),
     target_path=(Optional[str], Field(
@@ -106,7 +106,11 @@ PostmanUpdateCollectionVariables = create_model(
 PostmanUpdateCollectionAuth = create_model(
     "PostmanUpdateCollectionAuth",
     auth=(Optional[Dict[str, Any]], Field(default=None,
-        description="Authentication settings. Omit this parameter to clear authentication. Example: {'type': 'bearer', 'token': 'your_token'}"))
+        description="Authentication settings. Omit this parameter to clear authentication. Example: {'type': 'bearer', 'token': 'your_token'}")),
+    collection_id=(Optional[str], Field(
+        default=None,
+        description="Collection ID. If not specified, uses the collection_id from toolkit configuration"
+    ))
 )
 
 PostmanDeleteCollection = create_model(
@@ -290,7 +294,7 @@ PostmanGetRequestById = create_model(
 PostmanGetRequestScript = create_model(
     "PostmanGetRequestScript",
     request_path=(str, Field(description="Path to the request (folder/requestName)")),
-    script_type=(str, Field(description="The type of script to retrieve: 'test' or 'prerequest'", default="prerequest"))
+    script_type=(Literal["test", "prerequest"], Field(description="The type of script to retrieve: 'test' or 'prerequest'", default="prerequest"))
 )
 
 PostmanExecuteRequest = create_model(
@@ -1357,23 +1361,25 @@ class PostmanApiWrapper(BaseToolApiWrapper):
                 f"Unable to update collection {self.collection_id} variables: {str(e)}")
 
     @tool_group('write')
-    def update_collection_auth(self, auth: Dict[str, Any] = None, **kwargs) -> str:
+    def update_collection_auth(self, auth: Dict[str, Any] = None, collection_id: Optional[str] = None,
+                               **kwargs) -> str:
         """Update or clear collection authentication settings.
 
         When auth is omitted or None, authentication is cleared from the collection.
         """
+        coll_id = collection_id or self.collection_id
         try:
             # Get current collection
             current = self._make_request(
-                'GET', f'/collections/{self.collection_id}')
+                'GET', f'/collections/{coll_id}')
             collection_data = current["collection"]
 
             # Always apply auth — None clears authentication
             collection_data["auth"] = auth
 
-            self._make_request('PUT', f'/collections/{self.collection_id}',
+            self._make_request('PUT', f'/collections/{coll_id}',
                                json={"collection": collection_data})
-            updated = self._make_request('GET', f'/collections/{self.collection_id}')
+            updated = self._make_request('GET', f'/collections/{coll_id}')
             updated_data = updated["collection"]
             return json.dumps({
                 "collection": {"id": updated_data["info"]["_postman_id"], "name": updated_data["info"]["name"]},
@@ -1383,7 +1389,7 @@ class PostmanApiWrapper(BaseToolApiWrapper):
             stacktrace = format_exc()
             logger.error(f"Exception when updating collection auth: {stacktrace}")
             raise ToolException(
-                f"Unable to update collection {self.collection_id} auth: {str(e)}")
+                f"Unable to update collection {coll_id} auth: {str(e)}")
 
     @tool_group('delete')
     def delete_collection(self, collection_id: Optional[str] = None, **kwargs) -> str:

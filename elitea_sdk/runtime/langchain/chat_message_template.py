@@ -1,6 +1,8 @@
 import logging
 from typing import Any, Dict, List
-from jinja2 import Environment, DebugUndefined
+from jinja2 import DebugUndefined
+from jinja2.exceptions import SecurityError
+from ..utils.safe_templates import HardenedSandboxedEnvironment
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import (
     BaseMessage,
@@ -16,9 +18,13 @@ logger = logging.getLogger(__name__)
 class Jinja2TemplatedChatMessagesTemplate(ChatPromptTemplate):
 
     def _resolve_variables(self, message: BaseMessage, kwargs: Dict) -> BaseMessage:
-        environment = Environment(undefined=DebugUndefined)
-        template = environment.from_string(message.content)
-        content = template.render(kwargs)
+        # Sandboxed (#7681); a template the sandbox rejects keeps its raw content.
+        environment = HardenedSandboxedEnvironment(undefined=DebugUndefined)
+        try:
+            content = environment.from_string(message.content).render(kwargs)
+        except SecurityError:
+            logger.warning("Message template rejected by sandbox; using raw content")
+            content = message.content
         if isinstance(message, SystemMessage):
             return SystemMessage(content=content)
         elif isinstance(message, AIMessage):

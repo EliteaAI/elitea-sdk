@@ -1,4 +1,6 @@
+import functools
 import logging
+import traceback
 from copy import deepcopy
 
 import requests
@@ -18,6 +20,7 @@ from pydantic import ValidationError
 
 from ..langchain.assistant import Assistant as LangChainAssistant
 from .artifact import Artifact
+from .sandbox_client import in_project
 from ..middleware import (
     InputGuardMiddleware,
     LoggingStrategy,
@@ -25,6 +28,7 @@ from ..middleware import (
     SensitiveToolGuardMiddleware,
     TransformErrorStrategy,
 )
+from ..middleware.builder import BuilderMiddleware
 from ..middleware.sensitive_tool_guard import normalize_auto_approve
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from ..credential_slots import REASON_CODE_RE, GovernedCredentialError
@@ -131,14 +135,36 @@ class AuthSessionExpiredError(Exception):
 # Values the Schedules API of elitea_core accepts (models/pd/schedule_list.py)
 SCHEDULE_LIST_MAX_LIMIT = 100
 SCHEDULE_LIST_FILTERS = frozenset(
-    {'entity_type', 'status', 'enabled', 'owner_ids', 'entity_id', 'version_id', 'search', 'sort_by', 'sort_order'})
+    {'entity_type', 'status', 'enabled', 'owner_ids', 'entity_id', 'version_id', 'index_name', 'search', 'sort_by',
+     'sort_order'})
+SCHEDULE_INDEX_NAME_MAX_LENGTH = 256
 SCHEDULE_MAX_ID = 2 ** 31 - 1
 SCHEDULE_RUN_STATUSES = frozenset(
     {'running', 'success', 'failed', 'skipped', 'blocked', 'waiting_for_approval'})
 SCHEDULE_SORT_BY = frozenset({'name', 'entity_name', 'entity_type', 'next_run', 'last_run', 'enabled'})
 SCHEDULE_SORT_ORDER = frozenset({'asc', 'desc'})
-SCHEDULE_ENTITY_TYPES = frozenset({'agent', 'pipeline'})
+SCHEDULE_ENTITY_TYPES = frozenset({'agent', 'pipeline', 'toolkit_index'})
 SCHEDULE_TRIGGERS = ('manual', 'test')
+
+
+def _on_app_load_path(build):
+    # The agent being built joins the load path, so a sub-agent cycle back to it (root included) is cut
+    @functools.wraps(build)
+    def wrapper(self, application_id, application_version_id, *args, **kwargs):
+        from ..toolkits.tools import _APP_LOAD_STACK
+        try:
+            key = (int(application_id), int(application_version_id))
+        except (TypeError, ValueError):
+            return build(self, application_id, application_version_id, *args, **kwargs)
+        stack = _APP_LOAD_STACK.get()
+        if key in stack:
+            return build(self, application_id, application_version_id, *args, **kwargs)
+        token = _APP_LOAD_STACK.set(stack | {key})
+        try:
+            return build(self, application_id, application_version_id, *args, **kwargs)
+        finally:
+            _APP_LOAD_STACK.reset(token)
+    return wrapper
 
 
 class EliteAClient:
@@ -284,7 +310,7 @@ class EliteAClient:
             limit: Rows per page, an int from 1 to 100.
             offset: Rows to skip, an int from 0 to 2**31-1.
             **filters: Query filters, for example entity_type, status, enabled,
-                owner_ids, entity_id, version_id, search. A filter set to None is not sent.
+                owner_ids, entity_id, version_id, index_name, search. A filter set to None is not sent.
                 A list or tuple (owner_ids) is sent as a list: the key repeats
                 once per item in the query string.
 
@@ -295,6 +321,7 @@ class EliteAClient:
             ValueError: limit is not an int from 1 to 100, offset is not an int
                 of 0 or more, a filter key is unknown, owner_ids is not a list
                 of ints, entity_id or version_id is not an int from 1 to 2**31-1,
+                index_name is not a string of 1 to 256 characters,
                 enabled is not a bool, or sort_by, sort_order, entity_type or status
                 is not an allowed value. No request is sent.
             ApiDetailsRequestError: The API answers 400 or more. The error has
@@ -314,6 +341,11 @@ class EliteAClient:
             if value is not None and not (
                     isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= SCHEDULE_MAX_ID):
                 raise ValueError(f"{key} must be an int from 1 to {SCHEDULE_MAX_ID}, got {value!r}")
+        index_name = filters.get('index_name')
+        if index_name is not None and not (
+                isinstance(index_name, str) and 1 <= len(index_name) <= SCHEDULE_INDEX_NAME_MAX_LENGTH):
+            raise ValueError(
+                f"index_name must be a string of 1 to {SCHEDULE_INDEX_NAME_MAX_LENGTH} characters, got {index_name!r}")
         if filters.get('enabled') is not None and not isinstance(filters['enabled'], bool):
             raise ValueError(f"enabled must be a bool, got {filters['enabled']!r}")
         for key, allowed in (('sort_by', SCHEDULE_SORT_BY), ('sort_order', SCHEDULE_SORT_ORDER),
@@ -346,8 +378,9 @@ class EliteAClient:
         """Create a schedule.
 
         Args:
-            data: The body, sent unchanged. Keys: name, description, entity_type,
-                application_id, version_id, run_mode, prompt, variables, cron,
+            data: The body, sent unchanged. Keys: name, description, entity_type
+                (agent, pipeline or toolkit_index), application_id, toolkit_id,
+                index_name, version_id, run_mode, prompt, variables, cron,
                 timezone, expires_at, approval_rule, enabled (false saves the
                 schedule paused; default true), risk_ack (a dict with
                 `fingerprint` of a risk 409 and `confirmed_name`, the schedule
@@ -612,8 +645,9 @@ class EliteAClient:
         response.raise_for_status()
         return response.json()
 
-    def get_app_details(self, application_id: int, version_name: Optional[str] = None):
-        url = f"{self.app}/{application_id}" if version_name is None else f"{self.app}/{application_id}/{version_name}"
+    def get_app_details(self, application_id: int, version_name: Optional[str] = None, project_id: Optional[int] = None):
+        app = self.app if project_id is None else f"{self.base_app_url}{int(project_id)}"
+        url = f"{app}/{application_id}" if version_name is None else f"{app}/{application_id}/{version_name}"
         resp = self._request('get', url, headers=self.headers, verify=False)
         not_live = run_not_live_code(self, resp)
         if not_live:
@@ -1020,7 +1054,7 @@ class EliteAClient:
                 raise ValueError('Invalid Auto measured reasoning contract')
             expected_fields = {}
             if effort is not None:
-                expected_fields = ({'reasoning': {'effort': effort}}
+                expected_fields = ({'reasoning_effort': effort}
                     if routing_transport == 'chat_completions' else {
                         'thinking': {'type': 'adaptive', 'display': 'summarized'},
                         'output_config': {'effort': effort},
@@ -1028,12 +1062,6 @@ class EliteAClient:
             routing_reasoning_fields = model_config['routing_reasoning_fields']
             if not isinstance(routing_reasoning_fields, dict) or routing_reasoning_fields != expected_fields:
                 raise ValueError('Auto reasoning fields differ from its measured contract')
-        # Models needing the reasoning param nested in the request body instead of a
-        # top-level reasoning_effort string (e.g. Bedrock-hosted OpenAI models).
-        reasoning_in_body = any(
-            tag in model_name for tag in worker_config.get("reasoning_in_body_for", [])
-        )
-
         # Default means no Elitea-defined custom output cap. Optional provider
         # fields are omitted; required APIs resolve the configured model maximum.
         llm_max_tokens = model_config.get("max_tokens", None)
@@ -1064,7 +1092,6 @@ class EliteAClient:
                 "default_headers": {
                     "openai-organization": str(self.project_id),
                     **({"Authorization": f"Bearer {self.auth_token}"} if getattr(self, 'auth_token', None) else {}),
-                    "anthropic-beta": "prompt-caching-2024-07-31",
                     **(getattr(self, "api_extra_headers", None) or {}),
                     **self._llm_cookie_headers,
                     **owner_headers,
@@ -1138,17 +1165,12 @@ class EliteAClient:
                         "effort": reasoning_effort.lower(),
                         "summary": "auto"
                     }
-                elif reasoning_in_body:
-                    # Bedrock-hosted OpenAI models reject both reasoning_effort and the
-                    # Anthropic `thinking` that LiteLLM rewrites it into; they want a
-                    # nested reasoning object, which extra_body passes through verbatim.
-                    target_kwargs["extra_body"] = {
-                        **(target_kwargs.get("extra_body") or {}),
-                        "reasoning": {"effort": reasoning_effort.lower()},
-                    }
                 else:
                     # Chat Completions API path (default): use top-level reasoning_effort
-                    # string — widely supported and does NOT force the Responses API
+                    # string — widely supported and does NOT force the Responses API.
+                    # Bedrock-hosted OpenAI models need it too: since LiteLLM 1.108 they
+                    # reject a nested `reasoning` object. The old `reasoning_in_body_for`
+                    # worker setting is ignored for that reason.
                     target_kwargs["reasoning_effort"] = reasoning_effort.lower()
 
             if use_responses_api:
@@ -1314,9 +1336,10 @@ class EliteAClient:
             logger.error(f"Image generation request failed: {e}")
             raise
 
-    def get_app_version_details(self, application_id: int, application_version_id: int) -> dict:
-        """Get application version details for the client's project."""
-        url = f"{self.application_versions}/{application_id}/{application_version_id}"
+    def get_app_version_details(self, application_id: int, application_version_id: int,
+                                project_id: Optional[int] = None) -> dict:
+        """Get application version details for the client's project, or for ``project_id`` when given (#7719)."""
+        url = f"{in_project(self.application_versions, project_id)}/{application_id}/{application_version_id}"
         resp = self._request('patch', url, headers=self.headers, verify=False)
         if resp.ok:
             return resp.json()
@@ -1369,6 +1392,10 @@ class EliteAClient:
                 f"Skill file {project_id}/{skill_id}/{version_id}/{path} is not accessible ({response.status_code})",
                 denied=True,
             )
+        if response.status_code == 410:
+            raise SkillFileUnavailable(
+                f"Skill file {project_id}/{skill_id}/{version_id}/{path} has no stored content (410)", missing=True,
+            )
         if not response.ok:
             raise SkillFileUnavailable(
                 f"Skill file {project_id}/{skill_id}/{version_id}/{path} fetch failed ({response.status_code})"
@@ -1379,7 +1406,11 @@ class EliteAClient:
     def unsecret(self, secret_name: str):
         from elitea_sdk.runtime.utils.logging import mask_sensitive_value
         url = f"{self.secrets_url}/{secret_name}"
-        data = self._request('get', url, headers=self.headers, verify=False).json()
+        response = self._request('get', url, headers=self.headers, verify=False)
+        data = response.json()
+        if data is None:
+            logger.warning("Secret '%s' not available from project vault (HTTP %s)", secret_name, response.status_code)
+            return None
         logger.debug(f"Unsecret response for '{secret_name}': value={mask_sensitive_value(data.get('value', ''))}")
         return data.get('value', None)
 
@@ -1520,6 +1551,22 @@ class EliteAClient:
         except ValueError as e:
             logger.warning("Skipping invalid on-demand Project Context: %s", e)
 
+    @staticmethod
+    def _inject_builder(
+        middleware_list: list,
+        builder: Optional[dict],
+        conversation_id: Optional[str] = None,
+        auto_approve_sensitive_actions=False,
+    ) -> None:
+        """Elitea Builder (#7383): core prompt and HITL cards for the platform's Builder tools."""
+        if not builder or any(isinstance(mw, BuilderMiddleware) for mw in middleware_list):
+            return
+        middleware_list.append(BuilderMiddleware(
+            core_prompt=builder.get('core_prompt') or '',
+            interactive=builder.get('interactive', True) and auto_approve_sensitive_actions is not True,
+            conversation_id=conversation_id,
+        ))
+
     def _inject_input_guard(self, middleware_list: list, conversation_id: Optional[str] = None) -> None:
         """Inject the input guardrail (#6886) when the platform enabled it."""
         try:
@@ -1593,6 +1640,7 @@ class EliteAClient:
         except Exception as e:
             logger.warning(f"Failed to auto-inject ToolExceptionHandlerMiddleware: {e}")
 
+    @_on_app_load_path
     def application(self, application_id: int, application_version_id: int,
                     tools: Optional[list] = None, chat_history: Optional[List[Any]] = None,
                     app_type=None, memory=None, runtime='langchain',
@@ -1609,6 +1657,7 @@ class EliteAClient:
                     parallel_hitl_max_concurrency: int = 8,
                     user_declined_mcp_servers: Optional[list] = None,
                     project_context: Optional[dict] = None,
+                    builder: Optional[dict] = None,
                     routing_instructions: Optional[str] = None):
         auto_approve_sensitive_actions = normalize_auto_approve(auto_approve_sensitive_actions)
         if tools is None:
@@ -1683,6 +1732,7 @@ class EliteAClient:
             logger.info(f"Auto-created PlanningMiddleware for conversation_id={conversation_id}")
 
         self._inject_project_context(middleware_list, project_context, conversation_id)
+        self._inject_builder(middleware_list, builder, conversation_id, auto_approve_sensitive_actions)
 
         # Automatically compresses conversation history when threshold is exceeded
         llm = self._with_context_window(llm, context_settings)
@@ -1700,6 +1750,7 @@ class EliteAClient:
         # Extract lazy_tools_mode from internal_tools (it's a mode flag, not an actual tool)
         # UI stores it in meta.internal_tools array, not as meta.lazy_tools_mode boolean
         lazy_tools_mode = 'lazy_tools_mode' in internal_tools
+        code_mode = 'code_mode' in internal_tools
 
         # LangChainAssistant constructor calls get_tools() which may raise McpAuthorizationRequired
         # The exception will propagate naturally to the indexer worker's outer handler
@@ -1710,6 +1761,7 @@ class EliteAClient:
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
+                                      code_mode=code_mode,
                                       child_dispatcher=child_dispatcher,
                                       independent_parallel_hitl=independent_parallel_hitl,
                                       parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
@@ -1723,6 +1775,7 @@ class EliteAClient:
                                       is_subgraph=is_subgraph,
                                       middleware=middleware_list if middleware_list else None,
                                       lazy_tools_mode=lazy_tools_mode,
+                                      code_mode=code_mode,
                                       child_dispatcher=child_dispatcher,
                                       independent_parallel_hitl=independent_parallel_hitl,
                                       parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
@@ -2057,13 +2110,15 @@ class EliteAClient:
                       mcp_tokens: Optional[dict] = None, conversation_id: Optional[str] = None,
                       ignored_mcp_servers: Optional[list] = None, persona: Optional[str] = "generic",
                       lazy_tools_mode: Optional[bool] = False, internal_tools: Optional[list] = None,
+                      code_mode: Optional[bool] = None,
                       context_settings: Optional[dict] = None,
                       step_limit: Optional[int] = None, auto_approve_sensitive_actions: Union[bool, Iterable[Tuple[str, str]]] = False,
                       child_dispatcher: Optional[Any] = None,
                       independent_parallel_hitl: bool = True,
                       parallel_hitl_max_concurrency: int = 8,
                       user_declined_mcp_servers: Optional[list] = None,
-                      project_context: Optional[dict] = None):
+                      project_context: Optional[dict] = None,
+                      builder: Optional[dict] = None):
         """
         Create a predict-type agent with minimal configuration.
 
@@ -2131,6 +2186,7 @@ class EliteAClient:
             logger.info(f"Auto-created PlanningMiddleware for predict agent (conversation_id={conversation_id})")
 
         self._inject_project_context(middleware_list, project_context, conversation_id)
+        self._inject_builder(middleware_list, builder, conversation_id, auto_approve_sensitive_actions)
 
         # Add ToolExceptionHandlerMiddleware to handle tool errors with LLM messages
         self._inject_tool_exception_handler(middleware_list, conversation_id, llm)
@@ -2162,6 +2218,7 @@ class EliteAClient:
             persona=persona,
             middleware=middleware_list if middleware_list else None,
             lazy_tools_mode=lazy_tools_mode,
+            code_mode=code_mode if code_mode is not None else 'code_mode' in internal_tools,
             child_dispatcher=child_dispatcher,
             independent_parallel_hitl=independent_parallel_hitl,
             parallel_hitl_max_concurrency=parallel_hitl_max_concurrency,
@@ -2622,6 +2679,9 @@ class EliteAClient:
                 return {
                     "success": False,
                     "error": f"Tool execution failed: {str(tool_error)}",
+                    # The full exception chain goes behind the panel's expandable details,
+                    # so the headline above stays a readable message.
+                    "debug_error": "".join(traceback.format_exception(tool_error)),
                     **outcome.model_dump(
                         mode='json', include={'error_class', 'retriable', 'exception_type'}
                     ),

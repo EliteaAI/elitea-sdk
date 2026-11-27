@@ -11,8 +11,9 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Awaitable, Callable, Literal
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForToolRun,
@@ -26,7 +27,19 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
-from .sandbox_types import CodeExecutionResult, Status  # noqa: E402
+from .sandbox_types import BridgeExecutionResult, CodeExecutionResult, Status  # noqa: E402
+
+BRIDGE_MAX_LINE_BYTES = 4 * 1024 * 1024
+BRIDGE_MAX_CONCURRENT_CALLS = 8
+_BRIDGE_OUTPUT_KEEP_CHARS = 1024 * 1024
+_BRIDGE_STDERR_TAIL_BYTES = 64 * 1024
+
+
+# Proxy and CA-trust variables only (not secrets); keep in step with allow_env in tools/sandbox.py.
+_PASSTHROUGH_ENV = (
+    "PATH", "SANDBOX_BASE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "DENO_CERT", "DENO_TLS_CA_STORE", "SSL_CERT_FILE",
+)
 
 
 def get_default_pkg_name() -> str | None:
@@ -36,6 +49,12 @@ def get_default_pkg_name() -> str | None:
     to the Deno entrypoint script (e.g., local main.js file).
     """
     return os.environ.get("PYODIDE_SANDBOX_PKG")
+
+
+def _usable_snapshot_path() -> str | None:
+    # Set by indexer_worker when the snapshot flag is on (#6718); a granted read of a vanished file is harmless.
+    path = os.environ.get("SANDBOX_SNAPSHOT_PATH")
+    return path if path and os.path.isfile(path) else None
 
 
 def build_permission_flag(
@@ -68,6 +87,7 @@ class BasePyodideSandbox:
         allow_net: list[str] | bool = False,
         allow_run: list[str] | bool = False,
         allow_ffi: list[str] | bool = False,
+        allow_remote_modules: bool = True,
         node_modules_dir: str = "auto",
         skip_deno_check: bool = False,
         pkg_name: str | None = None,
@@ -82,6 +102,7 @@ class BasePyodideSandbox:
             allow_net: Network access (False/True/list of domains).
             allow_run: Subprocess execution (False/True/list of commands).
             allow_ffi: FFI access (False/True/list of libraries).
+            allow_remote_modules: Whether code may import remote, JSR or npm modules.
             node_modules_dir: Node modules directory setting.
             skip_deno_check: Skip Deno installation check.
             pkg_name: Path to the Deno entrypoint script. If not provided,
@@ -94,6 +115,7 @@ class BasePyodideSandbox:
         self.allow_net = allow_net
         self.allow_run = allow_run
         self.allow_ffi = allow_ffi
+        self.allow_remote_modules = allow_remote_modules
         self.node_modules_dir = node_modules_dir
         self.pkg_name = pkg_name or get_default_pkg_name()
 
@@ -117,6 +139,7 @@ class BasePyodideSandbox:
         memory_limit_mb: int | None = None,
         root_ca_path: str | None = None,
         insecure_tls_domains: list[str] | None = None,
+        bridge_max_line_bytes: int | None = None,
     ) -> list[str]:
         """Build the Deno command with appropriate flags."""
         cmd = [
@@ -127,9 +150,13 @@ class BasePyodideSandbox:
         ]
 
         # Add permission flags
+        snapshot = _usable_snapshot_path()
+        allow_read = self.allow_read
+        if snapshot and isinstance(allow_read, list):
+            allow_read = [*allow_read, snapshot]
         permission_configs = [
             ("--allow-env", self.allow_env),
-            ("--allow-read", self.allow_read),
+            ("--allow-read", allow_read),
             ("--allow-write", self.allow_write),
             ("--allow-net", self.allow_net),
             ("--allow-run", self.allow_run),
@@ -139,6 +166,9 @@ class BasePyodideSandbox:
         for flag, value in permission_configs:
             if permission_flag := build_permission_flag(flag, value=value):
                 cmd.append(permission_flag)
+
+        if not self.allow_remote_modules:
+            cmd.extend(["--no-remote", "--no-npm"])
 
         # WASM memory cap — bounds Pyodide's heap (Python objects, numpy arrays,
         # etc.), which lives in WASM linear memory. This REPLACES the old
@@ -166,7 +196,11 @@ class BasePyodideSandbox:
 
         # Add the package and stdin flag (code will be passed via stdin to avoid
         # Linux kernel's MAX_ARG_STRLEN 128KB limit on individual CLI arguments)
-        cmd.extend([self.pkg_name, "--stdin"])
+        snapshot_flag = [f"--snapshot={snapshot}"] if snapshot else []
+        if bridge_max_line_bytes:
+            cmd.extend([self.pkg_name, "--bridge", f"--max-line-bytes={int(bridge_max_line_bytes)}", *snapshot_flag])
+            return cmd
+        cmd.extend([self.pkg_name, "--stdin", *snapshot_flag])
 
         # Add stateful flag
         if self.stateful:
@@ -181,6 +215,18 @@ class BasePyodideSandbox:
             cmd.extend(["-m", json.dumps(session_metadata)])
 
         return cmd
+
+    @staticmethod
+    def _run_directory() -> tempfile.TemporaryDirectory:
+        """A temporary directory of one run's own, removed after it: Deno writes what a run's code puts in its caches
+        and web storage under TMPDIR and DENO_DIR, which would otherwise be shared by every run on the worker."""
+        return tempfile.TemporaryDirectory(prefix="pyodide-run-", ignore_cleanup_errors=True)
+
+    @staticmethod
+    def _run_environment(run_directory: tempfile.TemporaryDirectory) -> dict:
+        # Only what Deno needs; the worker's secrets never reach a sandbox process (#7727).
+        env = {key: os.environ[key] for key in _PASSTHROUGH_ENV if key in os.environ}
+        return {**env, "TMPDIR": run_directory.name, "DENO_DIR": os.path.join(run_directory.name, "deno_dir")}
 
 
 class PyodideSandbox(BasePyodideSandbox):
@@ -222,12 +268,14 @@ class PyodideSandbox(BasePyodideSandbox):
                 stderr=f"Failed to encode code as UTF-8: {e}",
             )
 
+        run_directory = self._run_directory()
         spawn_start = time.time()
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._run_environment(run_directory),
         )
         spawn_s = time.time() - spawn_start
         sandbox_timings = None
@@ -262,6 +310,11 @@ class PyodideSandbox(BasePyodideSandbox):
             timed_out = True
         except asyncio.CancelledError:
             pass
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            run_directory.cleanup()
 
         end_time = time.time()
         logger.debug(
@@ -278,6 +331,158 @@ class PyodideSandbox(BasePyodideSandbox):
             session_metadata=session_metadata,
             session_bytes=session_bytes,
             timed_out=timed_out,
+        )
+
+    async def execute_with_bridge(
+        self,
+        code: str,
+        dispatcher: Callable[[str, str], Awaitable[str]],
+        *,
+        timeout_seconds: float,
+        max_tool_calls: int,
+        memory_limit_mb: int | None = None,
+        max_line_bytes: int = BRIDGE_MAX_LINE_BYTES,
+        max_concurrent_calls: int = BRIDGE_MAX_CONCURRENT_CALLS,
+        on_output: Callable[[str, str], None] | None = None,
+        root_ca_path: str | None = None,
+        insecure_tls_domains: list[str] | None = None,
+    ) -> BridgeExecutionResult:
+        """Run `code` with `elitea_bridge.call(name, args_json)` routed to `dispatcher(name, args_json) -> value_json`.
+
+        A dispatcher exception becomes a catchable error in the program; tool time counts against the timeout."""
+        start_time = time.time()
+        stdout_parts: list[str] = []
+        stdout_len = 0
+        stderr_tail = bytearray()
+        outcome: dict[str, Any] = {}
+        calls_completed = 0
+        calls_started = 0
+        call_tasks: set[asyncio.Task] = set()
+        call_slots = asyncio.Semaphore(max(1, max_concurrent_calls))
+        write_lock = asyncio.Lock()
+
+        cmd = self._build_command(memory_limit_mb=memory_limit_mb, bridge_max_line_bytes=max_line_bytes,
+                                  root_ca_path=root_ca_path, insecure_tls_domains=insecure_tls_domains)
+        run_directory = self._run_directory()
+        # The reader limit must exceed the line cap, or asyncio rejects lines over its 64 KB default.
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._run_environment(run_directory),
+                limit=max_line_bytes + 1024,
+            )
+        except BaseException:
+            run_directory.cleanup()
+            raise
+
+        def fail(error_type: str, error: str) -> None:
+            outcome.setdefault("final", {"success": False, "error": error, "error_type": error_type})
+
+        async def send(message: dict) -> None:
+            data = (json.dumps(message) + "\n").encode("utf-8")
+            async with write_lock:
+                try:
+                    process.stdin.write(data)
+                    await process.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError, RuntimeError):
+                    pass
+
+        async def drain_stderr() -> None:
+            while chunk := await process.stderr.read(65536):
+                stderr_tail.extend(chunk)
+                del stderr_tail[:-_BRIDGE_STDERR_TAIL_BYTES]
+
+        async def run_call(call_id: Any, name: str, args_json: str) -> None:
+            nonlocal calls_completed
+            try:
+                async with call_slots:
+                    value = await dispatcher(name, args_json)
+                reply = {"type": "result", "id": call_id, "ok": True, "value": value}
+            except Exception as exc:  # pylint: disable=broad-except
+                reply = {"type": "result", "id": call_id, "ok": False, "error": str(exc) or type(exc).__name__}
+            calls_completed += 1
+            if len(reply.get("value") or "") > max_line_bytes:
+                reply = {"type": "result", "id": call_id, "ok": False,
+                         "error": f"Tool result is over the {max_line_bytes}-byte bridge limit."}
+            await send(reply)
+
+        async def pump() -> None:
+            nonlocal stdout_len, calls_started
+            await send({"type": "code", "code": code})
+            while True:
+                try:
+                    line = await process.stdout.readline()
+                except (asyncio.LimitOverrunError, ValueError):
+                    fail("result_too_large", f"A sandbox message is over the {max_line_bytes}-byte limit.")
+                    return
+                if not line:
+                    return
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                kind = message.get("type")
+                if kind == "final":
+                    outcome.setdefault("final", message)
+                    return
+                if kind in ("stdout", "stderr"):
+                    text = str(message.get("text", ""))
+                    if kind == "stdout" and stdout_len < _BRIDGE_OUTPUT_KEEP_CHARS:
+                        stdout_parts.append(text)
+                        stdout_len += len(text)
+                    elif kind == "stderr":
+                        stderr_tail.extend(text.encode("utf-8", "replace"))
+                        del stderr_tail[:-_BRIDGE_STDERR_TAIL_BYTES]
+                    if on_output:
+                        on_output(kind, text)
+                elif kind == "call":
+                    if calls_started >= max_tool_calls:
+                        fail("call_limit", f"The program made more than {max_tool_calls} tool calls.")
+                        return
+                    calls_started += 1
+                    task = asyncio.create_task(run_call(message.get("id"), str(message.get("name")), str(message.get("args") or "{}")))
+                    call_tasks.add(task)
+                    task.add_done_callback(call_tasks.discard)
+
+        stderr_task = asyncio.create_task(drain_stderr())
+        try:
+            await asyncio.wait_for(pump(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            fail("timeout", f"Execution timed out after {timeout_seconds} seconds.")
+        finally:
+            # Calls still running when the program ends or times out are cancelled and reported, not hidden.
+            calls_cancelled = len(call_tasks)
+            for task in list(call_tasks):
+                task.cancel()
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            # The pipe closes with the process, so this finishes promptly and keeps the crash message.
+            try:
+                await asyncio.wait_for(stderr_task, timeout=2)
+            except (asyncio.TimeoutError, Exception):  # pylint: disable=broad-except
+                stderr_task.cancel()
+            run_directory.cleanup()
+
+        final = outcome.get("final")
+        stderr = stderr_tail.decode("utf-8", "replace")
+        if final is None:
+            final = {"success": False, "error_type": "sandbox_crashed",
+                     "error": f"The sandbox exited (code {process.returncode}) without a result. {stderr[-2000:]}".strip()}
+        success = bool(final.get("success"))
+        return BridgeExecutionResult(
+            status="success" if success else "error",
+            execution_time=time.time() - start_time,
+            result=final.get("result") if success else None,
+            stdout="".join(stdout_parts),
+            stderr=stderr,
+            error=None if success else (final.get("error") or "unknown sandbox error"),
+            error_type=None if success else (final.get("error_type") or "sandbox_crashed"),
+            calls_completed=calls_completed,
+            calls_cancelled=calls_cancelled,
         )
 
 
@@ -320,6 +525,7 @@ class SyncPyodideSandbox(BasePyodideSandbox):
                 stderr=f"Failed to encode code as UTF-8: {e}",
             )
 
+        run_directory = self._run_directory()
         try:
             process = subprocess.run(
                 cmd,
@@ -328,6 +534,7 @@ class SyncPyodideSandbox(BasePyodideSandbox):
                 text=False,
                 timeout=timeout_seconds,
                 check=False,
+                env=self._run_environment(run_directory),
             )
 
             stdout_bytes = process.stdout
@@ -353,6 +560,8 @@ class SyncPyodideSandbox(BasePyodideSandbox):
             status = "error"
             stderr = f"Execution timed out after {timeout_seconds} seconds"
             timed_out = True
+        finally:
+            run_directory.cleanup()
 
         end_time = time.time()
 

@@ -11,7 +11,7 @@ Authentication precedence (evaluated in order):
 import logging
 import os
 import re
-from typing import Callable, Optional, Generator, List, Any
+from typing import Callable, Dict, Optional, Generator, List, Any
 
 from langchain_core.documents import Document
 from langchain_core.tools import ToolException
@@ -21,13 +21,26 @@ from .base_wrapper import BaseSharepointWrapper
 from .graph_wrapper import SharepointGraphWrapper
 from .rest_wrapper import SharepointRestWrapper
 from .models import OnenotePageItems
+from .library_metadata import (
+    CATEGORY_MAPPING_HINT, LIBRARY_LISTING_LIMIT, STATUS_AMBIGUOUS, STATUS_OK, JoinCounts, LibraryIndex,
+    LibraryMetadataError, LibrarySettings, apply_library_metadata, build_index, category_values,
+    has_categories, report_label,
+)
 from ..non_code_indexer_toolkit import NonCodeIndexerToolkit
 from ..utils.file_metadata import bound_read_result, describe_requested_range
 from .read_guidance import build_excel_over_limit_response
 from ...runtime.langchain.document_loaders.EliteAExcelLoader import ExcelReadLimitExceeded
 from ...runtime.utils.utils import IndexerKeywords
 from ..base_indexer_toolkit import DEPENDENT_DOC_META_KEY
+from .. import index_change_check
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import join_location, reuse_url, web_base
+
+# Settings that decide which files an index run covers. A run that covers other files than the
+# run before it must not remove rows, because the rows of the earlier scope look absent.
+INDEX_SCOPE_KEYS = ('path', 'form_name', 'include_extensions', 'skip_extensions',
+                    'library_lists', 'metadata_fields', 'categories', 'limit_files', 'include_onenote')
+DEFAULT_LIMIT_FILES = 10000
 
 # ------------------------------------------------------------------ #
 #  Read-safety: block executable / binary files (read_document only)  #
@@ -77,6 +90,15 @@ ReadList = create_model(
     limit=(Optional[int], Field(
         description="Limit (maximum number) of list items to be returned",
         default=1000, gt=0))
+)
+
+ListLibraryCategories = create_model(
+    "ListLibraryCategories",
+    library_lists=(List[str], Field(
+        description="Names of the library lists (usually the document libraries) to read.")),
+    metadata_fields=(Optional[List[str]], Field(
+        description="Optional field mapping, as for index_data, e.g. `[\"*\", \"area=category\"]`.",
+        default=[])),
 )
 
 GetFiles = create_model(
@@ -449,6 +471,10 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
     3. ``token`` only  → :class:`SharepointRestWrapper`
        (REST token without Graph scopes — legacy behaviour)
     """
+    index_source_type = "sharepoint"
+
+    # The loader attests a complete listing only under the gates of _run_may_remove_orphans.
+    loader_attests_completion = True
 
     index_item_labels = ('file', 'files')
 
@@ -463,6 +489,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                     "Graph API backend (SharepointGraphWrapper).")
     refresh_token: Optional[SecretStr] = None
     oauth_token_endpoint: Optional[str] = None
+    # Ask for offline_access at sign-in unless switched off (#7415)
+    auto_refresh_token: Optional[bool] = None
     oauth_discovery_endpoint: Optional[str] = None
     configuration_uuid: Optional[str] = None
     toolkit_id: Optional[int] = None
@@ -504,6 +532,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 configuration_uuid=self.configuration_uuid,
                 toolkit_id=self.toolkit_id,
                 toolkit_name=self.toolkit_name,
+                auto_refresh_token=self.auto_refresh_token,
             )
         elif client_id and secret_plain:
             # ── App-credential REST path ──────────────────────────────
@@ -637,7 +666,8 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                        form_name: Optional[str] = None,
                        include_extensions: Optional[List[str]] = None,
                        skip_extensions: Optional[List[str]] = None,
-                       on_file_skipped: Optional[Callable[[str], None]] = None):
+                       on_file_skipped: Callable[[str], None] | None = None,
+                       on_listing_gap: Callable[[str], None] | None = None):
         """
         Lists all files including files from subfolders.
         If folder name is specified, lists files under that folder path; otherwise lists
@@ -657,7 +687,7 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         self._sync_backend_context()
         return self._backend.get_files_list(
             folder_name, limit_files, form_name, include_extensions, skip_extensions,
-            on_file_skipped=on_file_skipped)
+            on_file_skipped=on_file_skipped, on_listing_gap=on_listing_gap)
 
     @tool_group('read')
     def read_file(self, path: str,
@@ -1048,6 +1078,22 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                             "OneNote page attachments (when include_attachments is enabled). "
                             'i.e. `["*.exe", "*.zip"]`',
                 default=[])),
+            # Document-library mode (#7352): per index, so one toolkit can serve several sources
+            'library_lists': (Optional[List[str]], Field(
+                description="SharePoint lists (usually the document libraries themselves) whose items describe "
+                            "the indexed files. When set, each file gets its list fields as metadata.",
+                default=[])),
+            'metadata_fields': (Optional[List[str]], Field(
+                description="List fields to copy when library_lists is set. Empty: all simple fields under "
+                            "readable snake_case names. Name a field as list_library_categories shows it; "
+                            "Field=name chooses the metadata name and * keeps all other fields, e.g. "
+                            '`["*", "area=category"]`. A field whose default name is taken by a mapping keeps '
+                            "its value as <name>_original.",
+                default=[])),
+            'categories': (Optional[List[str]], Field(
+                description="Index only files whose category (the list field stored as category) is one of "
+                            "these values. list_library_categories returns the values used on the site.",
+                default=[])),
             'path': (Optional[str], Field(
                 description="Folder path. "
                             "Accepts either a full server-relative path "
@@ -1095,8 +1141,19 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 default=None)),
         }
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('Path')
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return reuse_url(metadata.get('Link'), self.site_url, kept_query=('sourcedoc', 'file', 'action'))
+
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._sync_backend_context()
+        site = web_base(self.site_url)
+        self._record_index_source(
+            location=join_location(site and site.split("://", 1)[1], kwargs.get('form_name'), kwargs.get('path')),
+            url=site,
+        )
 
         # Normalise onenote_filter (already a dict or None) and inject top-level
         # extension filters so include_extensions / skip_extensions apply uniformly
@@ -1111,41 +1168,218 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
         }
 
         limit_files = kwargs.get('limit_files', 10000)
-        include_extensions = kwargs.get('include_extensions') or None
-        skip_extensions = kwargs.get('skip_extensions') or None
-        form_name = kwargs.get('form_name') or None
 
         if limit_files > 0:
-            self._log_tool_event(
-                message="Starting SharePoint files extraction", tool_name="loader")
-            try:
-                all_files = self.get_files_list(
-                    kwargs.get('path'), limit_files,
-                    form_name=form_name,
-                    include_extensions=include_extensions,
-                    skip_extensions=skip_extensions,
-                    on_file_skipped=lambda name: self._track_skipped_document(name, reason="filtered"))
-                self._log_tool_event(
-                    message="List of the files has been extracted", tool_name="loader")
-            except Exception as e:
-                raise ToolException(f"Unable to extract files: {e}")
+            all_files, library, list_limit, gaps = self._list_files_for_index(kwargs, track_skipped=True)
 
+            kept = 0
             for file in all_files:
-
-                metadata = {
-                    ("updated_on" if k == "Modified" else k): str(v)
-                    for k, v in file.items()
-                }
+                if kept >= limit_files:
+                    break
+                metadata = self._file_metadata(file)
+                if library is not None and not self._apply_library_metadata(metadata, *library):
+                    continue
+                kept += 1
                 yield Document(page_content="", metadata=metadata)
+            if library is not None:
+                logging.info("[SP-library] join: %s", library[2].as_dict())
+            if kept < limit_files and self._run_may_remove_orphans(kwargs, gaps, len(all_files), list_limit):
+                self._attest_loader_completion()
 
         # ── OneNote pages ─────────────────────────────────────────────
         if kwargs.get('include_onenote'):
             yield from self._onenote_base_loader(self._onenote_cfg)
 
+    @staticmethod
+    def _file_metadata(file: dict[str, Any]) -> dict[str, str]:
+        return {("updated_on" if k == "Modified" else k): str(v) for k, v in file.items()}
+
+    def _list_files_for_index(self, kwargs: dict[str, Any], track_skipped: bool):
+        """The files an index run covers: (files, library join context, listing cap, listing gaps).
+
+        The indexing loader and the change check both list through here, so they see the same files.
+        The check passes ``track_skipped=False`` because it must not touch the indexing statistics.
+        """
+        limit_files = kwargs.get('limit_files', 10000)
+        library = self._library_join_context(
+            kwargs.get('library_lists'), kwargs.get('metadata_fields'), kwargs.get('categories'))
+        # The categories filter drops files after listing: list up to the library bound and keep
+        # limit_files of the files that pass, so selected files beyond the first limit_files listed
+        # are not lost.
+        list_limit = (max(limit_files, LIBRARY_LISTING_LIMIT)
+                      if library is not None and library[0].categories else limit_files)
+        self._log_tool_event(
+            message="Starting SharePoint files extraction", tool_name="loader")
+        gaps: list[str] = []
+        try:
+            all_files = self.get_files_list(
+                kwargs.get('path'), list_limit,
+                form_name=kwargs.get('form_name') or None,
+                include_extensions=kwargs.get('include_extensions') or None,
+                skip_extensions=kwargs.get('skip_extensions') or None,
+                on_file_skipped=(lambda name: self._track_skipped_document(name, reason="filtered"))
+                if track_skipped else None,
+                on_listing_gap=gaps.append)
+            self._log_tool_event(
+                message="List of the files has been extracted", tool_name="loader")
+        except Exception as e:  # noqa: BLE001 - the three backends raise different errors; the caller needs one ToolException
+            raise ToolException(f"Unable to extract files: {e}")
+        if list_limit > limit_files and len(all_files) >= list_limit:
+            raise LibraryMetadataError(
+                f"The categories filter looks at most {list_limit} files and the library has more. "
+                "Narrow the scope with Path or Form Name.")
+        return all_files, library, list_limit, gaps
+
+    # ------------------------------------------------------------------ #
+    #  Change check and orphan removal                                     #
+    # ------------------------------------------------------------------ #
+
+    def _run_scope_keys(self, index_configuration):
+        scope = {}
+        for key in INDEX_SCOPE_KEYS:
+            value = (index_configuration or {}).get(key)
+            if key == 'limit_files' and value is None:
+                # The loader treats a missing limit as the default, so both forms compare equal.
+                value = DEFAULT_LIMIT_FILES
+            if isinstance(value, (list, tuple, set)):
+                # The order of the metadata fields decides which mapping wins, so it is part of the scope.
+                items = [str(item) for item in value]
+                value = items if key == 'metadata_fields' and not isinstance(value, set) else sorted(items)
+            # `0 in (..., False)` is true, so a plain membership test would turn limit_files 0 into None.
+            unset = value is None or value is False or (isinstance(value, (str, list, dict)) and not value)
+            scope[key] = None if unset else value
+        return scope
+
+    def _run_may_remove_orphans(self, kwargs: dict[str, Any], gaps: list[str], listed: int, list_limit: int) -> bool:
+        """True when this run's listing proves which files are gone, so the clean-up may remove rows."""
+        run = getattr(self, '_index_run', None)
+        if run is None or gaps or kwargs.get('include_onenote') or listed >= list_limit:
+            return False
+        if listed == 0 and self._has_previous_index_run():
+            # An empty listing of an index that held files can come from a renamed or removed
+            # library. Clean index is the way to empty such an index on purpose.
+            return False
+        return not run.meta_existed or run.run_scope == run.last_run_scope
+
+    def _stored_marker(self, metadata, listed_digest=None):
+        marker = str(metadata.get('updated_on') or '')
+        digest = metadata.get('library_digest')
+        if digest is None:
+            # A row indexed before the digest existed: take the listing's value, so only
+            # an edit made after the next index run shows as a change.
+            digest = listed_digest
+        return f"{marker}|{digest}" if digest else marker
+
+    def _indexed_item(self, key, entry, listing):
+        metadata = entry.get('metadata') or {}
+        return index_change_check.ListedItem(
+            key=key, name=str(metadata.get('Name') or ''), path=str(metadata.get('Path') or ''),
+            marker=self._stored_marker(metadata, listing.digests.get(key)))
+
+    def _is_unchecked_row(self, entry) -> bool:
+        return (entry.get('metadata') or {}).get('source_type') == 'onenote'
+
+    def _list_source_items(self, index_configuration):
+        self._sync_backend_context()
+        kwargs = dict(index_configuration)
+        limit_files = kwargs.get('limit_files', 10000)
+        items = []
+        gaps = []
+        digests = {}
+        if limit_files > 0:
+            files, library, _, gaps = self._list_files_for_index(kwargs, track_skipped=False)
+            for file in files:
+                metadata = self._file_metadata(file)
+                if library is not None and not apply_library_metadata(metadata, library[1], library[0], JoinCounts()):
+                    continue
+                key = metadata.get('id')
+                if not key:
+                    continue
+                if len(items) >= limit_files:
+                    gaps.append("the file limit was reached before the listing ended")
+                    break
+                digests[key] = metadata.get('library_digest')
+                items.append(index_change_check.ListedItem(
+                    key=key, name=metadata.get('Name', ''), path=metadata.get('Path', ''),
+                    marker=self._stored_marker(metadata)))
+        blockers = list(gaps)
+        if kwargs.get('include_onenote'):
+            blockers.append("OneNote pages are included in the index and are not checked")
+        return index_change_check.SourceListing(
+            items=items, complete=not gaps, gaps=gaps, id_family=type(self._backend).__name__,
+            attest_blockers=blockers, digests=digests,
+            unchecked_note="OneNote pages are not checked",
+            unchecked_reason=(
+                "OneNote pages are not checked, so changes there are not reported."
+                if kwargs.get('include_onenote') else
+                "OneNote pages are in the index but OneNote is now off, so the next complete "
+                "full run can delete them."))
+
     # ------------------------------------------------------------------ #
     #  OneNote helpers                                                     #
     # ------------------------------------------------------------------ #
 
+
+    def _library_join_context(self, library_lists=None, metadata_fields=None, categories=None):
+        """(settings, index, counts) when the index_data call sets library_lists, else None.
+        The lists are read once per run."""
+        settings = LibrarySettings.from_settings(library_lists, metadata_fields, categories)
+        if not settings.enabled:
+            return None
+        self._log_tool_event(message="Reading the library lists", tool_name="loader")
+        index = build_index(self._backend.library_list_client(), settings)
+        counts = JoinCounts(list_items=len(index.entries), unresolved_fields=len(index.unresolved_fields))
+        if index.unresolved_fields:
+            logging.warning("[SP-library] %d metadata field setting(s) match no field of the lists",
+                            len(index.unresolved_fields))
+        if settings.categories and not has_categories(index):
+            raise LibraryMetadataError(
+                "The categories filter needs a list field stored as `category`, and none of the library lists "
+                f"has one. {CATEGORY_MAPPING_HINT}")
+        self._log_tool_event(
+            message=f"Library lists read: {len(index.entries)} items", tool_name="loader")
+        return settings, index, counts
+
+    def _apply_library_metadata(self, metadata: dict, settings: LibrarySettings,
+                                index: LibraryIndex, counts: JoinCounts) -> bool:
+        name = report_label(metadata)
+        if not apply_library_metadata(metadata, index, settings, counts):
+            self._track_skipped_document(name, reason="filtered")
+            return False
+        status = metadata.get('metadata_status')
+        if status != STATUS_OK:
+            stats = self.get_indexing_stats() or self._init_indexing_stats()
+            target = (stats.documents_metadata_ambiguous if status == STATUS_AMBIGUOUS
+                      else stats.documents_without_metadata)
+            target.add(name)
+        return True
+
+    @tool_group('read')
+    def list_library_categories(self, library_lists: List[str], metadata_fields: Optional[List[str]] = None):
+        """Lists the category values used in the library lists, with the number of items in each.
+
+        Reads the items of the given library lists and returns the distinct values of the field
+        stored as `category`, most used first. Use these values for index_data's categories
+        parameter. Also returns the metadata field names each list provides, so index_data's
+        metadata_fields parameter can map them (e.g. `["*", "area=category"]`).
+        """
+        self._sync_backend_context()
+        settings = LibrarySettings.from_settings(library_lists, metadata_fields)
+        if not settings.enabled:
+            raise ToolException("Pass the names of the library lists to read (library_lists).")
+        index = build_index(self._backend.library_list_client(), settings)
+        fields = sorted({key for entry in index.entries for key in entry.metadata})
+        result = {
+            "lists": list(settings.lists),
+            "items": len(index.entries),
+            "metadata_fields": fields,
+            "categories": category_values(index),
+        }
+        if index.unresolved_fields:
+            result["unresolved_metadata_fields"] = sorted(index.unresolved_fields)
+        if 'category' not in fields:
+            result["note"] = f"No field is stored as `category`. {CATEGORY_MAPPING_HINT}"
+        return result
 
     def _onenote_base_loader(
         self,
@@ -1524,6 +1758,12 @@ class SharepointApiWrapper(NonCodeIndexerToolkit):
                 "description": self.create_list_item.__doc__,
                 "args_schema": CreateListItem,
                 "ref": self.create_list_item,
+            },
+            {
+                "name": "list_library_categories",
+                "description": self.list_library_categories.__doc__,
+                "args_schema": ListLibraryCategories,
+                "ref": self.list_library_categories,
             },
             {
                 "name": "get_files_list",

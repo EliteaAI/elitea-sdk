@@ -24,10 +24,10 @@ name = "bitbucket"
 def get_toolkit(tool):
     return EliteABitbucketToolkit.get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
-        project=tool['settings']['project'],
-        repository=tool['settings']['repository'],
+        project=tool['settings'].get('project'),
+        repository=tool['settings'].get('repository'),
         bitbucket_configuration=tool['settings']['bitbucket_configuration'],
-        branch=tool['settings']['branch'],
+        branch=tool['settings'].get('branch') or 'main',
         cloud=tool['settings'].get('cloud'),
         llm=tool['settings'].get('llm', None),
         elitea=tool['settings'].get('elitea', None),
@@ -52,8 +52,10 @@ class EliteABitbucketToolkit(BaseToolkit):
         tool_groups = {x['name']: x['group'] for x in available_tools if x.get('group')}
         m = create_model(
             name,
-            project=(str, Field(description="Project/Workspace")),
-            repository=(str, Field(description="Repository")),
+            project=(Optional[str], Field(default=None, description=(
+                "Default project key/workspace; each call may name another"))),
+            repository=(Optional[str], Field(default=None, description=(
+                "Default repository; each call may name another"))),
             branch=(str, Field(description="Main branch", default="main")),
             cloud=(Optional[bool], Field(description="Hosting Option", default=None)),
             bitbucket_configuration=(BitbucketConfiguration, Field(description=get_credentials_tooltip("Bitbucket"), json_schema_extra={'configuration_types': ['bitbucket']})),
@@ -79,10 +81,15 @@ class EliteABitbucketToolkit(BaseToolkit):
             username = bitbucket_config.get('username', '')
             password = bitbucket_config.get('password', '')
 
-            if self.cloud:
-                request_url = f"{url}/2.0/repositories/{self.project}/{self.repository}"
+            cloud = self.cloud
+            if cloud is None:
+                cloud = url_host_matches_domain(url, "bitbucket.org")
+            # Without a default repository the credentials are checked at account level.
+            if self.project and self.repository:
+                request_url = (f"{url}/2.0/repositories/{self.project}/{self.repository}" if cloud
+                               else f"{url}/rest/api/1.0/projects/{self.project}/repos/{self.repository}")
             else:
-                request_url = f"{url}/rest/api/1.0/projects/{self.project}/repos/{self.repository}"
+                request_url = f"{url}/2.0/user" if cloud else f"{url}/rest/api/1.0/projects"
             response = requests.get(request_url, auth=HTTPBasicAuth(username, password))
             return response
 
@@ -94,12 +101,15 @@ class EliteABitbucketToolkit(BaseToolkit):
     def get_toolkit(cls, selected_tools: list[str] | None = None, toolkit_name: Optional[str] = None, **kwargs):
         if selected_tools is None:
             selected_tools = []
-        if kwargs["cloud"] is None:
-            kwargs["cloud"] = url_host_matches_domain(kwargs.get('url'), "bitbucket.org")
+        bitbucket_configuration = kwargs.get('bitbucket_configuration') or {}
+        if kwargs.get('cloud') is None:
+            # The url lives in the configuration, not in the toolkit settings.
+            url = bitbucket_configuration.get('url') or kwargs.get('url')
+            kwargs['cloud'] = url_host_matches_domain(url, "bitbucket.org")
         wrapper_payload = {
             **kwargs,
             # TODO use bitbucket_configuration fields
-            **kwargs['bitbucket_configuration'],
+            **bitbucket_configuration,
             **(kwargs.get('pgvector_configuration') or {}),
         }
         bitbucket_api_wrapper = BitbucketAPIWrapper(**wrapper_payload)
@@ -109,7 +119,9 @@ class EliteABitbucketToolkit(BaseToolkit):
             if selected_tools:
                 if tool['name'] not in selected_tools:
                     continue
-            description = tool["description"] + f"\nrepo: {bitbucket_api_wrapper.repository}"
+            description = tool["description"]
+            if bitbucket_api_wrapper.repository:
+                description += f"\nrepo: {bitbucket_api_wrapper.repository}"
             if toolkit_name:
                 description = f"{description}\nToolkit: {toolkit_name}"
             description = description[:1000]

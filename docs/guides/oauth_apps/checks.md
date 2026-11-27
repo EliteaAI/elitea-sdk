@@ -98,6 +98,10 @@ project and, where noted, a team project.
 
 ## Sign-in and runtime
 
+- [ ] With **Auto refresh token off** (on the admin app, or on a Custom app credential), the sign-in window
+      and the token request don't include `offline_access`; with it on, they do. A credential that never
+      stored the switch still asks for `offline_access` (#7415).
+
 - [ ] Configuration OAuth window: Scope is read-only for a Default app credential and shows the admin's
       scopes; editable for Custom app credentials.
 - [ ] Test connection of a Default app credential returns a sign-in prompt with the app's client ID and

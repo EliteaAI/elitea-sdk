@@ -4,7 +4,8 @@ import json
 import logging
 import mimetypes
 import re
-from typing import ClassVar, Any, Callable, Optional, Generator, List
+from typing import ClassVar, Any, Callable, Dict, Optional, Generator, List
+from urllib.parse import urlsplit
 
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.documents import Document
@@ -42,6 +43,7 @@ from ...runtime.langchain.document_loaders.EliteAExcelLoader import (
     build_excel_metadata_from_estimate,
 )
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ...tools.utils.source_info import reuse_url
 
 BASIC_CREATE_FILE_DESCRIPTION = """Create a new file OR overwrite/replace an existing file entirely in the artifact bucket. Supports two modes:
 1. Create from content: Use 'filedata' parameter to create or fully overwrite files with text or rich formats
@@ -73,6 +75,7 @@ SKIP_SIZE_CHECK_DEPRECATION_MSG = (
 
 
 class ArtifactWrapper(NonCodeIndexerToolkit):
+    index_source_type = "artifact"
     index_item_labels = ('file', 'files')
     loader_attests_completion: ClassVar[bool] = True
     bucket: str
@@ -340,8 +343,7 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
         from urllib.parse import quote
         
         bucket = bucket_name or self.bucket
-        # #6985: base_url may be an in-cluster host; links are for users, so prefer the public one
-        base_url = (getattr(self.elitea, 'public_url', None) or getattr(self.elitea, 'base_url', '')).rstrip('/')
+        base_url = self._link_base_url()
         project_id = getattr(self.elitea, 'project_id', '')
         
         # Build prefix for folder scoping
@@ -898,11 +900,28 @@ class ArtifactWrapper(NonCodeIndexerToolkit):
                 default=[])),
         }
 
+    def _link_base_url(self) -> str:
+        # #6985: base_url may be an in-cluster host; links are for users, so prefer the public one
+        return (getattr(self.elitea, 'public_url', None) or getattr(self.elitea, 'base_url', '')).rstrip('/')
+
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        path = urlsplit(metadata.get('link') or '').path.split('/')
+        bucket = path[path.index('s3') + 1] if 's3' in path[:-1] else None
+        key = metadata.get('key') or metadata.get('name')
+        return f"{bucket}/{key}" if bucket and key else key
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return reuse_url(metadata.get('link'), self._link_base_url(), kept_query=('project_id',))
+
+    def _chunk_source_id(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('key') or metadata.get('id')
+
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._log_tool_event(message=f"Loading the files from artifact's bucket. {kwargs=}", tool_name="loader")
 
         # Extract filtering params
         folder = kwargs.get('folder', None)
+        self._record_index_source(location="/".join(part.strip('/') for part in (self.bucket, folder) if part))
         include_extensions = kwargs.get('include_extensions', [])
         skip_extensions = kwargs.get('skip_extensions', [])
 

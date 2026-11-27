@@ -106,6 +106,9 @@ jobs:
     name: Update SDK Plugin
     needs: pypi-publish
     uses: ./.github/workflows/update-sdk-plugin.yml
+    permissions:
+      contents: write
+      pull-requests: write
     with:
       sdk_version: ${{ needs.pypi-publish.outputs.sdk_version }}
       target_branch: ${{ github.ref_name }}

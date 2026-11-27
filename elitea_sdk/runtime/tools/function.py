@@ -10,11 +10,12 @@ from uuid import uuid4
 from langchain_core.callbacks import dispatch_custom_event
 from langchain_core.messages import ToolCall
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, ToolException
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from ..exceptions import InputGuardrailBlocked, budget_exceeded_from
+from ..credential_slots import GovernedCredentialError
 from ..tool_outcome import (
     ToolOutcome,
     ToolResultStatus,
@@ -22,10 +23,10 @@ from ..tool_outcome import (
     outcome_sink,
     record_outcome,
     retriable_for,
+    run_failure_message,
 )
 from ..utils.mcp_oauth import McpAuthorizationRequired
 from typing import Any, Optional, Union
-from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..langchain.utils import propagate_the_input_mapping, safe_serialize, object_to_dict, log_tool_result
 from .sandbox import CLIENT_ALIAS_LINE
@@ -132,6 +133,10 @@ alita_state = elitea_state.copy()
 
     def _handle_pyodide_output(self, tool_result: Any) -> dict:
         """Handle output processing for PyodideSandboxTool results."""
+        if not isinstance(tool_result, dict):
+            # Sandbox returns a plain error string when it fails before execution
+            raise ToolException(str(tool_result))
+
         tool_result_converted = {}
 
         if self.output_variables:
@@ -318,7 +323,7 @@ alita_state = elitea_state.copy()
         message = "\n\n".join(parts)
 
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
 
@@ -356,7 +361,7 @@ alita_state = elitea_state.copy()
         )
         self._record_blocked_error(tool_name, 'authorization skipped')
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
         for var in self.output_variables or []:
@@ -377,7 +382,7 @@ alita_state = elitea_state.copy()
         )
         self._record_blocked_error(tool_name, 'authorized toolkit not available')
         result: dict[str, Any] = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
         }
         for var in self.output_variables or []:
@@ -482,16 +487,34 @@ alita_state = elitea_state.copy()
         result[LAST_TOOL_OUTCOME_KEY] = payload
         return result
 
+    def _with_agent_node_call_id(self, config: Optional[RunnableConfig]) -> RunnableConfig:
+        """Stamp a per-run ``parent_agent_call_id`` for an Agent node (#7128).
+
+        The UI groups a sub-agent's activity by this id. An LLM-issued call gets
+        it from its tool_call_id in ``Application.invoke``; a pipeline node calls
+        the agent directly, so without this every run of the node (e.g. each loop
+        pass) shares the empty id and is merged into one Tool Call History entry.
+        The LangGraph task id is new for every node run but stays the same when a
+        paused run is resumed, so one run stays one entry across a HITL pause.
+        As in ``Application.invoke``, this level's id overrides an inherited one.
+        """
+        config = dict(config or {})
+        configurable = config.get('configurable') or {}
+        run_id = (
+            configurable.get('__pregel_task_id')
+            or (configurable.get('checkpoint_ns') or '').rpartition(':')[2]
+            or uuid4().hex
+        )
+        config['metadata'] = dict(config.get('metadata') or {})
+        config['metadata']['parent_agent_call_id'] = f'pipeline:{self.name}:{run_id}'
+        return config
+
     def _invoke_node(
             self,
             state: Union[str, dict, ToolCall],
             config: Optional[RunnableConfig] = None,
             **kwargs: Any,
     ) -> Any:
-        params = convert_to_openai_tool(self.tool).get(
-            'function', {'parameters': {}}).get(
-            'parameters', {'properties': {}}).get('properties', {})
-
         func_args = propagate_the_input_mapping(input_mapping=self.input_mapping, input_variables=self.input_variables,
                                                 state=state)
 
@@ -524,6 +547,7 @@ alita_state = elitea_state.copy()
                     logger.debug(f"[FUNC_TOOL] Overriding '{key}' in func_args with state value (value: {value!r})")
                     func_args[key] = value
             logger.debug(f"[FUNC_TOOL] Final func_args keys: {list(func_args.keys())}")
+            config = self._with_agent_node_call_id(config)
 
         # special handler for PyodideSandboxTool
         if self._is_pyodide_tool():
@@ -664,7 +688,7 @@ alita_state = elitea_state.copy()
                     return messages_dict
                 else:
                     return { self.output_variables[0]: object_to_dict(tool_result) }
-        except (GraphBubbleUp, InputGuardrailBlocked):
+        except (GraphBubbleUp, InputGuardrailBlocked, GovernedCredentialError):
             raise
         except McpAuthorizationRequired as auth_error:
             # Direct Toolkit/MCP pipeline nodes bypass the LLM tool loop, so
@@ -704,9 +728,9 @@ alita_state = elitea_state.copy()
                 exception_type=type(e).__name__,
                 retry_after=getattr(e, 'retry_after', None),
             ))
+            logger.error("FunctionTool %s failed", self.tool.name, exc_info=True)
             return {"messages": [
-                {"role": "assistant", "content": f"""Tool input to the {self.tool.name} with value {func_args} raised Exception.
-                        \n\nTool schema is {safe_serialize(params)}. \n\n Details: {e}"""}]}
+                run_failure_message(f"The tool {self.tool.name} failed. Open the run log for details.")]}
 
     def _run(self, *args, **kwargs):
         return self.invoke(**kwargs)

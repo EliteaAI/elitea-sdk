@@ -654,11 +654,8 @@ def test_application_toolkit_passes_parent_memory_and_subgraph_flag():
         auto_approve_sensitive_actions=True,
     )
 
-    assert len(client.application_calls) == 1
-    initial_call = client.application_calls[0]['kwargs']
-    assert initial_call['memory'] is parent_memory
-    assert initial_call['is_subgraph'] is True
-    assert initial_call['auto_approve_sensitive_actions'] is True
+    # #7759: the child is built on first call from args_runnable, not at load
+    assert client.application_calls == []
 
     tool = toolkit.get_tools()[0]
     assert tool.is_subgraph is True

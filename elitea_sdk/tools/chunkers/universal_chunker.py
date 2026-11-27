@@ -24,6 +24,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .code.codeparser import parse_code_files_for_db
+from ..utils.source_info import SOURCE_TARGET_KEYS
 from .sematic.markdown_chunker import markdown_chunker
 from .sematic.json_chunker import json_chunker
 
@@ -111,10 +112,14 @@ def _code_chunker_from_documents(
     """
     Adapter to convert Document generator to code parser format.
     """
+    source_targets = {}
+
     def file_content_generator():
         for doc in documents:
+            file_name = doc.metadata.get('file_path', doc.metadata.get('filename', 'unknown'))
+            source_targets[file_name] = {key: doc.metadata[key] for key in SOURCE_TARGET_KEYS if key in doc.metadata}
             yield {
-                'file_name': doc.metadata.get('file_path', doc.metadata.get('filename', 'unknown')),
+                'file_name': file_name,
                 'file_content': doc.page_content,
                 'commit_hash': doc.metadata.get('commit_hash', ''),
                 'blob_sha': doc.metadata.get('blob_sha', ''),
@@ -125,6 +130,7 @@ def _code_chunker_from_documents(
         # Ensure file_path is preserved
         if 'file_path' not in chunk.metadata and 'filename' in chunk.metadata:
             chunk.metadata['file_path'] = chunk.metadata['filename']
+        chunk.metadata.update(source_targets.get(chunk.metadata.get('filename'), {}))
         yield chunk
 
 

@@ -13,6 +13,7 @@ from .file_filters import (
     normalize_extension_filters,
     skip_reporter,
 )
+from .graph_retry import send_with_retry
 
 
 class SharepointAuthorizationHelper:
@@ -143,7 +144,7 @@ class SharepointAuthorizationHelper:
 
     def get_files_list(self, site_url: str, folder_name: str = None, limit_files: int = 100,
                        include_extensions=None, skip_extensions=None, form_name: str = None,
-                       on_file_skipped=None):
+                       on_file_skipped=None, on_listing_gap=None):
         if not site_url or not site_url.startswith("https://"):
             raise ValueError(f"Invalid site_url format: {site_url}")
         if limit_files is not None and (not isinstance(limit_files, int) or limit_files <= 0):
@@ -152,11 +153,16 @@ class SharepointAuthorizationHelper:
         norm_include = normalize_extension_filters(include_extensions)
         norm_skip = normalize_extension_filters(skip_extensions)
         _report_skipped = skip_reporter(on_file_skipped)
+
+        def _report_gap(reason: str) -> None:
+            if on_listing_gap:
+                on_listing_gap(reason)
+
         try:
             access_token, site_id = self.generate_token_and_site_id(site_url)
             headers = {"Authorization": f"Bearer {access_token}"}
             drives_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
-            drives_response = requests.get(drives_url, headers=headers)
+            drives_response = send_with_retry(lambda: requests.get(drives_url, headers=headers, timeout=60))
             drives = self._validate_response(drives_response, required_field="value", error_prefix="Drives request")
             result = []
             def _recurse_drive(drive_id, drive_path, parent_folder, limit_files):
@@ -170,11 +176,13 @@ class SharepointAuthorizationHelper:
                 files = []
                 next_link = url
                 while next_link:
-                    response = requests.get(next_link, headers=headers)
+                    response = send_with_retry(lambda url=next_link: requests.get(url, headers=headers, timeout=60))
                     if response.status_code != 200:
+                        _report_gap("a folder page could not be read")
                         break
                     files_json = response.json()
                     if "value" not in files_json:
+                        _report_gap("a folder page came back without its items")
                         break
                     for file in files_json["value"]:
                         file_name = file.get('name', '')
@@ -192,7 +200,9 @@ class SharepointAuthorizationHelper:
                             'id': file.get('id')
                         }
                         if not all([temp_props['Name'], temp_props['Path'], temp_props['id']]):
-                            continue  # skip files with missing required fields
+                            # The item cannot be listed, so a run must not read its absence as a removal.
+                            _report_gap("an item came back without a name, path or id")
+                            continue
                         if 'folder' in file:
                             # Recursively extract files from this folder
                             inner_folder = parent_folder + '/' + file_name if parent_folder else file_name
@@ -250,6 +260,7 @@ class SharepointAuthorizationHelper:
                 files = _recurse_drive(drive_id, drive_path, sub_folder, limit_files)
                 result.extend(files)
                 if limit_files is not None and len(result) >= limit_files:
+                    _report_gap("the file limit was reached before the listing ended")
                     return result[:limit_files]
             return result
         except Exception as e:

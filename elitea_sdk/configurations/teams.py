@@ -11,12 +11,19 @@ log = logging.getLogger(__name__)
 # Permissions offered as checkboxes, in display order (Microsoft Graph delegated permissions).
 TEAMS_SCOPE_DESCRIPTIONS: Dict[str, str] = {
     "User.ReadBasic.All": "Look up people by email: chat members, senders and recipients.",
-    "Chat.Read": "Read your chats and chat messages: list_chats, find_chat_messages, search_teams_messages.",
+    "Chat.Read": (
+        "Read your chats and chat messages: list_chats, find_chat_messages. "
+        "search_teams_messages also needs ChannelMessage.Read.All."
+    ),
     "ChatMessage.Send": "Send chat messages as you: send_chat_message.",
     "Chat.Create": "Start a new 1:1 or group chat when send_chat_message finds no existing chat.",
     "Team.ReadBasic.All": "List the teams you are a member of: list_teams, team names, connection test.",
     "Channel.ReadBasic.All": "List the channels of a team: list_channels, channel names.",
     "ChannelMessage.Send": "Post and reply in channels as you: send_channel_message.",
+    "ChannelMessage.Read.All": (
+        "Search and read channel messages (search_teams_messages across channels). "
+        "Requires Entra admin consent. Leave off unless your Entra admin has granted it."
+    ),
 }
 TEAMS_SCOPES = list(TEAMS_SCOPE_DESCRIPTIONS)
 TEAMS_DEFAULT_SCOPES = ["User.ReadBasic.All", "Chat.Read", "Team.ReadBasic.All", "Channel.ReadBasic.All"]
@@ -145,11 +152,13 @@ class TeamsConfiguration(BaseModel):
                 configuration_uuid=configuration_uuid,
                 oauth_app_id=oauth_app_id,
                 client_id=app_client_id,
+                auto_refresh_token=settings.get("auto_refresh_token"),
             )
 
         return TeamsConfiguration._call_graph_api(
             access_token, oauth_discovery_endpoint, scopes, configuration_uuid,
             oauth_app_id=oauth_app_id, client_id=app_client_id,
+            auto_refresh_token=settings.get("auto_refresh_token"),
         )
 
     @staticmethod
@@ -160,6 +169,7 @@ class TeamsConfiguration(BaseModel):
         configuration_uuid: Optional[str] = None,
         oauth_app_id: Optional[str] = None,
         client_id: Optional[str] = None,
+        auto_refresh_token: Optional[bool] = None,
     ) -> str | None:
         """Health-check access token using Microsoft Graph Teams API."""
         try:
@@ -182,6 +192,7 @@ class TeamsConfiguration(BaseModel):
                     configuration_uuid=configuration_uuid,
                     oauth_app_id=oauth_app_id,
                     client_id=client_id,
+                    auto_refresh_token=auto_refresh_token,
                 )
             elif resp.status_code == 403:
                 return (
@@ -228,6 +239,7 @@ class TeamsConfiguration(BaseModel):
         client_id: Optional[str] = None,
         client_secret: Optional[SecretStr | str] = None,
         oauth_app_id: Optional[str] = None,
+        auto_refresh_token: Optional[bool] = None,
     ) -> "McpAuthorizationRequired":
         """Build McpAuthorizationRequired exception for OAuth flow."""
         from ..runtime.utils.mcp_oauth import (
@@ -235,7 +247,8 @@ class TeamsConfiguration(BaseModel):
             fetch_oauth_authorization_server_metadata,
         )
 
-        effective_scopes = ["offline_access", *normalize_teams_scopes(scopes)]
+        from .oauth_app_mode import sign_in_scopes
+        effective_scopes = sign_in_scopes(normalize_teams_scopes(scopes), auto_refresh_token)
 
         base_discovery = oauth_discovery_endpoint.rstrip("/")
         azure_v2_endpoint = f"{base_discovery}/v2.0/.well-known/openid-configuration"

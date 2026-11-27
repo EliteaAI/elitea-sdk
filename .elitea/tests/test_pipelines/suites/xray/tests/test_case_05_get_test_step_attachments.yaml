@@ -173,13 +173,21 @@ nodes:
              - Response mentions a test key (like "EL-944") OR
              - Response says "No attachments found for test" (proves test ID was used)
           
-          5. test_passed = true IF AND ONLY IF all 4 criteria above are true
+          5. has_attachments = true ONLY when actual attachment metadata is present; false when the response is a valid "No attachments found" success
+          
+          6. attachments_count = 0 when the response is "No attachments found"; otherwise count the returned attachments
+          
+          7. test_passed = true IF AND ONLY IF tool_executed=true AND no_errors=true AND valid_response=true AND test_id_valid=true
+             - test_passed MUST NOT depend on has_attachments being true
+             - A graceful "No attachments found for test ..." response is a PASS
           
           EXAMPLE VALID SUCCESS: "No attachments found for test EL-944"
           - tool_executed: true (got response)
           - no_errors: true (no error keywords)
           - valid_response: true (contains "No attachments found")
           - test_id_valid: true (mentions "EL-944")
+          - has_attachments: false
+          - attachments_count: 0
           - test_passed: TRUE
 
           Return JSON test_results:

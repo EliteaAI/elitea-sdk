@@ -79,6 +79,8 @@ on:
 jobs:
   configure-matrix:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       loader_matrix: ${{ steps.set-matrix.outputs.loader_matrix }}
       has-tests: ${{ steps.set-matrix.outputs.has-tests }}
@@ -266,7 +268,7 @@ jobs:
         data: ${{ fromJson(needs.configure-matrix.outputs.loader_matrix) }}
 
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide102026
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide112026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -452,7 +454,7 @@ jobs:
           --health-retries 5
 
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide102026
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide112026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -564,7 +566,7 @@ jobs:
           --health-retries 5
 
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide102026
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide112026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

@@ -1288,7 +1288,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
             input_mapping={},
             output_variables=["question"],
             structured_output=True,
-            structured_output_dict={"question": {"type": "list", "description": "Questions"}},
+            structured_output_dict={"question": {"type": "str", "description": "Questions"}},
             available_tools=[_make_data_fetch_tool()],
             tool_names=["data_fetch"],
         )
@@ -1306,7 +1306,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         llm = _AnthropicThinkingLLM()
         node = self._make_node_for_anthropic_thinking(llm)
 
-        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+        struct_model = _make_struct_model({"question": {"type": "str", "description": "Q"}})
 
         # Simulate: first LLM call returns a tool-calling AIMessage (thinking blocks)
         tool_call_msg = AIMessage(
@@ -1389,7 +1389,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         """
         # 1. Demonstrate the stub raises on bare AIMessage-terminated input.
         bare_stub = _StructuredOutputStub(
-            _make_struct_model({"question": {"type": "list"}}),
+            _make_struct_model({"question": {"type": "str"}}),
             method="json_schema",
         )
         with pytest.raises(_AnthropicPrefillRejection):
@@ -1403,7 +1403,7 @@ class TestAnthropicThinkingStructuredOutputIntegration:
         # is satisfied at the boundary the real gateway enforces.
         llm = _AnthropicThinkingLLM()
         node = self._make_node_for_anthropic_thinking(llm)
-        struct_model = _make_struct_model({"question": {"type": "list", "description": "Q"}})
+        struct_model = _make_struct_model({"question": {"type": "str", "description": "Q"}})
 
         tool_call_msg = AIMessage(
             content=[
@@ -1731,6 +1731,78 @@ class TestSynthesizeStructuredRouting:
             )
 
 
+class TestThinkingAnthropicOpenObject:
+    """#7623: json_schema forces additionalProperties=false, so a dict field comes
+    back as {} on thinking Anthropic; such schemas must use the JSON-prompt path."""
+
+    def _node(self, client):
+        node = _make_llm_node()
+        node.client = client
+        return node
+
+    def test_dict_field_uses_json_prompt_and_keeps_object(self):
+        llm = _AnthropicThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({
+            "custom_text": {"type": "str", "description": ""},
+            "custom_json": {"type": "dict", "description": ""},
+        })
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(
+            content='{"custom_text": "ok", "custom_json": {"status": "ready", "source": "user"}}'
+        )
+
+        result = node._synthesize_structured(llm_client, [HumanMessage(content="q")], struct_model, {})
+
+        assert result.custom_json == {"status": "ready", "source": "user"}
+        assert llm.with_structured_output_calls == []
+
+    def test_list_field_also_uses_json_prompt(self):
+        # The inlined JsonValue union carries an open {"type": "object"} branch too.
+        llm = _AnthropicThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({"items": {"type": "list", "description": ""}})
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(content='{"items": [{"n": 1}]}')
+
+        result = node._synthesize_structured(llm_client, [HumanMessage(content="q")], struct_model, {})
+
+        assert result.items == [{"n": 1}]
+        assert llm.with_structured_output_calls == []
+
+    def test_closed_schema_keeps_json_schema_route(self):
+        llm = _AnthropicThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({"answer": {"type": "str", "description": ""}})
+
+        node._synthesize_structured(llm, [HumanMessage(content="q")], struct_model, {})
+
+        assert llm.with_structured_output_calls == ["json_schema"]
+
+    def test_non_thinking_anthropic_keeps_function_calling(self):
+        # Forced tool calling does not apply transform_schema, so dict values survive.
+        llm = _AnthropicNonThinkingLLM()
+        node = self._node(llm)
+        struct_model = _make_struct_model({"custom_json": {"type": "dict", "description": ""}})
+
+        node._synthesize_structured(llm, [HumanMessage(content="q")], struct_model, {})
+
+        assert llm.with_structured_output_calls == ["function_calling"]
+
+
+class TestHasOpenObject:
+    def test_detects_dict_and_jsonvalue_object_branch(self):
+        from elitea_sdk.runtime.langchain.utils import has_open_object, make_anthropic_compatible_schema
+
+        dict_model = create_pydantic_model("M", {"d": {"type": "dict"}})
+        list_model = create_pydantic_model("M", {"l": {"type": "list"}})
+        str_model = create_pydantic_model("M", {"s": {"type": "str"}, "n": {"type": "int"}})
+
+        assert has_open_object(make_anthropic_compatible_schema(dict_model)) is True
+        assert has_open_object(make_anthropic_compatible_schema(list_model)) is True
+        assert has_open_object(make_anthropic_compatible_schema(str_model)) is False
+
+
 class TestStructuredOutputResultFiltering:
     """Issue #6375: Anthropic's dict-schema path (see __get_struct_output_model)
     returns raw tool-call arguments with no Pydantic model to filter them
@@ -1798,3 +1870,134 @@ class TestStructuredOutputResultFiltering:
         )
 
         assert result["story"] == "Once upon a time..."
+
+
+class TestBareStringStructuredContent:
+    """#7623: with thinking on, Claude 5.5 can return the JSON as a bare string
+    next to the thinking block instead of a ``{'type': 'text'}`` block."""
+
+    CONTENT = [
+        '',
+        {'type': 'thinking', 'thinking': 'Use exactly these keys.', 'signature': 's'},
+        '{"custom_text": "ok", "custom_json": {"status": "ready"}}',
+    ]
+
+    def _struct_model(self):
+        return _make_struct_model({
+            "custom_text": {"type": "str", "description": ""},
+            "custom_json": {"type": "dict", "description": ""},
+        })
+
+    def test_extract_reads_bare_string_item(self):
+        node = _make_llm_node()
+        result = node._extract_structured_from_content(_make_completion(self.CONTENT), self._struct_model())
+        assert result is not None
+        assert result.custom_text == "ok"
+        assert result.custom_json == {"status": "ready"}
+
+    def test_extract_joins_text_blocks_and_bare_strings(self):
+        node = _make_llm_node()
+        content = [{'type': 'text', 'text': '{"custom_text": "ok", '}, '"custom_json": {"a": 1}}']
+        result = node._extract_structured_from_content(_make_completion(content), self._struct_model())
+        assert result.custom_json == {"a": 1}
+
+    def test_json_prompt_path_parses_bare_string_reply(self):
+        llm = _AnthropicThinkingLLM()
+        node = _make_llm_node()
+        node.client = llm
+        llm_client = MagicMock()
+        llm_client.invoke.return_value = AIMessage(content=self.CONTENT)
+
+        result = node._synthesize_structured(llm_client, [HumanMessage(content="q")], self._struct_model(), {})
+
+        assert result.custom_json == {"status": "ready"}
+        assert llm.with_structured_output_calls == []
+
+    def test_fallback_marks_only_raw_text_as_set(self):
+        node = _make_llm_node()
+        result = node._create_fallback_completion("raw", self._struct_model())
+        assert result.model_fields_set == {ELITEA_RS}
+
+
+class TestUnparsedStructuredOutputKeepsState:
+    """#7623: an unparseable reply must not overwrite existing state with None."""
+
+    def _node(self):
+        node = LLMNode(
+            name="LLM 1",
+            description="test",
+            input_variables=["input"],
+            input_mapping={
+                "chat_history": {"type": "fixed", "value": []},
+                "system": {"type": "fixed", "value": "fill the state"},
+                "task": {"type": "fixed", "value": "fill the state"},
+            },
+            output_variables=["custom_text", "custom_json"],
+            structured_output=True,
+            structured_output_dict={"custom_text": "str", "custom_json": "dict"},
+        )
+        node.client = MagicMock()
+        return node
+
+    def _run(self, node, make_completion):
+        node._invoke_with_structured_output = lambda llm_client, messages, struct_model, config: (
+            make_completion(node, struct_model), None, messages
+        )
+        return node._invoke_llm_internal(
+            {"input": "go", "messages": [], "custom_text": "old", "custom_json": {"k": "v"}},
+            {},
+            [],
+        )
+
+    def test_fallback_completion_drops_none_fields(self):
+        result = self._run(self._node(), lambda node, m: node._create_fallback_completion("not json", m))
+        assert "custom_text" not in result
+        assert "custom_json" not in result
+        assert result[ELITEA_RS] == "not json"
+
+    def test_parsed_completion_keeps_returned_none(self):
+        result = self._run(self._node(), lambda node, m: m.model_construct(
+            custom_text=None, custom_json={"a": 1}, **{ELITEA_RS: "done"}
+        ))
+        assert result["custom_text"] is None
+        assert result["custom_json"] == {"a": 1}
+
+
+class TestFormatStructuredOutputMessages:
+    """`messages` in a structured output is list[JsonValue]: models may return
+    strings or {"role", "content"} dicts. Both must become one assistant message."""
+
+    def _format(self, messages_value, rs="summary"):
+        node = _make_llm_node()
+        result = {'messages': messages_value, ELITEA_RS: rs}
+        completion = AIMessage(content="raw completion")
+        return node._format_structured_output_result(result, [HumanMessage(content="hi")], completion)
+
+    def test_string_items_are_joined(self):
+        out = self._format(["line one", "line two"])
+        assert out['messages'] == [{'role': 'assistant', 'content': 'line one\nline two'}]
+
+    def test_dict_items_use_content(self):
+        out = self._format([{"role": "assistant", "content": "custom=1 | str_var=hello"}])
+        assert out['messages'] == [{'role': 'assistant', 'content': 'custom=1 | str_var=hello'}]
+
+    def test_mixed_and_non_string_items(self):
+        out = self._format(["a", {"role": "assistant", "content": "b"}, {"k": 1}, 3, None])
+        assert out['messages'] == [{'role': 'assistant', 'content': 'a\nb\n{"k": 1}\n3'}]
+
+    def test_dict_with_non_string_content_is_dumped(self):
+        out = self._format([{"role": "assistant", "content": [{"type": "text", "text": "x"}]}])
+        assert out['messages'][0]['content'] == '[{"type": "text", "text": "x"}]'
+
+    def test_bare_string_value(self):
+        out = self._format("just text")
+        assert out['messages'] == [{'role': 'assistant', 'content': 'just text'}]
+
+    def test_empty_items_fall_back_to_elitea_response(self):
+        out = self._format([{"role": "assistant", "content": ""}], rs="summary")
+        assert [m.content for m in out['messages']] == ["hi", "summary"]
+
+    def test_missing_messages_falls_back_to_elitea_response(self):
+        out = self._format(None, rs="summary")
+        assert isinstance(out['messages'][-1], AIMessage)
+        assert out['messages'][-1].content == "summary"

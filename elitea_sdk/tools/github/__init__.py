@@ -19,9 +19,9 @@ def get_toolkit(tool) -> BaseToolkit:
     return EliteAGitHubToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         github_base_url=tool['settings'].get('base_url', ''),
-        github_repository=tool['settings']['repository'],
-        active_branch=tool['settings']['active_branch'],
-        github_base_branch=tool['settings']['base_branch'],
+        github_repository=tool['settings'].get('repository'),
+        active_branch=tool['settings'].get('active_branch'),
+        github_base_branch=tool['settings'].get('base_branch'),
         github_configuration=tool['settings']['github_configuration'],
         llm=tool['settings'].get('llm', None),
         elitea=tool['settings'].get('elitea', None),
@@ -60,7 +60,10 @@ class EliteAGitHubToolkit(BaseToolkit):
                                                              json_schema_extra={'configuration_types': ['github']})),
             pgvector_configuration=(Optional[PgVectorConfiguration], Field(description=PGVECTOR_CONFIGURATION_TOOLTIP, default=None,
                                                                      json_schema_extra={'configuration_types': ['pgvector']})),
-            repository=(str, Field(description="Github repository")),
+            repository=(Optional[str], Field(
+                default=None,
+                description="Default GitHub repository in format 'owner/repo'. Optional: tools accept "
+                            "repo_name to work on another repository the credentials can access.")),
             active_branch=(Optional[str], Field(description="Active branch", default="main")),
             base_branch=(Optional[str], Field(description="Github Base branch", default="main")),
             # embedder settings
@@ -92,7 +95,8 @@ class EliteAGitHubToolkit(BaseToolkit):
             description = tool["description"]
             if toolkit_name:
                 description = f"Toolkit: {toolkit_name}\n{description}"
-            description = f"Repository: {github_api_wrapper.github_repository}\n{description}"
+            if github_api_wrapper.github_repository:
+                description = f"Repository: {github_api_wrapper.github_repository}\n{description}"
             description = description[:1000]
             tools.append(GitHubAction(
                 api_wrapper=github_api_wrapper,

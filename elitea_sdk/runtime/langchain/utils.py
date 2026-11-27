@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langgraph.graph import add_messages
 
 from ...runtime.langchain.constants import ELITEA_RS, PRINTER_NODE_RS
+from ...runtime.utils import safe_templates
 
 logger = logging.getLogger(__name__)
 
@@ -577,7 +578,7 @@ def propagate_the_input_mapping(input_mapping: dict[str, dict], input_variables:
 
         if value['type'] == 'fstring':
             try:
-                input_data[key] = value['value'].format(**var_dict)
+                input_data[key] = safe_templates.safe_format(value['value'], **var_dict)
             except (KeyError, IndexError) as e:
                 # KeyError: named placeholder not found in var_dict
                 # IndexError: positional placeholder {0} or {} used but no positional args provided
@@ -729,6 +730,23 @@ def make_anthropic_compatible_schema(pydantic_model: Any) -> dict:
     if not defs:
         schema.pop("$defs", None)
     return schema
+
+def has_open_object(node: Any) -> bool:
+    """True when ``node`` (a JSON schema) contains an object with no declared
+    ``properties`` — the shape ``dict`` / ``list`` / ``any`` pipeline types emit.
+
+    Anthropic's ``output_config.format`` (``method='json_schema'``) runs the
+    schema through ``anthropic.transform_schema``, which forces
+    ``additionalProperties: false`` on every object; an object with no
+    properties then only admits ``{}`` and the model's keys are dropped (#7623).
+    """
+    if isinstance(node, dict):
+        if node.get("type") == "object" and not node.get("properties"):
+            return True
+        return any(has_open_object(value) for value in node.values())
+    if isinstance(node, list):
+        return any(has_open_object(item) for item in node)
+    return False
 
 def safe_serialize(obj: Any) -> str:
     """

@@ -181,3 +181,29 @@ def test_bare_with_instructions_sends_one_system_message_end_to_end():
     assert len(system_msgs) == 1
     assert "Always respond in Spanish." in str(system_msgs[0].content)
     assert "EliteA" not in str(system_msgs[0].content)
+
+
+# --- #7467: chat keeps the persona template when it also has instructions ----
+
+@pytest.mark.parametrize("persona", ["generic", "qa", "nerdy", "quirky", "cynical"])
+def test_chat_persona_template_wraps_platform_instructions(persona):
+    # Project context / MCP addons make chat instructions non-empty even with no custom text
+    assistant = _make_assistant(persona, app_type=APP_TYPE_PREDICT)
+    out = _compose(assistant, prompt_instructions="# Project Context\n\nShip on Fridays.")
+    assert "EliteA" in out
+    assert "Ship on Fridays." in out
+
+
+def test_chat_generic_persona_uses_default_assistant_with_custom_instructions():
+    assistant = _make_assistant("generic", app_type=APP_TYPE_PREDICT)
+    out = _compose(assistant, prompt_instructions="Answer in French.")
+    assert out.startswith(DEFAULT_ASSISTANT.split("{users_instructions}")[0].rstrip()[:40])
+    assert "## Custom instructions:" in out and "Answer in French." in out
+
+
+@pytest.mark.parametrize("persona", ["none", "bare"])
+def test_chat_without_a_template_persona_sends_instructions_directly(persona):
+    assistant = _make_assistant(persona, app_type=APP_TYPE_PREDICT)
+    out = _compose(assistant, prompt_instructions="Answer in French.")
+    assert out.startswith("Answer in French.")
+    assert "EliteA" not in out

@@ -94,3 +94,49 @@ Set _use_prompt_default_ to _true_ to use built-in detailed prompt to process im
 Note: the complexity of a prompt may affect processing time and token usage.  
 **Example:** `{".pdf": {"use_llm": true, "prompt": "Provide only information regarding colors and wrap output with image tag."}}`
 
+### Excel (`.xlsx`, `.xls`) chunk size
+
+Excel sheets are split into chunks of rows of at most _max_tokens_ tokens each (default: `512`), so a large sheet does not overflow the model's context window.
+A single row longer than _max_tokens_ becomes a chunk of its own. Set _add_header_to_chunks_ to _true_ to repeat the header row at the top of every chunk.
+Set _max_tokens_ to `-1` to index each sheet as one chunk (the pre-R-2.0.9 default).  
+**Example:** `{".xlsx": {"max_tokens": 1000, "add_header_to_chunks": true}, ".xls": {"max_tokens": -1}}`
+
+`read_file` is not affected: it still returns each sheet as one chunk.
+
+---
+
+## Page and section fields of PDF and Word chunks
+
+Chunks of PDF and Word files carry these metadata fields. Search results return them as stored.
+
+| Field | Files | Value |
+|---|---|---|
+| `page` | PDF | Zero-based page index (unchanged). |
+| `page_number` | PDF | `page + 1` of the page where the chunk starts: the page number a PDF viewer shows. Page labels printed in the text do not change it. |
+| `page_number_from`, `page_number_to` | PDF | First and last page of the chunk. Most chunks lie on one page, so both equal `page_number`. A chunk that crosses a page break has `page_number_to` greater than `page_number_from` (for example 5 and 6). |
+| `section_number`, `section_title` | PDF, Word | The closest heading above the start of the chunk. |
+
+How the section is found:
+
+- PDF: bookmarks (the outline) first. Without bookmarks, numbered headings in the text.
+- Word: heading styles and numbering.
+- When several headings are above the chunk, the deepest one is used (for example `2.1`, not `2`).
+- A field is absent when it is unknown. A chunk before the first heading has the page fields only. Word files have no page fields.
+
+### Where a PDF chunk starts and ends
+
+- A PDF page is one chunk, or several when _max_tokens_ is set. A page is also cut where a top-level heading starts in the middle of it (a top-level bookmark, or a number such as `2`, `Chapter 4` or `Appendix B`). No chunk holds text of two top-level sections. Headings of level two or deeper do not cut a page.
+- A short part, under 200 characters of text, joins its neighbour page: a short part at the bottom of a page that starts a new top-level section joins the next page, and a few lines at the top of a page, before the first top-level heading, join the previous page. The chunk then spans two pages, for example `page_number_from` 5 and `page_number_to` 6. A page with no cut is never joined only because it is short.
+- One short line above the first top-level heading of a page is a running header (`Page 4 of 10`). It does not cut the page: it stays with the chapter that starts below it, and the section tail above it is not joined to the previous page. The cost: a one-line tail of the previous section at the top of a page takes the section of the new chapter. Two or more lines above the heading, or a line of 200 characters or more, cut the page.
+- At most 10 top-level headings of one page cut it; the rest stay in the last part.
+- A PDF whose outline has one level-1 root bookmark (often the document title) over all chapters is not split at chapters: only level-1 entries cut a page.
+- A numbered keyword heading keeps its dotted parts (`Appendix D.2`, `Annex A.1.2`). `Appendix D` is top level, `Appendix D.2` is level two and does not cut a page.
+- An outline title is looked up at the start of a line of its page, also when it wraps over two lines. When no line starts with it, the entry names the top of its page and does not cut the page.
+- A chunk starts on the first page of its text and takes the section at that start.
+
+### Existing indexes
+
+An index run without `clean_index` skips files that did not change (see step 3). Their old chunks keep the bounds and the fields they had when they were indexed: chunks from before these fields have `page` only, and older PDF chunks are one per page. Nothing breaks, because a reader gets a chunk with fewer fields.
+
+To add the new fields to old chunks, run the index with `clean_index` set to _true_ (Clean index in the UI). It removes the old chunks and indexes every file again. A reader of these fields must handle a missing key.
+

@@ -37,6 +37,7 @@ from ..utils.mcp_oauth import (
     infer_authorization_servers_from_realm,
     normalize_mcp_url,
 )
+from ...configurations.mcp_login import McpLoginConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,17 @@ class McpToolkit(BaseToolkit):
                 Field(
                     default=None,
                     description="OAuth Scopes (if applicable)"
+                )
+            ),
+            mcp_login_configuration=(
+                Optional[McpLoginConfiguration],
+                Field(
+                    default=None,
+                    description="Saved login (used by chats, schedules and webhooks)",
+                    json_schema_extra={
+                        'configuration_types': ['mcp_login'],
+                        'tooltip': 'A project admin signs in once; runs with no browser session use this login',
+                    }
                 )
             ),
             timeout=(

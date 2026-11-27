@@ -40,4 +40,5 @@ def test_index_tool_raise_propagates_into_fallback_message():
         result = node.invoke({})
 
     content = result["messages"][0]["content"]
-    assert "Index backend unavailable" in content
+    assert content == "The tool doc_tool failed. Open the run log for details."
+    assert "Index backend unavailable" not in content

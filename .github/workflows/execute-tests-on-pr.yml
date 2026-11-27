@@ -23,6 +23,10 @@ env:
 jobs:
   configure-matrix:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: read
     if: github.actor != 'breilian'
     outputs:
       test_matrix: ${{ steps.set-matrix.outputs.test_matrix }}
@@ -51,7 +55,7 @@ jobs:
       - name: Pull Docker image
         run: |
           IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          docker pull ${{ env.REGISTRY }}/$IMAGE_NAME:pyodide102026
+          docker pull ${{ env.REGISTRY }}/$IMAGE_NAME:pyodide112026
 
       - name: Run PR Impact Analyzer Agent
         id: run-agent
@@ -165,6 +169,10 @@ jobs:
       matrix:
         data: ${{ fromJson(needs.configure-matrix.outputs.test_matrix) }}
     uses: ./.github/workflows/test-runner-reusable.yml
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
     with:
       test_cases_dir: ${{ matrix.data.suite }}
       tests_to_run: ${{ matrix.data.tests_to_run }}
@@ -183,7 +191,7 @@ jobs:
       checks: write
       pull-requests: write
     container:
-      image: ghcr.io/eliteaai/elitea-sdk:pyodide102026
+      image: ghcr.io/eliteaai/elitea-sdk:pyodide112026
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -214,6 +222,19 @@ jobs:
       - name: Install tavily-python (not yet in the prebuilt image)
         run: python -m pip install --no-cache-dir "tavily-python==0.8.5"
 
+      - name: Sync SVG rendering pins from pyproject (prebuilt image lags behind)
+        run: |
+          pins=$(python - <<'PY'
+          import re, tomllib
+          deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["optional-dependencies"]
+          names = {"svglib", "reportlab"}
+          print(" ".join(sorted({d for group in deps.values() for d in group
+                                 if re.split(r"[<>=!~\[ ]", d, 1)[0].lower() in names})))
+          PY
+          )
+          echo "Installing: $pins"
+          python -m pip install --no-cache-dir --no-deps $pins
+
       - name: Run unit tests
         run: |
           mkdir -p tests/reports
@@ -222,7 +243,7 @@ jobs:
             --ignore=tests/runtime/langchain/document_loaders \
             --ignore=tests/tools/index \
             --timeout=60 \
-            --timeout-method=thread \
+            --timeout-method=signal \
             --junit-xml=tests/reports/unit-test-results.xml
 
       - name: Run pinned Databricks tool-result compatibility tests

@@ -2,7 +2,7 @@ import hashlib
 import json
 import logging
 import re
-from typing import Optional, Generator, Literal
+from typing import Any, Dict, Optional, Generator, Literal
 from pydantic import model_validator, create_model, Field, SecretStr, PrivateAttr
 
 from .client import ZephyrEssentialAPI
@@ -24,6 +24,7 @@ def _is_content_absent(error: ToolException, absent_status: re.Pattern) -> bool:
 
 
 class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "zephyr_essential"
     index_item_labels = ('test case', 'test cases')
     token: SecretStr
     _client: ZephyrEssentialAPI = PrivateAttr()
@@ -335,6 +336,9 @@ class ZephyrEssentialApiWrapper(NonCodeIndexerToolkit):
         return {
             'chunking_tool':(Literal['json', ''], Field(description="Name of chunking tool", default='json'))
         }
+
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('key')
 
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         self._chunking_tool = kwargs.get('chunking_tool', None)
@@ -1149,7 +1153,7 @@ GetProject = create_model(
 ListFolders = create_model(
     "ListFolders",
     project_key=(Optional[str], Field(default=None, description="Project key to filter folders.")),
-    folder_type=(Optional[str], Field(default=None, description="Folder type to filter folders.")),
+    folder_type=(Optional[Literal["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]], Field(default=None, description="Folder type to filter folders.")),
     max_results=(Optional[int], Field(default=None, description="Maximum number of results to return.")),
     start_at=(Optional[int], Field(default=None, description="Starting index of the results."))
 )
@@ -1179,7 +1183,7 @@ FindFolderByName = create_model(
     "GetFolder",
     name=(str, Field(description="Name of the folder to retrieve.")),
     project_key=(Optional[str], Field(description="Project key", default=None)),
-    folder_type=(Optional[str], Field(description="""Folder type. Possible values: "TEST_CASE", "TEST_PLAN", "TEST_CYCLE" """,
+    folder_type=(Optional[Literal["TEST_CASE", "TEST_PLAN", "TEST_CYCLE"]], Field(description="""Folder type. Possible values: "TEST_CASE", "TEST_PLAN", "TEST_CYCLE" """,
                                       default=None)),
 )
 

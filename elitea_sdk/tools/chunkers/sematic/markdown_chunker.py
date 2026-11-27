@@ -4,6 +4,9 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter, ExperimentalMar
 from langchain_text_splitters import TokenTextSplitter
 from ..utils import tiktoken_length
 from copy import deepcopy as copy
+import re
+
+from ....runtime.langchain.document_loaders.sections import split_heading_text
 
 
 def markdown_chunker(file_content_generator: Generator[Document, None, None], config: dict, *args, **kwargs) -> Generator[Document, None, None]:
@@ -154,6 +157,7 @@ def markdown_by_headers_chunker(file_content_generator: Generator[Document, None
     headers_to_split_on = [header.split(' ', 1) for header in headers_to_split_on]
     max_tokens = config.get("max_tokens")
     tokens_overlapping = config.get("token_overlap", 10)
+    emit_sections = config.get("emit_sections", False)
     for doc in file_content_generator:
         doc_metadata = doc.metadata
         doc_content = doc.page_content
@@ -166,10 +170,12 @@ def markdown_by_headers_chunker(file_content_generator: Generator[Document, None
         md_header_splits = markdown_splitter.split_text(doc_content)
         for chunk in md_header_splits:
             headers_meta = list(chunk.metadata.values())
+            section_meta = section_from_headers(chunk.metadata) if emit_sections else {}
             for subchunk, method_name in split_oversized(chunk.page_content, max_tokens, tokens_overlapping):
                 chunk_id += 1
                 docmeta = copy(doc_metadata)
                 docmeta.update({"headers": "; ".join(headers_meta)})
+                docmeta.update(section_meta)
                 docmeta['chunk_id'] = chunk_id
                 docmeta['chunk_type'] = "document"
                 docmeta['method_name'] = method_name
@@ -191,3 +197,30 @@ def split_oversized(content: str, max_tokens, tokens_overlapping: int) -> Genera
             yield subchunk, 'text'
     else:
         yield content, 'markdown'
+
+_MD_ESCAPE_RE = re.compile(r'\\([\\`*_{}\[\]()#+\-.!])')
+_MD_LINK_RE = re.compile(r'!?\[([^\]]*)\]\([^)]*\)')
+_HEADER_LEVEL_RE = re.compile(r'(\d+)$')
+
+
+def section_from_headers(headers: dict) -> dict:
+    """``section_number`` / ``section_title`` from the deepest markdown header of a chunk (EL-7355).
+
+    ``headers`` is the splitter's ``{"Header 1": "...", "Header 2": "..."}``; an empty dict gives no section.
+    """
+    deepest = None
+    for key, value in (headers or {}).items():
+        match = _HEADER_LEVEL_RE.search(str(key))
+        if match and value and (deepest is None or int(match.group(1)) > deepest[0]):
+            deepest = (int(match.group(1)), str(value))
+    if deepest is None:
+        return {}
+    text = _MD_LINK_RE.sub(r'\1', deepest[1])
+    text = _MD_ESCAPE_RE.sub(r'\1', text.replace('**', '').replace('__', '').replace('*', ''))
+    number, title = split_heading_text(text)
+    meta = {}
+    if number:
+        meta['section_number'] = number
+    if title:
+        meta['section_title'] = title
+    return meta

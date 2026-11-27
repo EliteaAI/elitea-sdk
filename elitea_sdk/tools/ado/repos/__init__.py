@@ -11,6 +11,7 @@ from ....configurations.pgvector import PgVectorConfiguration
 from ...common_tooltips import get_credentials_tooltip, PGVECTOR_CONFIGURATION_TOOLTIP, EMBEDDING_MODEL_TOOLTIP
 from ...base.tool import BaseAction
 from .repos_wrapper import ReposApiWrapper, normalize_repositories
+from ..utils import check_organization_access
 from ...utils import check_connection_response, normalize_base_url
 from ....runtime.utils.constants import TOOLKIT_NAME_META, TOOL_NAME_META, TOOLKIT_TYPE_META
 
@@ -21,7 +22,7 @@ def get_toolkit(tool) -> BaseToolkit:
     return AzureDevOpsReposToolkit().get_toolkit(
         selected_tools=tool['settings'].get('selected_tools', []),
         ado_configuration=tool['settings']['ado_configuration'],
-        project=tool['settings']['project'],
+        project=tool['settings'].get('project'),
         repository_id=tool['settings'].get('repository_id'),
         limit=tool['settings'].get('limit', 5),
         base_branch=tool['settings'].get('base_branch', "main"),
@@ -49,7 +50,7 @@ class AzureDevOpsReposToolkit(BaseToolkit):
             name,
             ado_configuration=(AdoConfiguration, Field(description=get_credentials_tooltip("Azure DevOps"), default=None,
                                                        json_schema_extra={'configuration_types': ['ado']})),
-            project=(str, Field(description="ADO project name")),
+            project=(Optional[str], Field(default=None, description="Default ADO project; leave empty to let each tool call name the project")),
             # BeforeValidator keeps configurations saved as a single string valid
             repository_id=(Annotated[List[str], BeforeValidator(normalize_repositories)], Field(
                 default_factory=list,
@@ -101,9 +102,9 @@ class AzureDevOpsReposToolkit(BaseToolkit):
             if not ado_config:
                 raise ValueError("ADO configuration is required")
             project = self.project
-            if not project:
-                raise ValueError("ADO project is required")
             token = ado_config.token.get_secret_value() if ado_config.token else ""
+            if not project:
+                return check_organization_access(normalize_base_url(ado_config.organization_url), token)
             # Without a configured repository the project repository list still proves access
             repository_path = f'/{self.repository_id[0]}' if self.repository_id else ''
             response = requests.get(
@@ -133,7 +134,7 @@ class AzureDevOpsReposToolkit(BaseToolkit):
         }
         azure_devops_repos_wrapper = ReposApiWrapper(**wrapper_payload)
         available_tools = azure_devops_repos_wrapper.get_available_tools()
-        instance_info = f"\nADO instance: {azure_devops_repos_wrapper.organization_url}/{azure_devops_repos_wrapper.project}"
+        instance_info = f"\nADO instance: {azure_devops_repos_wrapper.organization_url}/{azure_devops_repos_wrapper.project or ''}"
         repositories = azure_devops_repos_wrapper.repositories
         if repositories:
             instance_info += f"\nRepositories: {', '.join(repositories)}"

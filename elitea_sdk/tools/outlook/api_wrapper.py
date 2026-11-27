@@ -44,6 +44,7 @@ class OutlookApiWrapper(BaseModel):
 
     oauth_discovery_endpoint: Optional[str] = Field(default=None, description="OAuth discovery endpoint")
     oauth_token_endpoint: Optional[str] = Field(default=None, description="OAuth token endpoint")
+    auto_refresh_token: Optional[bool] = Field(default=None, description="Ask for offline_access at sign-in")
 
     configuration_uuid: Optional[str] = Field(default=None, description="Configuration UUID")
     toolkit_id: Optional[int] = Field(default=None, description="Toolkit ID")
@@ -93,6 +94,7 @@ class OutlookApiWrapper(BaseModel):
             configuration_uuid=self.configuration_uuid,
             toolkit_id=self.toolkit_id,
             toolkit_name=self.toolkit_name,
+            auto_refresh_token=self.auto_refresh_token,
         )
         return self
 
@@ -109,6 +111,7 @@ class OutlookApiWrapper(BaseModel):
                 toolkit_name=self.toolkit_name,
                 client_id=self.client_id,
                 client_secret=self.client_secret,
+                auto_refresh_token=self.auto_refresh_token,
             )
         return self._backend
 

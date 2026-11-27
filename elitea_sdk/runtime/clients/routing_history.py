@@ -4,6 +4,7 @@ import hashlib
 import json
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableBinding
+from .routing import block_type
 
 NATIVE_BLOCKS = {'thinking', 'redacted_thinking', 'reasoning', 'reasoning_content'}
 
@@ -32,7 +33,7 @@ def completed_native_keys(messages):
             if isinstance(message.content, list):
                 calls.update(block['id'] for block in message.content if isinstance(block, dict)
                              and block.get('type') == 'tool_use' and block.get('id'))
-                if any(isinstance(block, dict) and block.get('type') in NATIVE_BLOCKS for block in message.content):
+                if any(block_type(block) in NATIVE_BLOCKS for block in message.content):
                     keys.append(message_key(message))
             if pending.intersection(calls):
                 raise ValueError('Duplicate pending tool call in Auto history')
@@ -74,7 +75,7 @@ def adapt_completed_history(native, messages, binding):
         if (isinstance(message, AIMessage) and not current and isinstance(message.content, list)
                 and message_key(message) in completed):
             blocks = [copy.deepcopy(block) for block in message.content
-                      if not (isinstance(block, dict) and block.get('type') in unsupported)]
+                      if block_type(block) not in unsupported]
             if isinstance(target, ChatAnthropic):
                 blocks = [({'type': 'text', 'text': block.get('text', '')}
                            if isinstance(block, dict) and block.get('type') == 'output_text' else block)

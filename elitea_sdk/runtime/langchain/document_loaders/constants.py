@@ -59,7 +59,10 @@ DEFAULT_ALLOWED_CSV = {**DEFAULT_ALLOWED_BASE, 'add_header_to_chunks': False, 'h
 
 # skip_size_check default False here is required plumbing for the indexing-only
 # force-override in content_parser.process_document_by_type (EL-TODO, temporary).
-DEFAULT_ALLOWED_EXCEL = {**DEFAULT_ALLOWED_WITH_LLM, 'add_header_to_chunks': False, 'header_row_number': 1, 'max_tokens': -1, 'sheet_name': '', 'evaluate_formulas': False, 'skip_size_check': False}
+# max_tokens is the indexing default (EL-7251): an unbounded sheet overflows the
+# context window; -1 stays available as an explicit override. read_file keeps
+# the loader kwargs' -1, so a read still returns one chunk per sheet.
+DEFAULT_ALLOWED_EXCEL = {**DEFAULT_ALLOWED_WITH_LLM, 'add_header_to_chunks': False, 'header_row_number': 1, 'sheet_name': '', 'evaluate_formulas': False, 'skip_size_check': False}
 
 DEFAULT_ALLOWED_EMAIL = {**DEFAULT_ALLOWED_BASE, 'process_attachments': True, 'ignore_empty_body': True, 'max_attachment_depth': 2, 'max_attachment_size_mb': 10}
 

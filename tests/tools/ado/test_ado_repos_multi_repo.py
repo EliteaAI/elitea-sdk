@@ -90,19 +90,21 @@ def test_multiple_repositories_default_to_the_first_and_constrain_the_argument(m
     schema = _schema_of(wrapper, "read_file").model_json_schema()
 
     assert "repository_id" not in schema.get("required", [])
-    assert schema["properties"]["repository_id"]["anyOf"][0]["enum"] == ["alpha", "beta"]
+    # A string rather than an enum: a call to another project names its own repositories
+    assert "'alpha'" in schema["properties"]["repository_id"]["description"]
+    assert "beta" in schema["properties"]["repository_id"]["description"]
     # Nothing is bound until a call happens
     assert wrapper.repository_id is None
 
     # An omitted argument keeps working for toolkits that gained a second repository
     wrapper.run("list_branches_in_repo")
-    assert wrapper._repo_state["alpha"]["searchable_name"] == "alpha"
+    assert wrapper._repo_state[("Digital", "alpha")]["searchable_name"] == "alpha"
 
     with pytest.raises(ToolException, match="not available in this toolkit"):
         wrapper.run("list_branches_in_repo", repository_id="gamma")
 
     wrapper.run("list_branches_in_repo", repository_id="beta")
-    assert wrapper._repo_state["beta"]["searchable_name"] == "beta"
+    assert wrapper._repo_state[("Digital", "beta")]["searchable_name"] == "beta"
 
 
 @patch("elitea_sdk.tools.ado.repos.repos_wrapper.GitClient")
@@ -117,13 +119,13 @@ def test_multiple_repositories_are_validated_lazily_per_repository(mock_git_clie
 
     wrapper.run("list_branches_in_repo", repository_id="beta")
     # 'main' is missing in beta, so its base branch falls back to the active one
-    assert wrapper._repo_state["beta"]["base_branch"] == "release"
-    assert wrapper._repo_state["beta"]["active_branch"] == "release"
+    assert wrapper._repo_state[("Digital", "beta")]["base_branch"] == "release"
+    assert wrapper._repo_state[("Digital", "beta")]["active_branch"] == "release"
 
     # ... while alpha resolves the other way around, from its own branches
     wrapper.run("list_branches_in_repo", repository_id="alpha")
-    assert wrapper._repo_state["alpha"]["base_branch"] == "main"
-    assert wrapper._repo_state["alpha"]["active_branch"] == "main"
+    assert wrapper._repo_state[("Digital", "alpha")]["base_branch"] == "main"
+    assert wrapper._repo_state[("Digital", "alpha")]["active_branch"] == "main"
 
 
 @patch("elitea_sdk.tools.ado.repos.repos_wrapper.GitClient")
@@ -144,7 +146,7 @@ def test_no_configured_repository_accepts_any_repository_of_the_project(mock_git
         wrapper.run("list_branches_in_repo")
 
     wrapper.run("list_branches_in_repo", repository_id="anything")
-    assert wrapper._repo_state["anything"]["searchable_name"] == "anything"
+    assert wrapper._repo_state[("Digital", "anything")]["searchable_name"] == "anything"
 
 
 @patch("elitea_sdk.tools.ado.repos.repos_wrapper.GitClient")
@@ -184,8 +186,8 @@ def test_active_branch_switch_survives_rebinding(mock_git_client_cls):
     wrapper = ReposApiWrapper(**_base_kwargs(repository_id=["alpha", "beta"]))
     wrapper.run("set_active_branch", branch_name="feature", repository_id="alpha")
 
-    assert wrapper._repo_state["alpha"]["active_branch"] == "feature"
-    assert wrapper._repo_state.get("beta") is None
+    assert wrapper._repo_state[("Digital", "alpha")]["active_branch"] == "feature"
+    assert wrapper._repo_state.get(("Digital", "beta")) is None
 
 
 @patch("elitea_sdk.tools.ado.repos.repos_wrapper.GitClient")
@@ -196,7 +198,7 @@ def test_index_data_takes_the_repository_argument(mock_git_client_cls):
     schema = _schema_of(wrapper, "index_data").model_json_schema()
 
     assert "repository_id" not in schema.get("required", [])
-    assert schema["properties"]["repository_id"]["anyOf"][0]["enum"] == ["alpha", "beta"]
+    assert "beta" in schema["properties"]["repository_id"]["description"]
     # Searching stays repository agnostic: one index per repository is the contract
     assert "repository_id" not in _schema_of(wrapper, "search_index").model_fields
 
@@ -222,6 +224,6 @@ def test_toolkit_config_schema_accepts_a_legacy_string_repository():
     json_schema = config_model.model_json_schema()
 
     assert json_schema["properties"]["repository_id"]["type"] == "array"
-    assert "repository_id" not in json_schema["required"]
+    assert "repository_id" not in json_schema.get("required", [])
     assert config_model(project="p", repository_id="alpha").repository_id == ["alpha"]
     assert config_model(project="p").repository_id == []

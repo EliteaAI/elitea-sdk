@@ -33,7 +33,7 @@ def contract(name, effort):
     native = name in ANTHROPIC_MODELS
     fields = {} if effort is None else (
         {'thinking': {'type': 'adaptive', 'display': 'summarized'},
-         'output_config': {'effort': effort}} if native else {'reasoning': {'effort': effort}})
+         'output_config': {'effort': effort}} if native else {'reasoning_effort': effort})
     return {'model_name': name, 'max_tokens': 32000, 'streaming': False,
             'reasoning_effort': effort, 'routing_reasoning_fields': fields,
             'routing_transport': 'anthropic_messages' if native else 'chat_completions',
@@ -88,9 +88,10 @@ def test_exact_measured_reasoning_reaches_http_body(name, effort, monkeypatch):
     {'routing_reasoning_fields': None},
     {'routing_reasoning_fields': []},
     {'routing_reasoning_fields': {}},
-    {'routing_reasoning_fields': {'reasoning_effort': 'high'}},
-    {'routing_reasoning_fields': {'reasoning': {'effort': 'low'}}},
-    {'routing_reasoning_fields': {'reasoning': {'effort': 'high', 'summary': 'auto'}}},
+    # A nested reasoning object is the pre-1.108 shape Bedrock GPT now rejects.
+    {'routing_reasoning_fields': {'reasoning': {'effort': 'high'}}},
+    {'routing_reasoning_fields': {'reasoning_effort': 'low'}},
+    {'routing_reasoning_fields': {'reasoning_effort': 'high', 'reasoning': {'summary': 'auto'}}},
     {'reasoning_effort': 'max'},
     {'reasoning_effort': None},
     {'routing_transport': None},

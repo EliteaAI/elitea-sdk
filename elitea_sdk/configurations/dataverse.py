@@ -220,9 +220,13 @@ def build_login_required(settings: dict, message: str):
     }
     if settings.get("configuration_uuid"):
         resource_metadata["configuration_uuid"] = settings["configuration_uuid"]
+        # The chat saves the login on the credential, which lives in this project
+        if settings.get("configuration_project_id"):
+            resource_metadata["configuration_project_id"] = settings["configuration_project_id"]
     client_id = (settings.get("client_id") or "").strip()
     if client_id:
-        resource_metadata["provided_settings"] = {"mcp_client_id": client_id, "scopes": scopes}
+        resource_metadata["provided_settings"] = {"mcp_client_id": client_id, "scopes": scopes,
+                                                  "credential_type": "dataverse"}
     return McpAuthorizationRequired(
         message=message,
         server_url=authority,

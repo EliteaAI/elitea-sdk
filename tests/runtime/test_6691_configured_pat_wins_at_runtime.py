@@ -130,7 +130,6 @@ def test_family_retry_does_not_replace_a_configured_pat(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["headers"] == {"Authorization": "Bearer configured-pat"}
     assert any(tool.name.startswith("mcp_authorize_") for tool in loaded)
-    assert any(tool.name == "mcp_auth_control" for tool in loaded)
 
 
 def test_family_retry_without_a_configured_pat_uses_the_shared_merge(monkeypatch):

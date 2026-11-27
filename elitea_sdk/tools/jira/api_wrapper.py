@@ -26,6 +26,7 @@ from ..utils.serialization import serialize_tool_result
 from ...configurations.utils import _resolve_api_version
 from ...runtime.utils.utils import IndexerKeywords
 from ..utils.tool_groups import tool_group, with_tool_groups
+from ..utils.source_info import encode_ref, join_location, web_base, web_host, web_url
 
 logger = logging.getLogger(__name__)
 
@@ -637,14 +638,18 @@ def normalize_and_parse_issue_json(issue_json: str) -> Dict[str, Any]:
     return parsed
 
 
+def _error_summary(error: Exception) -> str:
+    """One readable line for a failed Jira call; the traceback goes to the log, not the user."""
+    return str(error).strip() or type(error).__name__
+
+
 def parse_payload_params(params: Optional[str]) -> Dict[str, Any]:
     if params:
         try:
             return json.loads(clean_json_string(params))
-        except JSONDecodeError:
-            stacktrace = traceback.format_exc()
-            logger.error(f"Jira tool: Error parsing payload params: {stacktrace}")
-            raise ToolException(f"JIRA tool exception. Passed params are not valid JSON. {stacktrace}")
+        except JSONDecodeError as e:
+            logger.error(f"Jira tool: Error parsing payload params: {traceback.format_exc()}")
+            raise ToolException(f"JIRA tool exception. Passed params are not valid JSON: {e}") from e
     return {}
 
 
@@ -717,6 +722,7 @@ def process_search_response(jira_url, response, payload_params: Dict[str, Any] =
 
 
 class JiraApiWrapper(NonCodeIndexerToolkit):
+    index_source_type = "jira"
     index_item_labels = ('issue', 'issues')
     base_url: str
     api_version: Optional[str] = "auto"
@@ -1048,10 +1054,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             }
         except ToolException as e:
             raise ToolException(e)
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error creating Jira issue: {stacktrace}")
-            raise ToolException(f"Error creating Jira issue: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error creating Jira issue: {format_exc()}")
+            raise ToolException(f"Error creating Jira issue: {_error_summary(e)}") from e
 
     @tool_group('write')
     def set_issue_status(self, issue_key: str, status_name: str, mandatory_fields_json: str):
@@ -1079,10 +1084,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             return f"Done. Status for issue {issue_key} was updated successfully. You can view it at {issue_url}."
         except ToolException as e:
             raise ToolException(e)
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error setting Jira issue status: {stacktrace}")
-            raise ToolException(f"Error setting Jira issue status: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error setting Jira issue status: {format_exc()}")
+            raise ToolException(f"Error setting status for Jira issue {issue_key}: {_error_summary(e)}") from e
 
     def _update_issue(self, client: Jira, issue_json: str):
         """ Update an issue in Jira.
@@ -1161,10 +1165,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             output = f"Done. Comments were found for issue '{issue_key}': {comments_list}"
             logger.info(output)
             return output
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Unable to extract any comments from the issue: {stacktrace}")
-            return f"Error during the attempt to extract available comments: {stacktrace}"
+        except Exception as e:
+            logger.error(f"Unable to extract any comments from the issue: {format_exc()}")
+            return f"Error during the attempt to extract available comments for issue {issue_key}: {_error_summary(e)}"
 
     @tool_group('write')
     def add_comments(self, issue_key: str, comment: str):
@@ -1180,10 +1183,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.info(output)
             self._add_default_labels(issue_key=issue_key)
             return output
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error adding comment to Jira issue: {stacktrace}")
-            raise ToolException(f"Error adding comment to Jira issue: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error adding comment to Jira issue: {format_exc()}")
+            raise ToolException(f"Error adding comment to Jira issue {issue_key}: {_error_summary(e)}") from e
 
     def _text_to_adf(self, text: str) -> Dict[str, Any]:
         """Convert plain text to Atlassian Document Format."""
@@ -1441,10 +1443,9 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
         try:
             projects = client.projects()
             return self._parse_projects(projects)
-        except Exception:
-            stacktrace = format_exc()
-            logger.error(f"Error listing Jira projects: {stacktrace}")
-            raise ToolException(f"Error listing Jira projects: {stacktrace}")
+        except Exception as e:
+            logger.error(f"Error listing Jira projects: {format_exc()}")
+            raise ToolException(f"Error listing Jira projects: {_error_summary(e)}") from e
 
     @tool_group('read')
     def get_attachments_content(self, jira_issue_key: str, attachment_pattern: Optional[str] = None):
@@ -2186,6 +2187,13 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
             logger.error(f"Error processing comments with images: {stacktrace}")
             return f"Error processing comments with images: {str(e)}"
 
+    def _chunk_source_location(self, metadata: Dict[str, Any]) -> Optional[str]:
+        return metadata.get('issue_key')
+
+    def _chunk_source_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        issue_key = metadata.get('issue_key')
+        return web_url(web_base(self.base_url), "browse", encode_ref(issue_key)) if issue_key else None
+
     def _base_loader(self, **kwargs) -> Generator[Document, None, None]:
         """
         Base loader for Jira issues, used to load issues as documents.
@@ -2195,6 +2203,8 @@ class JiraApiWrapper(NonCodeIndexerToolkit):
 
         # Extract parameters from kwargs
         jql = kwargs.get('jql')
+        self._record_index_source(location=join_location(web_host(self.base_url), f"JQL: {jql}" if jql else None),
+                                  url=web_base(self.base_url))
         fields_to_extract = kwargs.get('fields_to_extract')
         fields_to_index = kwargs.get('fields_to_index')
         max_total_issues = kwargs.get('max_total_issues', 1000)

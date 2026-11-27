@@ -105,7 +105,7 @@ Placed after MCP Servers. Visible to platform admins (`configuration.oauth_apps.
 | OAuth discovery endpoint | Provider hosts only (Entra: `https://login.microsoftonline.com/<tenant or organizations>`). Empty = provider default. |
 | Credential types | One on/off switch per credential type of the provider (Entra: **Teams, Outlook, SharePoint**), all on by default; at least one must stay on. A type switched **off** makes this app unavailable to that type's credentials: it is not offered, not resolved, and existing credentials of that type that use it show "<name> is no longer offered for <Type> credentials by your administrator. Switch to Custom app." The type's scopes are kept, so switching it on again restores them. |
 | Scopes | Per credential type that is on: checkboxes for Teams and Outlook (recommended set preselected), free text for SharePoint. Empty = the type's recommended set. |
-| Auto refresh token | Keeps users signed in with offline_access. |
+| Auto refresh token | On: sign-in asks for `offline_access`, so users stay signed in and scheduled runs can use a saved login. Off: `offline_access` is not asked for (#7415); users sign in again when the access token expires (about an hour). The same switch on a Custom app credential works the same way; a credential that never stored it keeps `offline_access`. |
 
 **Test connection**: checks client ID, secret and tenant with the provider (Entra: client-credentials request
 to the app's own token endpoint). Reports wrong or expired secret, unknown client ID, unknown tenant; a tenant

@@ -69,7 +69,7 @@ nodes:
           2. returns_list: Output contains a list/array structure of files
           3. has_file_count: At least 1 file is returned (the test PR should have changes)
           4. files_have_required_fields: Each file entry has 'path' and 'diff' fields (do NOT check for changeType)
-          5. no_error: Output does NOT contain 'error', 'failed', 'exception'
+          5. no_error: Output does NOT report an error, failure or exception. The `errors` key itself is expected; an empty `errors` array (`"errors": []`) is NOT an error
 
           Return a JSON object with structure:
           {{

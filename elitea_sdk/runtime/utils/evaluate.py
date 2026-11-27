@@ -1,7 +1,9 @@
 from traceback import format_exc
 from typing import List, Dict
 from abc import ABCMeta
-from jinja2 import Environment, TemplateSyntaxError, UndefinedError
+from jinja2 import TemplateSyntaxError, UndefinedError
+from jinja2.exceptions import SecurityError
+from .safe_templates import HardenedSandboxedEnvironment, TemplateRejectedError
 import logging
 from langgraph.graph import END
 
@@ -29,7 +31,8 @@ class EvaluateTemplate(metaclass=MyABC):
         self.context = context
 
     def extract(self):
-        environment = Environment()
+        # Sandboxed: condition text is pipeline-author input (#7681).
+        environment = HardenedSandboxedEnvironment()
 
         def json_loads_filter(json_string: str,do_replace: bool = False):
             import json
@@ -46,6 +49,9 @@ class EvaluateTemplate(metaclass=MyABC):
             logger.critical(format_exc())
             logger.info('Template str: %s', self.query)
             raise Exception(f"Invalid jinja template: {exc.message}")
+        except SecurityError:
+            logger.warning('Template rejected by sandbox: %.200s', self.query)
+            raise TemplateRejectedError("Template rejected: unsafe attribute access is not allowed")
         except UndefinedError as exc:
             # The template is valid; the data it referenced is missing. Saying "invalid
             # template" here sends the author to debug the wrong thing (issue #6171).

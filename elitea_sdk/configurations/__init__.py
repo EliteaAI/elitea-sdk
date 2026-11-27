@@ -51,6 +51,7 @@ _safe_import_configuration('salesforce', 'salesforce', 'SalesforceConfiguration'
 _safe_import_configuration('sharepoint', 'sharepoint', 'SharepointConfiguration')
 _safe_import_configuration('outlook', 'outlook', 'OutlookConfiguration')
 _safe_import_configuration('teams', 'teams', 'TeamsConfiguration')
+_safe_import_configuration('ms_graph', 'ms_graph', 'MsGraphConfiguration')
 _safe_import_configuration('carrier', 'carrier', 'CarrierConfiguration')
 _safe_import_configuration('report_portal', 'report_portal', 'ReportPortalConfiguration')
 _safe_import_configuration('testio', 'testio', 'TestIOConfiguration')
@@ -58,6 +59,7 @@ _safe_import_configuration('openapi', 'openapi', 'OpenApiConfiguration')
 _safe_import_configuration('langfuse', 'langfuse', 'LangfuseConfiguration')
 _safe_import_configuration('aha', 'aha', 'AhaConfiguration')
 _safe_import_configuration('dataverse', 'dataverse', 'DataverseConfiguration')
+_safe_import_configuration('mcp_login', 'mcp_login', 'McpLoginConfiguration')
 
 # Log import summary
 available_count = len(AVAILABLE_CONFIGURATIONS)

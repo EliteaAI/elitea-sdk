@@ -8,7 +8,7 @@ from typing import Dict
 import yaml
 import ast
 from langchain_core.callbacks import dispatch_custom_event
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, RemoveMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, RemoveMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
@@ -31,7 +31,7 @@ from .utils import (
     propagate_the_input_mapping,
     safe_format,
 )
-from ..tool_outcome import ToolOutcome, ToolResultStatus, record_outcome
+from ..tool_outcome import ToolOutcome, ToolResultStatus, record_outcome, run_failure_message
 from ..utils.constants import TOOLKIT_NAME_META
 from ..tools.function import (
     FunctionTool, LAST_TOOL_OUTCOME_KEY, PIPELINE_BLOCKED_KEY, TOOL_OUTCOMES_KEY,
@@ -130,6 +130,24 @@ def _is_content_block(block) -> bool:
     # A bare {'text': ...} chunk is content; the same dict carrying a score is a
     # search hit, and joining it would discard every field but one.
     return block_type is None and 'text' in block and set(block) <= _TEXT_ONLY_BLOCK_KEYS
+
+
+def extract_current_turn_answer(messages: list) -> Optional[str]:
+    """Return the latest non-empty reply of the current turn, or None.
+
+    Empty replies are skipped (Sonnet returns ``AIMessage(content=[])`` in synthesis
+    turns, issue #5057), but the scan stops at the latest HumanMessage: anything
+    before it belongs to an earlier turn, and surfacing it re-sends that turn's answer.
+    """
+    for msg in reversed(messages or []):
+        if isinstance(msg, HumanMessage):
+            return None
+        if not hasattr(msg, 'content'):
+            continue
+        normalized = normalize_message_content(msg.content)
+        if normalized.strip():
+            return normalized
+    return None
 
 
 def normalize_message_content(content: Any) -> str:
@@ -827,6 +845,11 @@ class PrinterNode(Runnable):
         else:
             self.final_message = self.DEFAULT_FINAL_MSG
 
+    @property
+    def footer(self) -> str:
+        """The resume hint appended to the printed value while the run is paused."""
+        return f"\n\n-----\n*{self.final_message}*"
+
     def invoke(self, state: BaseStore, config: Optional[RunnableConfig] = None) -> dict:
         logger.debug(f"Printer Node - Current state variables: {state}")
         result = {}
@@ -845,7 +868,7 @@ class PrinterNode(Runnable):
             # convert formatted output to string if it's not
             if not isinstance(formatted_output, str):
                 formatted_output = str(formatted_output)
-            formatted_output += f"\n\n-----\n*{self.final_message}*"
+            formatted_output += self.footer
         logger.debug(f"Formatted output: {formatted_output}")
         result[PRINTER_NODE_RS] = formatted_output
         return result
@@ -875,7 +898,8 @@ class StateModifierNode(Runnable):
         # Render the template using Jinja
         import json
         import base64
-        from jinja2 import Environment
+        from jinja2.exceptions import SecurityError, UndefinedError
+        from ..utils.safe_templates import HardenedSandboxedEnvironment, TemplateRejectedError
 
         def from_json(value):
             """Convert JSON string to Python object"""
@@ -901,14 +925,25 @@ class StateModifierNode(Runnable):
             """Splits the provided string using the specified regex pattern."""
             return re.split(pattern, value)
 
-        env = Environment()
+        # Sandboxed: the node template is pipeline-author input (#7681).
+        env = HardenedSandboxedEnvironment()
         env.filters['from_json'] = from_json
         env.filters['base64_to_string'] = base64_to_string
         env.filters['split_by_words'] = split_by_words
         env.filters['split_by_regex'] = split_by_regex
 
-        template = env.from_string(self.template)
-        rendered_message = template.render(**input_data)
+        try:
+            template = env.from_string(self.template)
+            rendered_message = template.render(**input_data)
+        except SecurityError:
+            logger.warning('State modifier template rejected by sandbox: %.200s', self.template)
+            raise TemplateRejectedError("Template rejected: unsafe attribute access is not allowed")
+        except UndefinedError as exc:
+            logger.warning('State modifier template referenced an unavailable value: %s', exc)
+            raise Exception(
+                f"Jinja template referenced a value that is not available: {exc}. "
+                f"Available names: {sorted(input_data)}"
+            )
         result = {}
         # Store the rendered message in the state or messages
         if len(self.output_variables) > 0:
@@ -1072,7 +1107,7 @@ def _make_mcp_auth_skip_node(node_id: str, toolkit_name: str, output_vars: list)
             toolkit_type=toolkit_name,
         ))
         result = {
-            "messages": [{"role": "assistant", "content": message}],
+            "messages": [run_failure_message(message)],
             PIPELINE_BLOCKED_KEY: message,
             LAST_TOOL_OUTCOME_KEY: None,
         }
@@ -1156,6 +1191,26 @@ def find_mcp_auth_proxy(tools: list, toolkit_name: Optional[str]) -> Optional[Ba
     return legacy_matches[0] if len(legacy_identities) == 1 else None
 
 
+
+def _build_code_mode_registry(tools, always_bind_tool_names, middleware_manager=None):
+    """(enabled, registry, sensitive tools); it needs the local Deno sandbox, never the remote one."""
+    import shutil
+    from ..tools.code_mode import code_mode_eligible_tools, find_sensitive_guard, split_sensitive
+    if not shutil.which("deno"):
+        logger.warning("[CodeMode] Ignored: no local Deno sandbox available")
+        return False, None, []
+    base_tools = code_mode_eligible_tools([t for t in tools if isinstance(t, BaseTool)
+                                           and t.name not in always_bind_tool_names])
+    base_tools, sensitive = split_sensitive(base_tools, find_sensitive_guard(middleware_manager))
+    if not base_tools:
+        logger.info("[CodeMode] Ignored: the agent has no toolkit tools outside the ones needing approval")
+        return False, None, []
+    registry = ToolRegistry.from_tools(base_tools)
+    logger.info("[CodeMode] Enabled with %d toolkits, %d tools; %d bound directly for approval",
+                len(registry.get_toolkit_names()), len(base_tools), len(sensitive))
+    return True, registry, sensitive
+
+
 def create_graph(
         client: Any,
         yaml_schema: str,
@@ -1166,6 +1221,7 @@ def create_graph(
         debug: bool = False,
         for_subgraph: bool = False,
         lazy_tools_mode: bool = False,
+        code_mode: bool = False,
         always_bind_tools: Optional[list[BaseTool]] = None,
         middleware_manager: Optional[Any] = None,
         child_dispatcher: Optional[Any] = None,
@@ -1222,6 +1278,13 @@ def create_graph(
 
     always_bind_tool_names = {t.name for t in always_bind_tools if hasattr(t, 'name')}
 
+    code_registry, sensitive_tools = None, []
+    if code_mode:
+        code_mode, code_registry, sensitive_tools = _build_code_mode_registry(
+            tools, always_bind_tool_names, middleware_manager)
+        if code_mode:
+            lazy_tools_mode = False
+
     if lazy_tools_mode:
         # Exclude always_bind_tools from the registry - they'll be bound directly
         base_tools = [
@@ -1252,6 +1315,14 @@ def create_graph(
 
     # Update lazy_tools_mode to effective value for use in LLMNode creation
     lazy_tools_mode = effective_lazy_mode
+
+    if code_mode:
+        from ..tools.code_mode import is_direct_bind_tool
+        tool_registry = code_registry
+        direct = [t for t in tools if isinstance(t, BaseTool) and is_direct_bind_tool(t)
+                  and t.name not in always_bind_tool_names]
+        # Tools that need approval stay bound directly; they already carry the guard from the assistant.
+        always_bind_tools = list(always_bind_tools) + direct + sensitive_tools
 
     if for_subgraph:
         # Sanitization for sub-graphs
@@ -1428,7 +1499,8 @@ def create_graph(
             elif node_type == 'code':
                 from ..tools.sandbox import create_sandbox_tool
                 sandbox_tool = create_sandbox_tool(stateful=False, allow_net=True,
-                                                   elitea_client=kwargs.get('elitea_client', None))
+                                                   elitea_client=kwargs.get('elitea_client', None),
+                                                   caller="code_node")
                 # Apply middleware wrapping (e.g. exception handling) to the
                 # freshly-created sandbox tool — it was not in the `tools` list
                 # that was wrapped during Assistant.__init__().
@@ -1479,8 +1551,8 @@ def create_graph(
 
                 # When an explicitly connected toolkit cannot load before OAuth, its
                 # real tools are replaced by a deferred authorization gateway. Preserve
-                # that gateway (and the preferred auth control tool) on this LLM node;
-                # otherwise exact-name filtering removes the entire toolkit.
+                # that gateway on this LLM node; otherwise exact-name filtering removes
+                # the entire toolkit.
                 if connected_toolkit_names:
                     auth_gateway_names = []
                     for tool in tools:
@@ -1505,17 +1577,6 @@ def create_graph(
                             ):
                                 available_tools.append(tool)
                                 selected_ids.add(id(tool))
-                        if any(
-                            isinstance(tool, BaseTool) and tool.name == 'mcp_auth_control'
-                            for tool in tools
-                        ):
-                            auth_control = next(
-                                tool for tool in tools
-                                if isinstance(tool, BaseTool) and tool.name == 'mcp_auth_control'
-                            )
-                            if id(auth_control) not in selected_ids:
-                                available_tools.append(auth_control)
-                                selected_ids.add(id(auth_control))
 
                 # For non-agent LLM nodes (PIPELINE node without toolkits defined) we don't add any hidden tools by default, to avoid confusion and encourage explicit tool selection
                 if explicit_tool_selection:
@@ -1537,6 +1598,7 @@ def create_graph(
                     tool_registry is not None and
                     not explicit_tool_selection
                 )
+                use_code_mode_for_node = code_mode and not explicit_tool_selection
 
                 if use_lazy_for_node:
                     logger.info(f"[LazyTools] LLM node '{node_id}' using lazy tools mode")
@@ -1557,7 +1619,9 @@ def create_graph(
                     steps_limit=kwargs.get('steps_limit', 25),
                     # Lazy tools mode parameters
                     lazy_tools_mode=use_lazy_for_node,
-                    tool_registry=tool_registry if use_lazy_for_node else None,
+                    code_mode=use_code_mode_for_node,
+                    code_mode_direct_tools=[t.name for t in sensitive_tools] if use_code_mode_for_node else [],
+                    tool_registry=tool_registry if (use_lazy_for_node or use_code_mode_for_node) else None,
                     # Always-bind tools (e.g., agent/pipeline tools, planning tools)
                     # These should ALWAYS be passed regardless of lazy mode - they need direct LLM access
                     # Fix for #3382: When lazy mode auto-disabled (tool_count < 20), agent tools were lost
@@ -1770,7 +1834,8 @@ def create_graph(
         interrupt_after_successors=interrupt_after_successors,
         state_class={state_class: None},
         output_variables=node.get('output', []),
-        tool_registry=tool_registry,
+        # Dynamic toolkit selection is a lazy-mode feature; in code mode it would bind toolkit tools directly.
+        tool_registry=None if code_mode else tool_registry,
         middleware_manager=middleware_manager,
         terminal_output_variables=collect_terminal_output_variables(schema),
         child_dispatcher=child_dispatcher,
@@ -1833,7 +1898,12 @@ def convert_dict_to_message(msg_dict):
         if role == 'user':
             return HumanMessage(content=content, additional_kwargs=additional_kwargs)
         elif role == 'assistant':
-            return AIMessage(content=content, additional_kwargs=additional_kwargs)
+            # Replayed tool-call stubs (#7460) keep their structure so the pair reaches the provider as tool_use
+            return AIMessage(content=content, additional_kwargs=additional_kwargs,
+                             tool_calls=msg_dict.get('tool_calls') or [])
+        elif role == 'tool' and msg_dict.get('tool_call_id'):
+            return ToolMessage(content=content, tool_call_id=msg_dict['tool_call_id'],
+                               additional_kwargs=additional_kwargs)
         elif role == 'system':
             return SystemMessage(content=content, additional_kwargs=additional_kwargs)
         else:
@@ -1859,6 +1929,18 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         self._child_dispatcher = child_dispatcher
         self._independent_parallel_hitl = independent_parallel_hitl
         self._parallel_hitl_max_concurrency = parallel_hitl_max_concurrency
+
+    def _strip_printer_footer(self, output):
+        # Top-level printers are all there is: a flattened subgraph's printers are hoisted
+        # into this builder, and a child built with for_subgraph has its printers removed.
+        if not isinstance(output, str):
+            return output
+        for spec in getattr(self.builder, 'nodes', {}).values():
+            printer = getattr(spec, 'runnable', None)
+            if isinstance(printer, PrinterNode) and output.endswith(printer.footer):
+                # A printer that rendered nothing leaves no answer, not ''
+                return output[:-len(printer.footer)] or None
+        return output
 
     def invoke(self, input: Union[dict[str, Any], Any],
                config: Optional[RunnableConfig] = None,
@@ -2384,6 +2466,25 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                                     "preservation (tool=%s)",
                                     hitl_interrupt.get('tool_name', ''),
                                 )
+                    elif guardrail_type == 'builder_changeset' or (
+                        guardrail_type == 'clarifying_question' and hitl_interrupt.get('builder')
+                    ):
+                        # Elitea Builder (#7383): needs_input (Ask User card) and needs_confirmation (Changes card)
+                        # both fired interrupt() inside the wrapped Builder tool. Re-issue that same tool call
+                        # without a new LLM turn; its interrupt() consumes the answer / decision.
+                        default_action = 'answer' if guardrail_type == 'clarifying_question' else 'cancel'
+                        resume_ctx = {
+                            'tool_name': hitl_interrupt.get('builder_tool_name') or hitl_interrupt.get('tool_name', ''),
+                            'toolkit_name': '',
+                            'tool_args': hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args') or {},
+                            'tool_call_id': hitl_interrupt.get('tool_call_id') or f"call_{uuid4().hex[:24]}",
+                            'action': hitl_resume_value.get('action', default_action),
+                            'value': hitl_resume_value.get('value', ''),
+                        }
+                        config['configurable']['_hitl_resume_context'] = resume_ctx
+                        self._restore_pending_for_resume(resume_ctx, hitl_interrupt)
+                        hitl_resume_ctx = resume_ctx
+                        logger.info("[HITL] Prepared Elitea Builder resume (%s)", guardrail_type)
                     elif guardrail_type in ('clarifying_question', 'credential_form'):
                         # Ask-user (clarifying question) resume. The ask_user tool
                         # fired interrupt() from inside the single LLM+tools node,
@@ -2410,19 +2511,7 @@ class LangGraphAgentRunnable(CompiledStateGraph):
 
                         # Restore intermediate tool messages captured before the
                         # pause so completed sibling tools are not re-executed.
-                        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
-                        if pending_msgs_dicts:
-                            trimmed = self._trim_pending_messages(pending_msgs_dicts)
-                            if trimmed:
-                                resume_ctx['pending_messages'] = trimmed
-                            original_ai_dict = self._extract_original_ai_message(
-                                pending_msgs_dicts,
-                                tool_name=form_tool,
-                                tool_args=resume_ctx['tool_args']
-                                if isinstance(resume_ctx['tool_args'], dict) else {},
-                            )
-                            if original_ai_dict is not None:
-                                resume_ctx['original_ai_message'] = original_ai_dict
+                        self._restore_pending_for_resume(resume_ctx, hitl_interrupt)
                         hitl_resume_ctx = resume_ctx
                         logger.info("[HITL] Prepared %s resume for %s", guardrail_type, form_tool)
                     elif guardrail_type in {
@@ -2683,36 +2772,20 @@ class LangGraphAgentRunnable(CompiledStateGraph):
             elif (printer_output := result.get(PRINTER_NODE_RS)) == PRINTER_COMPLETED_STATE:
                 # Printer completed, extract last AI message
                 messages = result['messages']
-                # Skip messages whose normalized content is empty (Sonnet 4.5/4.6 returns
-                # AIMessage(content=[]) in synthesis turns — issue #5057).
-                output = None
-                for _msg in reversed(messages):
-                    if isinstance(_msg, HumanMessage):
-                        continue
-                    _normed_check = normalize_message_content(_msg.content).strip()
-                    if _normed_check:
-                        output = normalize_message_content(_msg.content)
-                        break
+                output = extract_current_turn_answer(messages)
                 if output is None:
                     output = (
                         normalize_message_content(messages[-1].content) if messages else None
                     ) if messages else result.get('output')
+                # Nothing after the printer answered, so this is the printer's own reply
+                # from the paused turn; the run has finished, so drop its resume hint (#6889).
+                output = self._strip_printer_footer(output)
             elif printer_output is not None:
                 # Printer node has output (interrupted state)
                 output = normalize_message_content(printer_output) if not isinstance(printer_output, str) else printer_output
             else:
-                # No printer node, extract last non-Human message with non-empty content.
-                # Skip messages whose normalized content is empty — Sonnet 4.5/4.6 returns
-                # AIMessage(content=[]) in synthesis turns after tool calls (issue #5057).
                 messages = result.get('messages', [])
-                output = None
-                for _msg in reversed(messages):
-                    if isinstance(_msg, HumanMessage):
-                        continue
-                    _normed_check = normalize_message_content(_msg.content).strip()
-                    if _normed_check:
-                        output = normalize_message_content(_msg.content)
-                        break
+                output = extract_current_turn_answer(messages)
         except Exception as exc:
             logger.warning("[OUTPUT] Exception during output extraction: %s", exc, exc_info=True)
             # If pipeline was blocked, we already have the output — use it
@@ -2720,16 +2793,8 @@ class LangGraphAgentRunnable(CompiledStateGraph):
                 output = _blocked_output
             else:
                 # Fallback: try to extract from messages first, then last state value.
-                # Skip messages whose normalized content is empty (issue #5057).
                 messages = result.get('messages', []) if isinstance(result, dict) else []
-                output = None
-                for _msg in reversed(messages):
-                    if not hasattr(_msg, 'content') or isinstance(_msg, HumanMessage):
-                        continue
-                    _normed_check = normalize_message_content(_msg.content).strip()
-                    if _normed_check:
-                        output = normalize_message_content(_msg.content)
-                        break
+                output = extract_current_turn_answer(messages)
                 if output is None:
                     output = str(list(result.values())[-1]) if result else 'Output is undefined'
         config_state = self.get_state(config)
@@ -3333,6 +3398,24 @@ class LangGraphAgentRunnable(CompiledStateGraph):
         interrupt_args = hitl_interrupt.get('tool_args_raw') or hitl_interrupt.get('tool_args') or {}
         resumed_args = hitl_resume_ctx.get('tool_args') or {}
         return args_match_normalized(interrupt_args, resumed_args)
+
+    @classmethod
+    def _restore_pending_for_resume(cls, resume_ctx: dict, hitl_interrupt: dict) -> None:
+        """Put the sibling tool messages captured before the pause, and the AIMessage that issued the paused call,
+        on ``resume_ctx`` so the LLM node re-issues that call without a new LLM turn."""
+        pending_msgs_dicts = hitl_interrupt.get('_pending_messages') or []
+        if not pending_msgs_dicts:
+            return
+        trimmed = cls._trim_pending_messages(pending_msgs_dicts)
+        if trimmed:
+            resume_ctx['pending_messages'] = trimmed
+        tool_args = resume_ctx.get('tool_args')
+        original_ai_dict = cls._extract_original_ai_message(
+            pending_msgs_dicts, tool_name=resume_ctx.get('tool_name', ''),
+            tool_args=tool_args if isinstance(tool_args, dict) else {},
+        )
+        if original_ai_dict is not None:
+            resume_ctx['original_ai_message'] = original_ai_dict
 
     @staticmethod
     def _trim_pending_messages(pending_msgs_dicts: list[dict]) -> list[dict]:

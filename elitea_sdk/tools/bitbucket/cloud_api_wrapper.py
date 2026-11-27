@@ -5,7 +5,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar
 
 from urllib.parse import quote
 
@@ -186,6 +186,10 @@ class BitbucketServerApi(BitbucketApiAbstract):
         self.username = username
         self.password = password
         self.api_client = Bitbucket(url=url, username=username, password=password)
+
+    @retry_on_rate_limit()
+    def default_branch(self) -> Optional[str]:
+        return (self.api_client.get_default_branch(self.project, self.repository) or {}).get('displayId')
 
     @retry_on_rate_limit()
     def list_branches(self) -> List[str]:
@@ -458,11 +462,14 @@ class BitbucketCloudApi(BitbucketApiAbstract):
         self.username = username
         self.password = password
         self.api_client = Cloud(url=url, username=username, password=password)
-        self.workspace = self.api_client.workspaces.get(self.workspace_name)
         try:
+            self.workspace = self.api_client.workspaces.get(self.workspace_name)
             self.repository = self.workspace.repositories.get(self.repository_name)
         except Exception as e:
             raise ToolException(f"Unable to connect to the repository '{self.repository_name}' due to error:\n{str(e)}")
+
+    def default_branch(self) -> Optional[str]:
+        return (self.repository.get_data('mainbranch') or {}).get('name')
 
     @retry_on_rate_limit()
     def list_branches(self) -> List[str]:

@@ -4,6 +4,8 @@ import re
 import subprocess
 import os
 import time
+from functools import lru_cache
+from urllib.parse import urlsplit
 from typing import Any, Type, Optional, Dict, List, Literal, Union
 from copy import deepcopy
 from pathlib import Path
@@ -15,6 +17,9 @@ from pydantic.fields import FieldInfo
 
 from ..exceptions import SandboxAdmissionRefused
 from ..utils.internal_run_auth import is_run_token_bearer
+from .sandbox_client_bridge import (
+    ClientBridgeDispatcher, bridge_enabled, bridge_limits, build_client_stub, sandbox_client_factory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,18 @@ _COMMENT_LINE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 def _code_needs_sandbox_client(code: str) -> bool:
     code = _COMMENT_LINE.sub("", code.replace(CLIENT_ALIAS_LINE, ""))
     return bool(_FULL_PREAMBLE_NAMES.search(code))
+
+
+# With the bridged client (#7719) only the client names matter: code that imports requests installs it itself.
+_BRIDGE_CLIENT_NAMES = re.compile(
+    r"\b(elitea_client|alita_client|SandboxClient|SandboxArtifact|ApiDetailsRequestError|PrivateSecret\w*"
+    r"|NoPersonalProject)\b"
+)
+
+
+def _code_needs_bridged_client(code: str) -> bool:
+    code = _COMMENT_LINE.sub("", code.replace(CLIENT_ALIAS_LINE, ""))
+    return bool(_BRIDGE_CLIENT_NAMES.search(code))
 
 name = "pyodide"
 
@@ -103,6 +120,9 @@ def _is_deno_available() -> bool:
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    except OSError as e:
+        logger.warning("Deno probe failed: %s", e)
         return False
 
 
@@ -267,6 +287,110 @@ def _cgroup_memory_pressure_pct() -> Optional[float]:
         return None
 
 
+def enforce_sandbox_admission(limits: Dict[str, Any]) -> None:
+    """Refuse a new Deno sandbox, retriably, while the pod is at its concurrency or memory-pressure limit."""
+    max_concurrent = limits["max_concurrent"]
+    if max_concurrent and max_concurrent > 0:
+        n_deno = _count_deno_processes()
+        if n_deno >= max_concurrent:
+            logger.warning(
+                "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
+                n_deno, max_concurrent,
+            )
+            raise SandboxAdmissionRefused(
+                f"Sandbox busy: {n_deno} concurrent executions at limit "
+                f"{max_concurrent}. Retry shortly.",
+                "service_busy",
+            )
+
+    pressure_pct = limits["memory_pressure_pct"]
+    if pressure_pct and pressure_pct > 0:
+        current_pressure = _cgroup_memory_pressure_pct()
+        if current_pressure is not None and current_pressure >= pressure_pct:
+            logger.warning(
+                "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
+                current_pressure, pressure_pct,
+            )
+            raise SandboxAdmissionRefused(
+                f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
+                f"{pressure_pct}%. Retry shortly.",
+                "out_of_memory",
+            )
+
+
+def local_sandbox_permissions() -> dict:
+    """The Deno grants of every local Pyodide sandbox: only the SANDBOX_BASE variable and the Pyodide assets readable,
+    nothing on the host writable, no module fetched, no subprocesses, no FFI. Network stays each caller's choice."""
+    sandbox_base = os.environ.get("SANDBOX_BASE", os.path.expanduser('~/.cache/pyodide'))
+    return {
+        # Widening this means revisiting _PASSTHROUGH_ENV in langchain/pyodide_sandbox.py (the child's real environment).
+        'allow_env': ["SANDBOX_BASE"],
+        'allow_read': [os.path.join(sandbox_base, "pyodide")],
+        'allow_write': False,
+        'allow_run': False,
+        'allow_ffi': False,
+        'allow_remote_modules': False,
+    }
+
+
+# Hosts micropip and the Pyodide package lockfile need; bare --allow-net would expose the worker's internal network
+_DEFAULT_SANDBOX_HOSTS = ("pypi.org", "files.pythonhosted.org", "cdn.jsdelivr.net")
+# Exact host[:port] only: wildcards, paths and schemes would widen the grant beyond the named host
+_HOST_ENTRY_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::\d{1,5})?$")
+
+
+def _valid_hosts(entries) -> list:
+    valid = []
+    for entry in entries:
+        host = entry.strip().lower()
+        if not host:
+            continue
+        port = host.rpartition(":")[2] if ":" in host else "1"
+        if _HOST_ENTRY_RE.match(host) and len(host.split(":")[0]) <= 253 and 0 < int(port) <= 65535:
+            valid.append(host)
+        else:
+            logger.warning("Ignoring sandbox network allowlist entry %r: only exact host[:port] is allowed", entry)
+    return list(dict.fromkeys(valid))
+
+
+def sandbox_allowed_hosts() -> list:
+    return list(_cached_allowed_hosts(os.environ.get("SANDBOX_ALLOWED_HOSTS", "")))
+
+
+@lru_cache(maxsize=8)
+def _cached_allowed_hosts(raw: str) -> tuple:
+    return tuple(_valid_hosts([*_DEFAULT_SANDBOX_HOSTS, *raw.split(",")]))
+
+
+def platform_host(base_url) -> Optional[str]:
+    """Exact host[:port] of the platform URL the in-sandbox SandboxClient calls over HTTP, or None if it is not a plain host."""
+    try:
+        parts = urlsplit(str(base_url or ""))
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host or parts.scheme not in ("http", "https"):
+        return None
+    valid = _valid_hosts([f"{host}:{port}" if port else host])
+    return valid[0] if valid else None
+
+
+def resolve_allow_net(value):
+    """True becomes the hostname allowlist; explicit lists are validated the same way."""
+    if value is True:
+        return sandbox_allowed_hosts()
+    if isinstance(value, list):
+        return _valid_hosts(value) or False
+    return value
+
+
+def build_offline_pyodide_sandbox():
+    """The local sandbox third-party code runs in, with no network. Never the remote sandbox service, whose runner has
+    network on and no per-call network setting."""
+    from ..langchain.pyodide_sandbox import PyodideSandbox
+    return PyodideSandbox(stateful=False, allow_net=False, node_modules_dir="auto", **local_sandbox_permissions())
+
+
 # Create input schema for the sandbox tool
 sandbox_tool_input = create_model(
     "SandboxToolInput",
@@ -300,6 +424,8 @@ class PyodideSandboxTool(BaseTool):
     session_bytes: Optional[bytes] = None
     session_metadata: Optional[Dict] = None
     elitea_client: Optional[Any] = None
+    # Who wrote the code: "code_node" (a person) may read secrets through the bridged client, model-written code may not
+    caller: str = "pyodide_tool"
 
     def __init__(self, **kwargs: Any) -> None:
         # Ensure display metadata is set so EliteACallback can render the FE chip correctly.
@@ -349,10 +475,28 @@ class PyodideSandboxTool(BaseTool):
                     config['metadata'][key] = value
         return super().invoke(input, config=config, **kwargs)
 
+    def _bridge_mode(self) -> bool:
+        """The bridged client (#7719) applies: flag on and a local stateless sandbox."""
+        return bool(
+            self.elitea_client is not None
+            and not self.stateful
+            and not os.environ.get("SANDBOX_SERVICE_URL")
+            and bridge_enabled()
+        )
+
+    def _uses_client_bridge(self, code: str) -> bool:
+        return self._bridge_mode() and _code_needs_bridged_client(code)
+
     def _prepare_pyodide_input(self, code: str) -> str:
         """Prepare input for PyodideSandboxTool by injecting state and elitea_client into the code block."""
         pyodide_predata = ""
 
+        if self._uses_client_bridge(code):
+            stub = build_client_stub(self.elitea_client.base_url, getattr(self.elitea_client, 'project_id', None))
+            return f"#elitea simplified client\n{_LIGHT_PREAMBLE}{stub}\n{code}"
+        if self._bridge_mode():
+            # Never fall back to the token-carrying client, whatever the code looks like
+            return f"#elitea simplified client\n{_LIGHT_PREAMBLE}{code}"
         if self.elitea_client and not _code_needs_sandbox_client(code):
             pyodide_predata = _LIGHT_PREAMBLE
         elif self.elitea_client:
@@ -383,6 +527,14 @@ class PyodideSandboxTool(BaseTool):
 
         return f"#elitea simplified client\n{pyodide_predata}{code}"
 
+    def _resolved_allow_net(self):
+        allow_net = resolve_allow_net(self.allow_net)
+        # Without the #7719 bridge, the injected SandboxClient reaches the platform over HTTP from inside Deno
+        host = platform_host(getattr(self.elitea_client, "base_url", None)) if self.elitea_client else None
+        if isinstance(allow_net, list) and host and not self._bridge_mode():
+            allow_net = list(dict.fromkeys([*allow_net, host]))
+        return allow_net
+
     def _initialize_sandbox(self) -> None:
         """Initialize the PyodideSandbox instance with optimized settings"""
         try:
@@ -411,22 +563,11 @@ class PyodideSandboxTool(BaseTool):
 
             from ..langchain.pyodide_sandbox import PyodideSandbox
 
-            # Air-gapped settings
-            sandbox_base = os.environ.get("SANDBOX_BASE", os.path.expanduser('~/.cache/pyodide'))
-            sandbox_tmp = os.path.join(sandbox_base, "tmp")
-            deno_cache = os.environ.get("DENO_DIR", os.path.expanduser('~/.cache/deno'))
-
-            # Configure sandbox with performance optimizations
             self._sandbox = PyodideSandbox(
                 stateful=self.stateful,
-                #
-                allow_env=["SANDBOX_BASE"],
-                allow_read=[sandbox_base, sandbox_tmp, deno_cache],
-                allow_write=[sandbox_tmp, deno_cache],
-                #
-                allow_net=self.allow_net,
-                # Use auto node_modules_dir for better caching
-                node_modules_dir="auto"
+                allow_net=self._resolved_allow_net(),
+                node_modules_dir="auto",
+                **local_sandbox_permissions(),
             )
             logger.info(f"PyodideSandbox initialized successfully (stateful={self.stateful})")
         except Exception as e:
@@ -491,33 +632,7 @@ class PyodideSandboxTool(BaseTool):
                 # Reject (soft, retriable) rather than spawn another sandbox when the
                 # box is already at capacity. Both checks read shared OS/cgroup state,
                 # are self-healing (no counter to leak), and fail OPEN on probe error.
-                max_concurrent = limits["max_concurrent"]
-                if max_concurrent and max_concurrent > 0:
-                    n_deno = _count_deno_processes()
-                    if n_deno >= max_concurrent:
-                        logger.warning(
-                            "Sandbox concurrency gate: %d deno procs >= limit %d — rejecting",
-                            n_deno, max_concurrent,
-                        )
-                        raise SandboxAdmissionRefused(
-                            f"Sandbox busy: {n_deno} concurrent executions at limit "
-                            f"{max_concurrent}. Retry shortly.",
-                            "service_busy",
-                        )
-
-                pressure_pct = limits["memory_pressure_pct"]
-                if pressure_pct and pressure_pct > 0:
-                    current_pressure = _cgroup_memory_pressure_pct()
-                    if current_pressure is not None and current_pressure >= pressure_pct:
-                        logger.warning(
-                            "Sandbox memory-pressure gate: %.1f%% >= threshold %d%% — rejecting",
-                            current_pressure, pressure_pct,
-                        )
-                        raise SandboxAdmissionRefused(
-                            f"Host memory pressure {current_pressure:.1f}% exceeds threshold "
-                            f"{pressure_pct}%. Retry shortly.",
-                            "out_of_memory",
-                        )
+                enforce_sandbox_admission(limits)
             # --- End admission gate ----------------------------------------------
             gate_s = time.perf_counter() - arun_start
 
@@ -529,6 +644,8 @@ class PyodideSandboxTool(BaseTool):
             # Prepare code with state and client injection
             # This is needed when _arun is called directly via ainvoke()
             prepared_code = self._prepare_pyodide_input(code)
+            if self._uses_client_bridge(code):
+                return await self._arun_bridged(prepared_code, limits, arun_start)
 
             exec_start = time.perf_counter()
             # Execute the code with session state if available, bounded by the
@@ -596,6 +713,51 @@ class PyodideSandboxTool(BaseTool):
             logger.error(f"Error executing code in sandbox: {e}")
             return {"error": f"Error executing code: {str(e)}"}
 
+    async def _arun_bridged(self, prepared_code: str, limits: Dict[str, Any], arun_start: float) -> Dict[str, Any]:
+        """Run with the bridged client: platform calls happen here, secret values are masked in what comes back."""
+        client = self.elitea_client
+        bridge = bridge_limits()
+        dispatcher = ClientBridgeDispatcher(
+            sandbox_client_factory(client),
+            caller=self.caller,
+            project_id=getattr(client, 'project_id', None),
+            user_id=getattr(client, 'user_id', None),
+            governed=is_run_token_bearer(client),
+            max_result_bytes=bridge["max_line_bytes"],
+            deadline=time.monotonic() + limits["timeout_seconds"],
+        )
+        try:
+            result = await self._sandbox.execute_with_bridge(
+                prepared_code,
+                dispatcher,
+                timeout_seconds=limits["timeout_seconds"],
+                max_tool_calls=bridge["max_calls"],
+                memory_limit_mb=limits["wasm_max_mem_mb"],
+                max_line_bytes=bridge["max_line_bytes"],
+                max_concurrent_calls=1,
+                root_ca_path=limits.get("root_ca_path"),
+                insecure_tls_domains=limits.get("allowed_pyodide_domains"),
+            )
+        finally:
+            dispatcher.close()
+        logger.debug("[sandbox-timing] bridged client run: total=%.3fs calls=%s",
+                     time.perf_counter() - arun_start, dispatcher.call_log)
+        mask = dispatcher.masker.mask
+        if result.error_type == "timeout":
+            raise SandboxAdmissionRefused(mask(result.error) or "Sandbox execution timed out", "timeout")
+
+        result_dict: Dict[str, Any] = {}
+        # The result is pipeline state (a later node may need the secret); only printed and error text is masked
+        if result.result is not None:
+            result_dict["result"] = result.result
+        if result.stdout:
+            result_dict["output"] = mask(result.stdout)
+        if result.status == 'error':
+            result_dict["error"] = mask("\n".join(p for p in (result.error, result.stderr) if p))
+            result_dict["status"] = "Execution failed"
+        result_dict["execution_info"] = f"Execution time: {result.execution_time:.2f}s"
+        return result_dict
+
 
 class StatefulPyodideSandboxTool(PyodideSandboxTool):
     """
@@ -622,7 +784,8 @@ class StatefulPyodideSandboxTool(PyodideSandboxTool):
 
 
 # Factory function for creating sandbox tools
-def create_sandbox_tool(stateful: bool = False, allow_net: bool = True, elitea_client: Optional[Any] = None) -> BaseTool:
+def create_sandbox_tool(stateful: bool = False, allow_net: bool = True, elitea_client: Optional[Any] = None,
+                        caller: str = "pyodide_tool") -> BaseTool:
     """
     Factory function to create sandbox tools with specified configuration.
 
@@ -645,9 +808,9 @@ def create_sandbox_tool(stateful: bool = False, allow_net: bool = True, elitea_c
         - Cached wheels reduce package download time from ~4.76s to near-instant
     """
     if stateful:
-        return StatefulPyodideSandboxTool(allow_net=allow_net, elitea_client=elitea_client)
+        return StatefulPyodideSandboxTool(allow_net=allow_net, elitea_client=elitea_client, caller=caller)
     else:
-        return PyodideSandboxTool(stateful=False, allow_net=allow_net, elitea_client=elitea_client)
+        return PyodideSandboxTool(stateful=False, allow_net=allow_net, elitea_client=elitea_client, caller=caller)
 
 
 class SandboxToolkit(BaseToolkit):
@@ -668,7 +831,7 @@ class SandboxToolkit(BaseToolkit):
         return create_model(
             'sandbox',
             stateful=(bool, Field(default=False, description="Whether to maintain state between executions")),
-            allow_net=(bool, Field(default=True, description="Whether to allow network access for package installation")),
+            allow_net=(bool, Field(default=True, description="Allow network to package hosts plus operator SANDBOX_ALLOWED_HOSTS")),
             selected_tools=(List[Literal[tuple(selected_tools)]],
                             Field(default=[], json_schema_extra={'args_schemas': selected_tools})),
 

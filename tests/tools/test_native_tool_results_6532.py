@@ -122,7 +122,7 @@ class TestQtest:
         assert result['items'] == found[:2]
 
     def test_get_modules_returns_native_list(self, monkeypatch):
-        wrapper = _bare(QtestApiWrapper)
+        wrapper = QtestApiWrapper.model_construct(qtest_project_id=1)
         module = SimpleNamespace(
             to_dict=lambda: {'id': 1, 'name': 'Module', 'pid': 'MD-1', 'children': None}
         )
@@ -131,7 +131,6 @@ class TestQtest:
             QtestApiWrapper, '_QtestApiWrapper__instantiate_module_api_instance',
             lambda self: module_api, raising=False,
         )
-        monkeypatch.setattr(QtestApiWrapper, 'qtest_project_id', 1, raising=False)
 
         result = wrapper.get_modules()
 
